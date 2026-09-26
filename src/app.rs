@@ -240,8 +240,16 @@ async fn start_profile(
         .entry(name.clone())
         .or_default()
         .clone();
+    let (display_width, display_height) = display_dimensions(options.picture);
     tools
-        .configure_input_and_window(&name, options.host_keyboard, options.device_frame)
+        .configure_input_and_window(
+            &name,
+            options.host_keyboard,
+            options.device_frame,
+            display_width,
+            display_height,
+            options.dpi,
+        )
         .and_then(|_| {
             if let Some(scale) = options.window_scale {
                 tools.configure_window_scale(&name, scale)
@@ -335,6 +343,7 @@ async fn save_settings(
 }
 
 fn launch_args(options: &ProfileOptions) -> Vec<String> {
+    let (display_width, display_height) = display_dimensions(options.picture);
     let mut args = vec![
         "-cores".into(),
         options.cores.to_string(),
@@ -343,14 +352,7 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         "-gpu".into(),
         options.gpu_mode.clone(),
         "-skin".into(),
-        match options.picture {
-            PicturePreset::Compact => "540x960",
-            PicturePreset::Phone => "720x1280",
-            PicturePreset::Sharp => "1080x1920",
-        }
-        .into(),
-        "-dpi-device".into(),
-        options.dpi.to_string(),
+        format!("{display_width}x{display_height}"),
     ];
     if let Some(port) = options.adb_port {
         args.extend(["-port".into(), port.to_string()]);
@@ -362,6 +364,14 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         args.push("-no-audio".into());
     }
     args
+}
+
+fn display_dimensions(picture: PicturePreset) -> (u16, u16) {
+    match picture {
+        PicturePreset::Compact => (540, 960),
+        PicturePreset::Phone => (720, 1280),
+        PicturePreset::Sharp => (1080, 1920),
+    }
 }
 
 #[cfg(test)]
@@ -383,10 +393,8 @@ mod tests {
     fn uses_frostguard_friendly_resolution_by_default() {
         let args = launch_args(&ProfileOptions::default());
         let skin = args.iter().position(|arg| arg == "-skin").unwrap();
-        let dpi = args.iter().position(|arg| arg == "-dpi-device").unwrap();
 
         assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
-        assert_eq!(args.get(dpi + 1).map(String::as_str), Some("240"));
     }
 }
 

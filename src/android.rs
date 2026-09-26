@@ -247,6 +247,9 @@ impl AndroidTools {
         profile_name: &str,
         host_keyboard: bool,
         device_frame: bool,
+        display_width: u16,
+        display_height: u16,
+        display_dpi: u16,
     ) -> Result<(), String> {
         validate_profile_name(profile_name)?;
         let path = home_path(&format!(".android/avd/{profile_name}.avd/config.ini"))
@@ -263,6 +266,9 @@ impl AndroidTools {
             "showDeviceFrame",
             if device_frame { "yes" } else { "no" },
         );
+        let text = set_ini_value(&text, "hw.lcd.width", &display_width.to_string());
+        let text = set_ini_value(&text, "hw.lcd.height", &display_height.to_string());
+        let text = set_ini_value(&text, "hw.lcd.density", &display_dpi.to_string());
         fs::write(&path, text)
             .map_err(|error| format!("Could not update {}: {error}", path.display()))
     }
