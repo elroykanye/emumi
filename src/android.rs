@@ -265,6 +265,19 @@ impl AndroidTools {
             .map_err(|error| format!("Could not update {}: {error}", path.display()))
     }
 
+    pub fn configure_window_scale(&self, profile_name: &str, scale: f32) -> Result<(), String> {
+        validate_profile_name(profile_name)?;
+        let path = home_path(&format!(
+            ".android/avd/{profile_name}.avd/emulator-user.ini"
+        ))
+        .ok_or("HOME is not set")?;
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let scale = scale.clamp(0.45, 1.0);
+        let text = set_ini_value(&text, "window.scale", &format!("{scale:.6}"));
+        fs::write(&path, text)
+            .map_err(|error| format!("Could not update {}: {error}", path.display()))
+    }
+
     pub fn stop(&self, serial: &str) -> Result<(), String> {
         let adb = self.adb.as_ref().ok_or("ADB was not found")?;
         let status = Command::new(adb)

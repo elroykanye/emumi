@@ -1,5 +1,8 @@
 use crate::{
-    android::AndroidTools, config::AppConfig, model::ProfileOptions, monitor::HostMonitor,
+    android::AndroidTools,
+    config::AppConfig,
+    model::{PicturePreset, ProfileOptions},
+    monitor::HostMonitor,
 };
 use axum::{
     Json, Router,
@@ -239,6 +242,7 @@ async fn start_profile(
         .clone();
     tools
         .configure_input_and_window(&name, options.host_keyboard, options.device_frame)
+        .and_then(|_| tools.configure_window_scale(&name, options.window_scale))
         .and_then(|_| tools.start(&profile, &launch_args(&options)))
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
     runtime.log("success", format!("Starting {name}"));
@@ -326,6 +330,13 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         options.memory_mb.to_string(),
         "-gpu".into(),
         options.gpu_mode.clone(),
+        "-skin".into(),
+        match options.picture {
+            PicturePreset::Compact => "540x960",
+            PicturePreset::Phone => "720x1280",
+            PicturePreset::Sharp => "1080x1920",
+        }
+        .into(),
     ];
     if let Some(port) = options.adb_port {
         args.extend(["-port".into(), port.to_string()]);
@@ -333,7 +344,34 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
     if options.cold_boot {
         args.push("-no-snapshot-load".into());
     }
+    if options.mute_audio {
+        args.push("-no-audio".into());
+    }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::launch_args;
+    use crate::model::ProfileOptions;
+
+    #[test]
+    fn disables_emulator_audio_when_profile_is_muted() {
+        let options = ProfileOptions {
+            mute_audio: true,
+            ..ProfileOptions::default()
+        };
+
+        assert!(launch_args(&options).contains(&"-no-audio".to_owned()));
+    }
+
+    #[test]
+    fn uses_frostguard_friendly_resolution_by_default() {
+        let args = launch_args(&ProfileOptions::default());
+        let skin = args.iter().position(|arg| arg == "-skin").unwrap();
+
+        assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+    }
 }
 
 fn lock(

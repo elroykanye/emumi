@@ -41,6 +41,7 @@ import {
 import {
   AddRounded,
   AndroidRounded,
+  AspectRatioRounded,
   CheckCircleRounded,
   ChevronRightRounded,
   CodeRounded,
@@ -57,12 +58,14 @@ import {
   StopRounded,
   TerminalRounded,
   TuneRounded,
+  VolumeOffRounded,
   WarningAmberRounded,
 } from "@mui/icons-material";
 
 type Page = "androids" | "monitor" | "logs" | "settings";
 type PendingAction = "starting" | "stopping";
 type Speed = "Efficient" | "Balanced" | "Fast";
+type Picture = "Compact" | "Phone" | "Sharp";
 
 type AndroidProfile = {
   name: string;
@@ -74,7 +77,7 @@ type AndroidProfile = {
 
 type ProfileOptions = {
   speed: Speed;
-  picture: "Compact" | "Phone" | "Sharp";
+  picture: Picture;
   window: "Remember" | "Portrait" | "Landscape";
   cores: number;
   memory_mb: number;
@@ -84,6 +87,8 @@ type ProfileOptions = {
   cold_boot: boolean;
   host_keyboard: boolean;
   device_frame: boolean;
+  mute_audio: boolean;
+  window_scale: number;
 };
 
 type AppState = {
@@ -109,6 +114,8 @@ const defaultOptions: ProfileOptions = {
   cold_boot: false,
   host_keyboard: true,
   device_frame: false,
+  mute_audio: false,
+  window_scale: 0.7,
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -390,12 +397,28 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
           </ToggleButtonGroup>
         </SettingRow>
         <Divider />
+        <SettingRow icon={<AspectRatioRounded />} title="Resolution" description="720 × 1280 is the default for Frostguard">
+          <ToggleButtonGroup exclusive value={draft.picture} size="small" onChange={(_, value: Picture | null) => value && setDraft({ ...draft, picture: value })}>
+            <ToggleButton value="Compact">540 × 960</ToggleButton><ToggleButton value="Phone">720 × 1280</ToggleButton><ToggleButton value="Sharp">1080 × 1920</ToggleButton>
+          </ToggleButtonGroup>
+        </SettingRow>
+        <Divider />
+        <SettingRow icon={<MonitorHeartRounded />} title="Window size" description="Changes how large Android appears on your desktop">
+          <ToggleButtonGroup exclusive value={draft.window_scale} size="small" onChange={(_, value: number | null) => value && setDraft({ ...draft, window_scale: value })}>
+            <ToggleButton value={0.55}>Compact</ToggleButton><ToggleButton value={0.7}>Comfortable</ToggleButton><ToggleButton value={0.85}>Large</ToggleButton>
+          </ToggleButtonGroup>
+        </SettingRow>
+        <Divider />
         <SettingRow icon={<KeyboardRounded />} title="Use computer keyboard" description="Send Linux keyboard input into Android">
           <Switch checked={draft.host_keyboard} onChange={(event) => setDraft({ ...draft, host_keyboard: event.target.checked })} />
         </SettingRow>
         <Divider />
         <SettingRow icon={<PhoneAndroidRounded />} title="Show device frame" description="Keep off for a clean, easier-to-resize window">
           <Switch checked={draft.device_frame} onChange={(event) => setDraft({ ...draft, device_frame: event.target.checked })} />
+        </SettingRow>
+        <Divider />
+        <SettingRow icon={<VolumeOffRounded />} title="Mute Android audio" description="Launch this Android without sound output">
+          <Switch checked={draft.mute_audio} onChange={(event) => setDraft({ ...draft, mute_audio: event.target.checked })} />
         </SettingRow>
         <Accordion disableGutters elevation={0} sx={{ mt: 1, "&:before": { display: "none" } }}>
           <AccordionSummary expandIcon={<ExpandMoreRounded />}><TuneRounded sx={{ mr: 2 }} /><Box><Typography fontWeight={700}>Advanced settings</Typography><Typography variant="body2" color="text.secondary">CPU, memory, graphics, ports and boot behavior</Typography></Box></AccordionSummary>

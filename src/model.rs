@@ -53,6 +53,8 @@ pub struct ProfileOptions {
     pub cold_boot: bool,
     pub host_keyboard: bool,
     pub device_frame: bool,
+    pub mute_audio: bool,
+    pub window_scale: f32,
 }
 
 impl Default for ProfileOptions {
@@ -69,6 +71,8 @@ impl Default for ProfileOptions {
             cold_boot: false,
             host_keyboard: true,
             device_frame: false,
+            mute_audio: false,
+            window_scale: 0.7,
         }
     }
 }
