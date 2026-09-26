@@ -8,7 +8,7 @@ collapsed Advanced section.
 
 ## Current prototype
 
-- Runs as one native Tauri window with a bundled WebKit interface
+- Runs as one native Tauri window with a bundled React + Material UI interface
 - Discovers Android SDK, Java, AVD profiles, ADB devices, and KVM
 - Shows profile status and host CPU/RAM monitoring
 - Creates and deletes AVD profiles using installed Android system images
@@ -23,6 +23,17 @@ collapsed Advanced section.
 cargo run
 ```
 
+The compiled frontend is checked into `web/`, so running the native app does
+not require Node.js. To change the interface, install Node.js 24 and rebuild it:
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+cargo run
+```
+
 Android Studio is not required. EmuMi uses the standalone Android SDK command-
 line tools and Emulator package.
 
@@ -33,7 +44,8 @@ line tools and Emulator package.
 - `src/config.rs` — user configuration persistence
 - `src/monitor.rs` — lightweight Linux host monitoring
 - `src/model.rs` — shared application models
-- `web/` — bundled responsive interface rendered inside Tauri/WebKit
+- `frontend/` — React, TypeScript, and Material UI source (no CSS files)
+- `web/` — compiled interface bundled into the native binary
 - `tauri.conf.json` — native application-window configuration
 
 This repository is intentionally independent from Frostguard/WOSBot.

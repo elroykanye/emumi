@@ -17,7 +17,6 @@ use std::{
 use tokio::net::TcpListener;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
-const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 
 type Shared = Arc<Mutex<Runtime>>;
@@ -93,7 +92,6 @@ impl EmuMiApp {
 
         let app = Router::new()
             .route("/", get(index))
-            .route("/app.css", get(styles))
             .route("/app.js", get(script))
             .route("/api/state", get(read_state))
             .route("/api/profiles", post(create_profile))
@@ -144,10 +142,6 @@ impl Runtime {
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
-}
-
-async fn styles() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS)
 }
 
 async fn script() -> impl IntoResponse {
