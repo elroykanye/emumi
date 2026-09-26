@@ -1,0 +1,12 @@
+[package]
+name = "emumi"
+version = "0.1.0"
+edition = "2024"
+description = "A friendly Android emulator manager for Linux"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+
