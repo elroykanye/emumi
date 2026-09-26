@@ -1,10 +1,7 @@
 use crate::{
     android::{AndroidTools, validate_profile_name},
     config::AppConfig,
-    model::{
-        AndroidProfile, HostStats, LogEntry, LogLevel, PicturePreset, ProfileOptions, SpeedPreset,
-        WindowPreset,
-    },
+    model::{AndroidProfile, HostStats, LogEntry, LogLevel, ProfileOptions, SpeedPreset},
     monitor::HostMonitor,
 };
 use eframe::egui::{
@@ -140,8 +137,6 @@ impl EmuMiApp {
             options.cores.to_string(),
             "-memory".into(),
             options.memory_mb.to_string(),
-            "-dpi-device".into(),
-            options.dpi.to_string(),
             "-gpu".into(),
             options.gpu_mode.clone(),
         ];
@@ -450,34 +445,22 @@ impl EmuMiApp {
                 "Quick setup",
                 "Useful defaults without technical noise",
                 |ui| {
-                    preset_row(
+                    speed_row(ui, options);
+                    row_divider(ui);
+                    setting_toggle(
                         ui,
-                        icon::GAUGE,
-                        "Performance",
-                        "How much of your computer this Android may use",
-                        &mut options.speed,
-                        SpeedPreset::ALL,
-                        SpeedPreset::label,
+                        icon::KEYBOARD,
+                        "Use computer keyboard",
+                        "Send typing from Linux directly into Android",
+                        &mut options.host_keyboard,
                     );
                     row_divider(ui);
-                    preset_row(
-                        ui,
-                        icon::MONITOR,
-                        "Display",
-                        "A comfortable resolution and pixel density",
-                        &mut options.picture,
-                        PicturePreset::ALL,
-                        PicturePreset::label,
-                    );
-                    row_divider(ui);
-                    preset_row(
+                    setting_toggle(
                         ui,
                         icon::FRAME_CORNERS,
-                        "Window",
-                        "How the emulator opens",
-                        &mut options.window,
-                        WindowPreset::ALL,
-                        WindowPreset::label,
+                        "Show device frame",
+                        "Turn this off for a cleaner, easier-to-resize window",
+                        &mut options.device_frame,
                     );
                 },
             );
@@ -522,8 +505,15 @@ impl EmuMiApp {
                 }
             } else {
                 let args = Self::launch_args(options);
-                match self.tools.start(&profile, &args) {
-                    Ok(()) => self.log(LogLevel::Success, format!("Starting {}", profile.name)),
+                match self.tools.configure_input_and_window(
+                    &profile.name,
+                    options.host_keyboard,
+                    options.device_frame,
+                ) {
+                    Ok(()) => match self.tools.start(&profile, &args) {
+                        Ok(()) => self.log(LogLevel::Success, format!("Starting {}", profile.name)),
+                        Err(error) => self.log(LogLevel::Error, error),
+                    },
                     Err(error) => self.log(LogLevel::Error, error),
                 }
             }
@@ -1132,30 +1122,26 @@ fn settings_card(
         });
 }
 
-fn preset_row<T: Copy + PartialEq>(
-    ui: &mut egui::Ui,
-    row_icon: &str,
-    title: &str,
-    detail: &str,
-    value: &mut T,
-    choices: [T; 3],
-    label: fn(T) -> &'static str,
-) {
+fn speed_row(ui: &mut egui::Ui, options: &mut ProfileOptions) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(row_icon).size(21.0).color(GREEN));
+        ui.label(RichText::new(icon::GAUGE).size(21.0).color(GREEN));
         ui.add_space(4.0);
         ui.vertical(|ui| {
-            ui.label(RichText::new(title).size(13.5).strong().color(TEXT));
-            ui.label(RichText::new(detail).size(11.5).color(SOFT));
+            ui.label(RichText::new("Performance").size(13.5).strong().color(TEXT));
+            ui.label(
+                RichText::new("CPU and memory allocated when Android starts")
+                    .size(11.5)
+                    .color(SOFT),
+            );
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            for choice in choices.into_iter().rev() {
-                let selected = *value == choice;
+            for choice in SpeedPreset::ALL.into_iter().rev() {
+                let selected = options.speed == choice;
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new(label(choice))
+                            RichText::new(choice.label())
                                 .size(11.5)
                                 .strong()
                                 .color(if selected { GREEN_DARK } else { SOFT }),
@@ -1166,9 +1152,28 @@ fn preset_row<T: Copy + PartialEq>(
                     )
                     .clicked()
                 {
-                    *value = choice;
+                    options.speed = choice;
+                    (options.cores, options.memory_mb) = match choice {
+                        SpeedPreset::Efficient => (2, 2048),
+                        SpeedPreset::Balanced => (4, 4096),
+                        SpeedPreset::Fast => (8, 8192),
+                    };
                 }
             }
+        });
+    });
+}
+
+fn setting_toggle(ui: &mut egui::Ui, row_icon: &str, title: &str, detail: &str, value: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(row_icon).size(21.0).color(GREEN));
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).size(13.5).strong().color(TEXT));
+            ui.label(RichText::new(detail).size(11.5).color(SOFT));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.checkbox(value, "");
         });
     });
 }
@@ -1184,9 +1189,6 @@ fn advanced_settings(ui: &mut egui::Ui, options: &mut ProfileOptions) {
             ui.end_row();
             advanced_label(ui, "Memory", "Maximum guest RAM");
             ui.add(egui::Slider::new(&mut options.memory_mb, 512..=16384).suffix(" MB"));
-            ui.end_row();
-            advanced_label(ui, "Pixel density", "Android display scaling");
-            ui.add(egui::Slider::new(&mut options.dpi, 120..=640).suffix(" dpi"));
             ui.end_row();
             advanced_label(ui, "ADB port", "0 means automatic");
             let mut port = options.adb_port.unwrap_or(0);

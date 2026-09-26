@@ -240,6 +240,31 @@ impl AndroidTools {
             .map_err(|err| err.to_string())
     }
 
+    pub fn configure_input_and_window(
+        &self,
+        profile_name: &str,
+        host_keyboard: bool,
+        device_frame: bool,
+    ) -> Result<(), String> {
+        validate_profile_name(profile_name)?;
+        let path = home_path(&format!(".android/avd/{profile_name}.avd/config.ini"))
+            .ok_or("HOME is not set")?;
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        let text = set_ini_value(
+            &text,
+            "hw.keyboard",
+            if host_keyboard { "yes" } else { "no" },
+        );
+        let text = set_ini_value(
+            &text,
+            "showDeviceFrame",
+            if device_frame { "yes" } else { "no" },
+        );
+        fs::write(&path, text)
+            .map_err(|error| format!("Could not update {}: {error}", path.display()))
+    }
+
     pub fn stop(&self, serial: &str) -> Result<(), String> {
         let adb = self.adb.as_ref().ok_or("ADB was not found")?;
         let status = Command::new(adb)
@@ -372,6 +397,28 @@ fn path_command(name: &str) -> Option<PathBuf> {
         .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
 }
 
+fn set_ini_value(text: &str, key: &str, value: &str) -> String {
+    let mut found = false;
+    let mut lines = text
+        .lines()
+        .map(|line| {
+            if line
+                .split_once('=')
+                .is_some_and(|(candidate, _)| candidate.trim() == key)
+            {
+                found = true;
+                format!("{key}={value}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !found {
+        lines.push(format!("{key}={value}"));
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +442,13 @@ mod tests {
         assert!(validate_profile_name("Pixel_7_work").is_ok());
         assert!(validate_profile_name("bad profile").is_err());
         assert!(validate_profile_name("../bad").is_err());
+    }
+
+    #[test]
+    fn updates_ini_values_without_duplicates() {
+        let updated = set_ini_value("hw.keyboard=no\nfoo=bar\n", "hw.keyboard", "yes");
+        assert_eq!(updated, "hw.keyboard=yes\nfoo=bar\n");
+        let inserted = set_ini_value("foo=bar\n", "showDeviceFrame", "no");
+        assert_eq!(inserted, "foo=bar\nshowDeviceFrame=no\n");
     }
 }

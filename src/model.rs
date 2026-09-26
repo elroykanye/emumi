@@ -56,18 +56,6 @@ pub enum PicturePreset {
     Sharp,
 }
 
-impl PicturePreset {
-    pub const ALL: [Self; 3] = [Self::Compact, Self::Phone, Self::Sharp];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Compact => "Compact",
-            Self::Phone => "Phone",
-            Self::Sharp => "Sharp",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowPreset {
     #[default]
@@ -76,19 +64,8 @@ pub enum WindowPreset {
     Landscape,
 }
 
-impl WindowPreset {
-    pub const ALL: [Self; 3] = [Self::Remember, Self::Portrait, Self::Landscape];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Remember => "Remember",
-            Self::Portrait => "Portrait",
-            Self::Landscape => "Landscape",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProfileOptions {
     pub speed: SpeedPreset,
     pub picture: PicturePreset,
@@ -99,6 +76,8 @@ pub struct ProfileOptions {
     pub adb_port: Option<u16>,
     pub gpu_mode: String,
     pub cold_boot: bool,
+    pub host_keyboard: bool,
+    pub device_frame: bool,
 }
 
 impl Default for ProfileOptions {
@@ -113,6 +92,8 @@ impl Default for ProfileOptions {
             adb_port: None,
             gpu_mode: "auto".into(),
             cold_boot: false,
+            host_keyboard: true,
+            device_frame: false,
         }
     }
 }
