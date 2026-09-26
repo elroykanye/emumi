@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AndroidProfile {
     pub name: String,
     pub device_name: String,
@@ -11,18 +10,6 @@ pub struct AndroidProfile {
 }
 
 impl AndroidProfile {
-    pub fn subtitle(&self) -> String {
-        let device = if self.device_name.is_empty() {
-            "Android device"
-        } else {
-            &self.device_name
-        };
-        match self.api_level {
-            Some(api) => format!("{device}  ·  API {api}"),
-            None => device.to_owned(),
-        }
-    }
-
     pub fn is_running(&self) -> bool {
         self.running_serial.is_some()
     }
@@ -34,18 +21,6 @@ pub enum SpeedPreset {
     #[default]
     Balanced,
     Fast,
-}
-
-impl SpeedPreset {
-    pub const ALL: [Self; 3] = [Self::Efficient, Self::Balanced, Self::Fast];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Efficient => "Efficient",
-            Self::Balanced => "Balanced",
-            Self::Fast => "Fast",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,22 +73,7 @@ impl Default for ProfileOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogLevel {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug)]
-pub struct LogEntry {
-    pub at: SystemTime,
-    pub level: LogLevel,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct HostStats {
     pub cpu_percent: f32,
     pub memory_used_bytes: u64,
