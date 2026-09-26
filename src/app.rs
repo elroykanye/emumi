@@ -242,7 +242,13 @@ async fn start_profile(
         .clone();
     tools
         .configure_input_and_window(&name, options.host_keyboard, options.device_frame)
-        .and_then(|_| tools.configure_window_scale(&name, options.window_scale))
+        .and_then(|_| {
+            if let Some(scale) = options.window_scale {
+                tools.configure_window_scale(&name, scale)
+            } else {
+                Ok(())
+            }
+        })
         .and_then(|_| tools.start(&profile, &launch_args(&options)))
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
     runtime.log("success", format!("Starting {name}"));
@@ -298,6 +304,12 @@ async fn save_profile_settings(
     Json(options): Json<ProfileOptions>,
 ) -> ApiResult<ApiMessage> {
     let mut runtime = lock(&shared)?;
+    if options.window_scale.is_none() {
+        runtime
+            .tools()
+            .forget_window_scale(&name)
+            .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
+    }
     runtime.config.profile_options.insert(name.clone(), options);
     runtime
         .config
@@ -337,6 +349,8 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
             PicturePreset::Sharp => "1080x1920",
         }
         .into(),
+        "-dpi-device".into(),
+        options.dpi.to_string(),
     ];
     if let Some(port) = options.adb_port {
         args.extend(["-port".into(), port.to_string()]);
@@ -369,8 +383,10 @@ mod tests {
     fn uses_frostguard_friendly_resolution_by_default() {
         let args = launch_args(&ProfileOptions::default());
         let skin = args.iter().position(|arg| arg == "-skin").unwrap();
+        let dpi = args.iter().position(|arg| arg == "-dpi-device").unwrap();
 
         assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+        assert_eq!(args.get(dpi + 1).map(String::as_str), Some("240"));
     }
 }
 

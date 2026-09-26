@@ -54,7 +54,7 @@ pub struct ProfileOptions {
     pub host_keyboard: bool,
     pub device_frame: bool,
     pub mute_audio: bool,
-    pub window_scale: f32,
+    pub window_scale: Option<f32>,
 }
 
 impl Default for ProfileOptions {
@@ -65,14 +65,14 @@ impl Default for ProfileOptions {
             window: WindowPreset::Remember,
             cores: 4,
             memory_mb: 4096,
-            dpi: 320,
+            dpi: 240,
             adb_port: None,
             gpu_mode: "auto".into(),
             cold_boot: false,
             host_keyboard: true,
             device_frame: false,
             mute_audio: false,
-            window_scale: 0.7,
+            window_scale: None,
         }
     }
 }

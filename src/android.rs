@@ -1,4 +1,5 @@
 use crate::model::AndroidProfile;
+use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
     fs,
@@ -229,15 +230,16 @@ impl AndroidTools {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
         let log = fs::File::create(log_path).map_err(|err| err.to_string())?;
-        Command::new(emulator)
+        let mut command = Command::new(emulator);
+        command
             .arg("-avd")
             .arg(&profile.name)
             .args(args)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
             .stderr(Stdio::from(log))
-            .spawn()
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+            .process_group(0);
+        command.spawn().map(|_| ()).map_err(|err| err.to_string())
     }
 
     pub fn configure_input_and_window(
@@ -275,6 +277,19 @@ impl AndroidTools {
         let scale = scale.clamp(0.45, 1.0);
         let text = set_ini_value(&text, "window.scale", &format!("{scale:.6}"));
         fs::write(&path, text)
+            .map_err(|error| format!("Could not update {}: {error}", path.display()))
+    }
+
+    pub fn forget_window_scale(&self, profile_name: &str) -> Result<(), String> {
+        validate_profile_name(profile_name)?;
+        let path = home_path(&format!(
+            ".android/avd/{profile_name}.avd/emulator-user.ini"
+        ))
+        .ok_or("HOME is not set")?;
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        fs::write(&path, remove_ini_value(&text, "window.scale"))
             .map_err(|error| format!("Could not update {}: {error}", path.display()))
     }
 
@@ -432,6 +447,22 @@ fn set_ini_value(text: &str, key: &str, value: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+fn remove_ini_value(text: &str, key: &str) -> String {
+    let lines = text
+        .lines()
+        .filter(|line| {
+            !line
+                .split_once('=')
+                .is_some_and(|(candidate, _)| candidate.trim() == key)
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +494,11 @@ mod tests {
         assert_eq!(updated, "hw.keyboard=yes\nfoo=bar\n");
         let inserted = set_ini_value("foo=bar\n", "showDeviceFrame", "no");
         assert_eq!(inserted, "foo=bar\nshowDeviceFrame=no\n");
+    }
+
+    #[test]
+    fn removes_a_remembered_ini_value() {
+        let updated = remove_ini_value("window.x = 10\nwindow.scale = 0.7\n", "window.scale");
+        assert_eq!(updated, "window.x = 10\n");
     }
 }

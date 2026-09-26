@@ -88,7 +88,7 @@ type ProfileOptions = {
   host_keyboard: boolean;
   device_frame: boolean;
   mute_audio: boolean;
-  window_scale: number;
+  window_scale: number | null;
 };
 
 type AppState = {
@@ -108,14 +108,14 @@ const defaultOptions: ProfileOptions = {
   window: "Remember",
   cores: 4,
   memory_mb: 4096,
-  dpi: 420,
+  dpi: 240,
   adb_port: null,
   gpu_mode: "auto",
   cold_boot: false,
   host_keyboard: true,
   device_frame: false,
   mute_audio: false,
-  window_scale: 0.7,
+  window_scale: null,
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -136,6 +136,10 @@ function statusLabel(profile: AndroidProfile, pending?: PendingAction) {
 
 function gib(bytes: number) {
   return (bytes / 1024 / 1024 / 1024).toFixed(1);
+}
+
+function resolutionLabel(picture: Picture) {
+  return picture === "Compact" ? "540 × 960" : picture === "Sharp" ? "1080 × 1920" : "720 × 1280";
 }
 
 function relativeTime(seconds: number) {
@@ -376,7 +380,7 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
             <Typography color="text.secondary">{profile.device_name || "Android device"}{profile.api_level ? ` · Android API ${profile.api_level}` : ""}</Typography>
             <Stack direction="row" gap={1} mt={1} flexWrap="wrap">
               <Chip size="small" color={running ? "success" : "default"} label={statusLabel(profile, pending)} />
-              {profile.resolution && <Chip size="small" variant="outlined" label={profile.resolution} />}
+              <Chip size="small" variant="outlined" label={`${resolutionLabel(options.picture)} configured`} />
               {profile.running_serial && <Chip size="small" variant="outlined" label={profile.running_serial} />}
             </Stack>
           </Box>
@@ -404,8 +408,14 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
         </SettingRow>
         <Divider />
         <SettingRow icon={<MonitorHeartRounded />} title="Window size" description="Changes how large Android appears on your desktop">
-          <ToggleButtonGroup exclusive value={draft.window_scale} size="small" onChange={(_, value: number | null) => value && setDraft({ ...draft, window_scale: value })}>
-            <ToggleButton value={0.55}>Compact</ToggleButton><ToggleButton value={0.7}>Comfortable</ToggleButton><ToggleButton value={0.85}>Large</ToggleButton>
+          <ToggleButtonGroup exclusive value={draft.window_scale ?? "remember"} size="small" onChange={(_, value: number | "remember" | null) => value !== null && setDraft({ ...draft, window_scale: value === "remember" ? null : value })}>
+            <ToggleButton value="remember">Remember</ToggleButton><ToggleButton value={0.45}>Compact</ToggleButton><ToggleButton value={0.55}>Comfortable</ToggleButton><ToggleButton value={0.7}>Large</ToggleButton>
+          </ToggleButtonGroup>
+        </SettingRow>
+        <Divider />
+        <SettingRow icon={<TuneRounded />} title="Android UI size" description="Controls the size of text, buttons and apps inside Android">
+          <ToggleButtonGroup exclusive value={draft.dpi} size="small" onChange={(_, value: number | null) => value && setDraft({ ...draft, dpi: value })}>
+            <ToggleButton value={240}>Smaller</ToggleButton><ToggleButton value={280}>Normal</ToggleButton><ToggleButton value={320}>Larger</ToggleButton>
           </ToggleButtonGroup>
         </SettingRow>
         <Divider />
