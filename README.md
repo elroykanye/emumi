@@ -22,6 +22,7 @@ stopping Android profiles without requiring Android Studio.
 - Automatic Android SDK, Java, ADB, emulator and KVM discovery
 - Local lifecycle API for tools such as Frostguard
 - Native Tauri window with a bundled React and Material UI interface
+- Per-image compatibility runtimes stored privately in EmuMi's user data
 
 ## Requirements
 
@@ -43,7 +44,7 @@ sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 Download the `.deb` from the latest GitHub release and install it with:
 
 ```bash
-sudo apt install ./emumi_0.1.0_amd64.deb
+sudo apt install ./emumi_0.1.1_amd64.deb
 ```
 
 EmuMi then appears in the desktop application menu.
@@ -86,6 +87,24 @@ Create the Debian package with:
 
 EmuMi is independent from Frostguard/WOSBot. Frostguard integration uses
 EmuMi's local-only lifecycle API and stable ADB port assignments.
+
+## Compatibility runtimes
+
+EmuMi can select a locally prepared compatibility system image from
+`$XDG_DATA_HOME/emumi/runtime`, or `~/.local/share/emumi/runtime` when
+`XDG_DATA_HOME` is unset. The Android SDK's original system image is never
+modified.
+
+Every profile continues to use its own userdata disk and writable system
+overlay. When a compatibility runtime changes, EmuMi preserves the profile's
+previous system overlay as a `pre-emumi-runtime` backup before creating a new
+overlay against the updated runtime. Apps, Google accounts and game data stay
+in that profile's separate userdata image.
+
+Locally modified Android system images require verified boot to be disabled
+inside the emulator guest. This does not change Linux host security, and EmuMi
+only enables writable-system mode for profiles whose matching private runtime
+is present.
 
 ## License
 

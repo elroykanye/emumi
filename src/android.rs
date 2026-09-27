@@ -322,6 +322,10 @@ impl AndroidTools {
             .emulator
             .as_ref()
             .ok_or("Android Emulator was not found")?;
+        let runtime_image = runtime_system_image(&profile.name);
+        if let Some(image) = runtime_image.as_deref() {
+            prepare_profile_runtime_overlay(&profile.name, image)?;
+        }
         let log_path = state_path("emulator.log").ok_or("HOME is not set")?;
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -336,6 +340,12 @@ impl AndroidTools {
             .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
             .stderr(Stdio::from(log))
             .process_group(0);
+        if let Some(image) = runtime_image {
+            // Compatibility runtimes are private EmuMi copies. Each AVD still
+            // receives its own writable QCOW overlay and keeps userdata fully
+            // separate from every other profile.
+            command.arg("-system").arg(image).arg("-writable-system");
+        }
         command.spawn().map(|_| ()).map_err(|err| err.to_string())
     }
 
@@ -758,6 +768,104 @@ fn home_path(relative: &str) -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(relative))
 }
 
+fn data_path(relative: &str) -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_path(".local/share"))
+        .map(|base| base.join(relative))
+}
+
+fn runtime_system_image(profile_name: &str) -> Option<PathBuf> {
+    let config = home_path(&format!(".android/avd/{profile_name}.avd/config.ini"))?;
+    let config = fs::read_to_string(config).ok()?;
+    let image_sysdir = config.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "image.sysdir.1").then(|| value.trim())
+    })?;
+    let runtime_key = runtime_key_from_image_sysdir(image_sysdir)?;
+    let image = data_path(&format!("emumi/runtime/{runtime_key}/system.img"))?;
+    image.is_file().then_some(image)
+}
+
+fn runtime_key_from_image_sysdir(image_sysdir: &str) -> Option<String> {
+    let mut components = image_sysdir
+        .trim_matches('/')
+        .strip_prefix("system-images/")?
+        .split('/');
+    let api = components.next()?;
+    let flavor = components.next()?;
+    let architecture = components.next()?;
+    if components.next().is_some()
+        || [api, flavor, architecture]
+            .iter()
+            .any(|component| !safe_runtime_component(component))
+    {
+        return None;
+    }
+    Some(format!("{api}-{flavor}-{architecture}"))
+}
+
+fn safe_runtime_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn prepare_profile_runtime_overlay(profile_name: &str, runtime_image: &Path) -> Result<(), String> {
+    validate_profile_name(profile_name)?;
+    let avd_dir =
+        home_path(&format!(".android/avd/{profile_name}.avd")).ok_or("HOME is not set")?;
+    let metadata = fs::metadata(runtime_image)
+        .map_err(|error| format!("Could not inspect EmuMi compatibility runtime: {error}"))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let marker = format!(
+        "{}\n{}\n{}\n",
+        runtime_image.display(),
+        metadata.len(),
+        modified
+    );
+    let marker_path = avd_dir.join("emumi-system-runtime");
+    if fs::read_to_string(&marker_path).ok().as_deref() == Some(marker.as_str()) {
+        return Ok(());
+    }
+
+    let overlay = avd_dir.join("system.img.qcow2");
+    if overlay.is_file() {
+        let backup = unique_runtime_overlay_backup(&avd_dir);
+        fs::rename(&overlay, &backup).map_err(|error| {
+            format!(
+                "Could not preserve the previous Android system overlay at {}: {error}",
+                backup.display()
+            )
+        })?;
+    }
+    fs::write(&marker_path, marker)
+        .map_err(|error| format!("Could not activate the EmuMi compatibility runtime: {error}"))
+}
+
+fn unique_runtime_overlay_backup(avd_dir: &Path) -> PathBuf {
+    let base = avd_dir.join("system.img.qcow2.pre-emumi-runtime");
+    if !base.exists() {
+        return base;
+    }
+    for suffix in 2..=9999 {
+        let candidate = avd_dir.join(format!("system.img.qcow2.pre-emumi-runtime-{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    avd_dir.join(format!(
+        "system.img.qcow2.pre-emumi-runtime-{}",
+        now_millis()
+    ))
+}
+
 fn state_path(relative: &str) -> Option<PathBuf> {
     if let Some(base) = std::env::var_os("XDG_STATE_HOME") {
         return Some(PathBuf::from(base).join("emumi").join(relative));
@@ -846,6 +954,22 @@ mod tests {
         assert!(validate_profile_name("Pixel_7_work").is_ok());
         assert!(validate_profile_name("bad profile").is_err());
         assert!(validate_profile_name("../bad").is_err());
+    }
+
+    #[test]
+    fn maps_sdk_images_to_private_runtime_keys() {
+        assert_eq!(
+            runtime_key_from_image_sysdir("system-images/android-36/google_apis_playstore/x86_64/")
+                .as_deref(),
+            Some("android-36-google_apis_playstore-x86_64")
+        );
+        assert!(runtime_key_from_image_sysdir("../outside").is_none());
+        assert!(
+            runtime_key_from_image_sysdir(
+                "system-images/android-36/google_apis_playstore/x86_64/extra"
+            )
+            .is_none()
+        );
     }
 
     #[test]
