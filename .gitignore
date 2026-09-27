@@ -1,4 +1,6 @@
 .tools/
+.runtime-build/
+.runtime/
 frontend/node_modules/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
