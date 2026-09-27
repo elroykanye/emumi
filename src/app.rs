@@ -1,7 +1,7 @@
 use crate::{
     android::AndroidTools,
     config::AppConfig,
-    model::{PicturePreset, ProfileOptions},
+    model::{PicturePreset, ProfileOptions, SpeedPreset},
     monitor::HostMonitor,
 };
 use axum::{
@@ -13,7 +13,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -21,6 +23,7 @@ use tokio::net::TcpListener;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
+const MAX_RUNNING_PROFILES: usize = 4;
 
 type Shared = Arc<Mutex<Runtime>>;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
@@ -31,6 +34,8 @@ struct Runtime {
     config: AppConfig,
     logs: Vec<ApiLog>,
     monitor: HostMonitor,
+    rectangular_watchers: BTreeSet<String>,
+    starting_profiles: BTreeSet<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -84,6 +89,11 @@ struct CreateRequest {
     package_id: String,
 }
 
+#[derive(Deserialize)]
+struct CloneRequest {
+    name: String,
+}
+
 impl EmuMiApp {
     pub async fn start_server() -> Result<String, Box<dyn std::error::Error>> {
         let config = AppConfig::load();
@@ -91,6 +101,8 @@ impl EmuMiApp {
             config,
             logs: vec![ApiLog::new("success", "EmuMi is ready")],
             monitor: HostMonitor::default(),
+            rectangular_watchers: BTreeSet::new(),
+            starting_profiles: BTreeSet::new(),
         }));
 
         let app = Router::new()
@@ -101,13 +113,17 @@ impl EmuMiApp {
             .route("/api/profiles/{name}", delete(delete_profile))
             .route("/api/profiles/{name}/start", post(start_profile))
             .route("/api/profiles/{name}/stop", post(stop_profile))
+            .route("/api/profiles/{name}/clone", post(clone_profile))
             .route("/api/profiles/{name}/settings", post(save_profile_settings))
+            .route("/api/ports/{port}/start", post(start_port))
+            .route("/api/ports/{port}/stop", post(stop_port))
             .route("/api/settings", post(save_settings))
             .with_state(runtime);
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let url = format!("http://{address}");
+        write_api_endpoint(&url)?;
         tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("EmuMi server stopped: {error}");
@@ -141,6 +157,49 @@ impl Runtime {
             self.logs.drain(..self.logs.len() - 200);
         }
     }
+
+    fn ensure_profile_ports(&mut self, profile_names: &[String]) {
+        let mut used = BTreeSet::new();
+        for name in profile_names {
+            let options = self.config.profile_options.entry(name.clone()).or_default();
+            if let Some(port) = options.adb_port {
+                if !(5554..=5682).contains(&port) || port % 2 != 0 || !used.insert(port) {
+                    options.adb_port = None;
+                }
+            }
+        }
+        let mut changed = false;
+        for name in profile_names {
+            let options = self.config.profile_options.entry(name.clone()).or_default();
+            if options.adb_port.is_none() {
+                if let Some(port) = (5554..=5682).step_by(2).find(|port| !used.contains(port)) {
+                    options.adb_port = Some(port);
+                    used.insert(port);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let _ = self.config.save();
+        }
+    }
+
+    fn next_profile_port(&self) -> Option<u16> {
+        let active_profiles = self
+            .tools()
+            .discover_profiles()
+            .into_iter()
+            .map(|profile| profile.name)
+            .collect::<BTreeSet<_>>();
+        let used = self
+            .config
+            .profile_options
+            .iter()
+            .filter(|(name, _)| active_profiles.contains(*name))
+            .filter_map(|(_, options)| options.adb_port)
+            .collect::<BTreeSet<_>>();
+        (5554..=5682).step_by(2).find(|port| !used.contains(port))
+    }
 }
 
 async fn index() -> Html<&'static str> {
@@ -158,6 +217,35 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
     let mut runtime = lock(&shared)?;
     let tools = runtime.tools();
     let profiles = tools.discover_profiles();
+    runtime.ensure_profile_ports(
+        &profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>(),
+    );
+    let running_names = profiles
+        .iter()
+        .filter(|profile| profile.is_running())
+        .map(|profile| profile.name.clone())
+        .collect::<BTreeSet<_>>();
+    runtime
+        .rectangular_watchers
+        .retain(|name| running_names.contains(name));
+    for profile in &profiles {
+        let rectangular = runtime
+            .config
+            .profile_options
+            .get(&profile.name)
+            .cloned()
+            .unwrap_or_default()
+            .rectangular_display;
+        if profile.is_running()
+            && rectangular
+            && runtime.rectangular_watchers.insert(profile.name.clone())
+        {
+            tools.watch_rectangular_display_after_start(&profile.name);
+        }
+    }
     let system_images = tools
         .installed_system_images()
         .into_iter()
@@ -216,6 +304,13 @@ async fn create_profile(
     tools
         .create_profile(request.name.trim(), &request.device_id, &image)
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
+    let mut options = ProfileOptions::default();
+    options.adb_port = runtime.next_profile_port();
+    runtime
+        .config
+        .profile_options
+        .insert(request.name.trim().to_owned(), options);
+    let _ = runtime.config.save();
     runtime.log("success", format!("Created {}", request.name.trim()));
     Ok(message("Android created"))
 }
@@ -224,6 +319,10 @@ async fn start_profile(
     State(shared): State<Shared>,
     Path(name): Path<String>,
 ) -> ApiResult<ApiMessage> {
+    start_named_profile(&shared, &name)
+}
+
+fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let mut runtime = lock(&shared)?;
     let tools = runtime.tools();
     let profile = tools
@@ -232,16 +331,32 @@ async fn start_profile(
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
     if profile.is_running() {
+        runtime.starting_profiles.remove(name);
         return Ok(message("Android is already running"));
+    }
+    if runtime.starting_profiles.contains(name) {
+        return Ok(message("Android is already starting"));
+    }
+    let running = tools
+        .discover_profiles()
+        .into_iter()
+        .filter(|candidate| candidate.is_running())
+        .count();
+    if running + runtime.starting_profiles.len() >= MAX_RUNNING_PROFILES {
+        return api_error(
+            StatusCode::CONFLICT,
+            "This computer is limited to four running Androids. Stop an idle one first.",
+        );
     }
     let options = runtime
         .config
         .profile_options
-        .entry(name.clone())
+        .entry(name.to_owned())
         .or_default()
         .clone();
+    runtime.starting_profiles.insert(name.to_owned());
     let (display_width, display_height) = display_dimensions(options.picture);
-    tools
+    let start_result = tools
         .configure_input_and_window(
             &name,
             options.host_keyboard,
@@ -249,6 +364,7 @@ async fn start_profile(
             display_width,
             display_height,
             options.dpi,
+            options.speed == SpeedPreset::LeanGaming,
         )
         .and_then(|_| {
             if let Some(scale) = options.window_scale {
@@ -257,9 +373,42 @@ async fn start_profile(
                 Ok(())
             }
         })
-        .and_then(|_| tools.start(&profile, &launch_args(&options)))
-        .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
+        .and_then(|_| tools.start(&profile, &launch_args(&options)));
+    if let Err(message) = start_result {
+        runtime.starting_profiles.remove(name);
+        return Err(error_tuple(StatusCode::BAD_REQUEST, message));
+    }
+    if options.rectangular_display {
+        runtime.rectangular_watchers.insert(name.to_owned());
+        tools.watch_rectangular_display_after_start(&name);
+    }
+    if options.speed == SpeedPreset::LeanGaming {
+        tools.watch_lean_profile_after_start(name);
+    }
     runtime.log("success", format!("Starting {name}"));
+    let cleanup_shared = Arc::clone(shared);
+    let cleanup_name = name.to_owned();
+    tokio::spawn(async move {
+        for _ in 0..240 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let Ok(mut runtime) = cleanup_shared.lock() else {
+                return;
+            };
+            let running = runtime
+                .tools()
+                .discover_profiles()
+                .into_iter()
+                .any(|profile| profile.name == cleanup_name && profile.is_running());
+            if running {
+                runtime.starting_profiles.remove(&cleanup_name);
+                return;
+            }
+        }
+        if let Ok(mut runtime) = cleanup_shared.lock() {
+            runtime.starting_profiles.remove(&cleanup_name);
+            runtime.log("warning", format!("{cleanup_name} did not finish starting"));
+        }
+    });
     Ok(message("Android is starting"))
 }
 
@@ -267,7 +416,12 @@ async fn stop_profile(
     State(shared): State<Shared>,
     Path(name): Path<String>,
 ) -> ApiResult<ApiMessage> {
+    stop_named_profile(&shared, &name)
+}
+
+fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let mut runtime = lock(&shared)?;
+    runtime.starting_profiles.remove(name);
     let tools = runtime.tools();
     let profile = tools
         .discover_profiles()
@@ -282,6 +436,99 @@ async fn stop_profile(
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
     runtime.log("info", format!("Stopped {name}"));
     Ok(message("Android stopped"))
+}
+
+async fn start_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiResult<ApiMessage> {
+    let name = profile_name_for_port(&shared, port)?;
+    start_named_profile(&shared, &name)
+}
+
+async fn stop_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiResult<ApiMessage> {
+    let name = profile_name_for_port(&shared, port)?;
+    stop_named_profile(&shared, &name)
+}
+
+fn profile_name_for_port(
+    shared: &Shared,
+    port: u16,
+) -> Result<String, (StatusCode, Json<ApiMessage>)> {
+    lock(shared)?
+        .config
+        .profile_options
+        .iter()
+        .find_map(|(name, options)| (options.adb_port == Some(port)).then(|| name.clone()))
+        .ok_or_else(|| {
+            error_tuple(
+                StatusCode::NOT_FOUND,
+                format!("No Android uses ADB port {port}"),
+            )
+        })
+}
+
+async fn clone_profile(
+    State(shared): State<Shared>,
+    Path(source_name): Path<String>,
+    Json(request): Json<CloneRequest>,
+) -> ApiResult<ApiMessage> {
+    let clone_name = request.name.trim().to_owned();
+    let (tools, mut options) = {
+        let runtime = lock(&shared)?;
+        let profiles = runtime.tools().discover_profiles();
+        let source = profiles
+            .iter()
+            .find(|profile| profile.name == source_name)
+            .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Source Android not found"))?;
+        if source.is_running() {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Stop the source Android before cloning it",
+            );
+        }
+        if profiles.iter().any(|profile| profile.name == clone_name) {
+            return api_error(StatusCode::CONFLICT, "That clone name is already in use");
+        }
+        let options = runtime
+            .config
+            .profile_options
+            .get(&source_name)
+            .cloned()
+            .unwrap_or_default();
+        let mut options = options;
+        if options.window_scale.is_none() {
+            options.window_scale = ProfileOptions::default().window_scale;
+        }
+        (runtime.tools(), options)
+    };
+
+    let source_for_copy = source_name.clone();
+    let clone_for_copy = clone_name.clone();
+    tokio::task::spawn_blocking(move || tools.clone_profile(&source_for_copy, &clone_for_copy))
+        .await
+        .map_err(|error| {
+            error_tuple(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Clone worker failed: {error}"),
+            )
+        })?
+        .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
+
+    options.adb_port = runtime_port(&shared)?;
+    options.cold_boot = true;
+    let mut runtime = lock(&shared)?;
+    runtime
+        .config
+        .profile_options
+        .insert(clone_name.clone(), options);
+    runtime
+        .config
+        .save()
+        .map_err(|error| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    runtime.log("success", format!("Cloned {source_name} as {clone_name}"));
+    Ok(message(format!("{clone_name} cloned successfully")))
+}
+
+fn runtime_port(shared: &Shared) -> Result<Option<u16>, (StatusCode, Json<ApiMessage>)> {
+    Ok(lock(shared)?.next_profile_port())
 }
 
 async fn delete_profile(
@@ -366,6 +613,16 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
     args
 }
 
+fn write_api_endpoint(url: &str) -> std::io::Result<()> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .ok_or_else(|| std::io::Error::other("HOME is not set"))?;
+    let directory = base.join("emumi");
+    fs::create_dir_all(&directory)?;
+    fs::write(directory.join("api-url"), format!("{url}\n"))
+}
+
 fn display_dimensions(picture: PicturePreset) -> (u16, u16) {
     match picture {
         PicturePreset::Compact => (540, 960),
@@ -377,7 +634,7 @@ fn display_dimensions(picture: PicturePreset) -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::launch_args;
-    use crate::model::ProfileOptions;
+    use crate::model::{ProfileOptions, SpeedPreset};
 
     #[test]
     fn disables_emulator_audio_when_profile_is_muted() {
@@ -390,11 +647,35 @@ mod tests {
     }
 
     #[test]
+    fn lean_gaming_uses_small_hardware_accelerated_devices() {
+        let options = ProfileOptions::default();
+        let args = launch_args(&options);
+        assert_eq!(options.speed, SpeedPreset::LeanGaming);
+        assert_eq!(options.cores, 2);
+        assert_eq!(options.memory_mb, 4096);
+        assert_eq!(options.gpu_mode, "host");
+        assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(args.contains(&"-no-audio".to_owned()));
+    }
+
+    #[test]
     fn uses_frostguard_friendly_resolution_by_default() {
         let args = launch_args(&ProfileOptions::default());
         let skin = args.iter().position(|arg| arg == "-skin").unwrap();
 
         assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+    }
+
+    #[test]
+    fn launches_with_the_profiles_stable_adb_slot() {
+        let options = ProfileOptions {
+            adb_port: Some(5558),
+            ..ProfileOptions::default()
+        };
+        let args = launch_args(&options);
+        let port = args.iter().position(|arg| arg == "-port").unwrap();
+
+        assert_eq!(args.get(port + 1).map(String::as_str), Some("5558"));
     }
 }
 

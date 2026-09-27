@@ -1,51 +1,88 @@
 # EmuMi
 
-**Android emulators, made easy.**
+**Android emulators, made easy on Linux.**
 
-EmuMi is a friendly Linux desktop manager for Android Virtual Devices. It keeps
-the everyday controls obvious, while preserving detailed emulator controls in a
-collapsed Advanced section.
+EmuMi is a focused desktop manager for Android Virtual Devices. It provides a
+small, readable interface for creating, cloning, configuring, starting and
+stopping Android profiles without requiring Android Studio.
 
-## Current prototype
+## Features
 
-- Runs as one native Tauri window with a bundled React + Material UI interface
-- Discovers Android SDK, Java, AVD profiles, ADB devices, and KVM
-- Shows profile status and host CPU/RAM monitoring
-- Creates and deletes AVD profiles using installed Android system images
-- Starts and stops emulator profiles through the official Android Emulator
-- Reconciles running state with ADB every two seconds
-- Stores SDK/JDK paths in the user's XDG configuration directory
-- Keeps an in-app activity log
+- Create, clone and remove Android emulator profiles
+- Preserve apps, accounts and Android data when cloning a stopped profile
+- Stable sequential ADB ports (`5554`, `5556`, `5558`, ...)
+- Simple performance, resolution, window-size and audio controls
+- Lean Gaming defaults: 2 CPU cores, 4 GB RAM, 720 × 1280 at 240 dpi and host GPU
+- Up to four concurrently running Android devices
+- Live device state plus host CPU and memory monitoring
+- Automatic Android SDK, Java, ADB, emulator and KVM discovery
+- Local lifecycle API for tools such as Frostguard
+- Native Tauri window with a bundled React and Material UI interface
 
-## Run from source
+## Requirements
+
+- A Linux desktop with KVM virtualization available
+- Android SDK command-line tools, Emulator and an x86_64 system image
+- Java 17 or newer
+- WebKitGTK 4.1 and GTK 3 runtime libraries
+
+Android Studio is not required. EmuMi uses the standalone Android SDK tools.
+
+On Ubuntu or Linux Mint, the desktop runtime libraries can be installed with:
 
 ```bash
-cargo run
+sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 ```
 
-The compiled frontend is checked into `web/`, so running the native app does
-not require Node.js. To change the interface, install Node.js 24 and rebuild it:
+## Install a release
+
+Download the `.deb` from the latest GitHub release and install it with:
+
+```bash
+sudo apt install ./emumi_0.1.0_amd64.deb
+```
+
+EmuMi then appears in the desktop application menu.
+
+## Build from source
+
+The compiled frontend is checked into `web/`, so Node.js is not needed unless
+you are modifying the interface:
+
+```bash
+cargo build --release
+```
+
+To rebuild the frontend, use Node.js 24:
 
 ```bash
 cd frontend
 npm install
 npm run build
 cd ..
-cargo run
+cargo build --release
 ```
 
-Android Studio is not required. EmuMi uses the standalone Android SDK command-
-line tools and Emulator package.
+Create the Debian package with:
+
+```bash
+./scripts/package-deb.sh
+```
 
 ## Project layout
 
-- `src/app.rs` — private local API and application state
-- `src/android.rs` — SDK discovery and emulator/ADB adapter
-- `src/config.rs` — user configuration persistence
-- `src/monitor.rs` — lightweight Linux host monitoring
+- `src/app.rs` — private loopback API and application state
+- `src/android.rs` — Android SDK, emulator and ADB integration
+- `src/config.rs` — XDG user configuration persistence
+- `src/monitor.rs` — Linux host monitoring
 - `src/model.rs` — shared application models
-- `frontend/` — React, TypeScript, and Material UI source (no CSS files)
+- `frontend/` — React, TypeScript and Material UI source
 - `web/` — compiled interface bundled into the native binary
-- `tauri.conf.json` — native application-window configuration
+- `scripts/package-deb.sh` — reproducible Mint/Ubuntu release package
 
-This repository is intentionally independent from Frostguard/WOSBot.
+EmuMi is independent from Frostguard/WOSBot. Frostguard integration uses
+EmuMi's local-only lifecycle API and stable ADB port assignments.
+
+## License
+
+MIT

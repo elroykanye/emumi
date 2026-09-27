@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EmuMi
+Comment=Android emulators, made easy
+Exec=emumi
+Icon=dev.elroy.emumi
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true

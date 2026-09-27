@@ -17,6 +17,7 @@ import {
   DialogTitle,
   Divider,
   Drawer,
+  Fade,
   FormControl,
   FormControlLabel,
   InputLabel,
@@ -45,6 +46,7 @@ import {
   CheckCircleRounded,
   ChevronRightRounded,
   CodeRounded,
+  ContentCopyRounded,
   DeleteOutlineRounded,
   ExpandMoreRounded,
   HelpOutlineRounded,
@@ -64,7 +66,7 @@ import {
 
 type Page = "androids" | "monitor" | "logs" | "settings";
 type PendingAction = "starting" | "stopping";
-type Speed = "Efficient" | "Balanced" | "Fast";
+type Speed = "Efficient" | "LeanGaming" | "Balanced" | "Fast";
 type Picture = "Compact" | "Phone" | "Sharp";
 
 type AndroidProfile = {
@@ -87,6 +89,7 @@ type ProfileOptions = {
   cold_boot: boolean;
   host_keyboard: boolean;
   device_frame: boolean;
+  rectangular_display: boolean;
   mute_audio: boolean;
   window_scale: number | null;
 };
@@ -103,19 +106,20 @@ type AppState = {
 
 const drawerWidth = 244;
 const defaultOptions: ProfileOptions = {
-  speed: "Balanced",
+  speed: "LeanGaming",
   picture: "Phone",
   window: "Remember",
-  cores: 4,
+  cores: 2,
   memory_mb: 4096,
   dpi: 240,
   adb_port: null,
-  gpu_mode: "auto",
+  gpu_mode: "host",
   cold_boot: false,
   host_keyboard: true,
   device_frame: false,
-  mute_audio: false,
-  window_scale: null,
+  rectangular_display: true,
+  mute_audio: true,
+  window_scale: 0.55,
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -132,6 +136,28 @@ function statusLabel(profile: AndroidProfile, pending?: PendingAction) {
   if (pending === "starting") return "Starting…";
   if (pending === "stopping") return "Stopping…";
   return profile.running_serial ? "Running" : "Stopped";
+}
+
+function runActionLabel(profile: AndroidProfile, pending?: PendingAction) {
+  if (pending === "starting") return "Starting…";
+  if (pending === "stopping") return "Stopping…";
+  return profile.running_serial ? "Stop" : "Start";
+}
+
+function displayProfileName(name: string) {
+  const automatic = /^Device_(\d+)$/.exec(name);
+  return automatic ? `Device ${automatic[1]}` : name;
+}
+
+function nextDeviceName(profiles: AndroidProfile[]) {
+  const used = new Set(profiles.map((profile) => profile.name));
+  let number = 1;
+  while (used.has(`Device_${number}`)) number += 1;
+  return `Device ${number}`;
+}
+
+function internalProfileName(name: string) {
+  return name.trim().replace(/\s+/g, "_");
 }
 
 function gib(bytes: number) {
@@ -157,6 +183,7 @@ export default function App() {
   const [pending, setPending] = useState<Record<string, PendingAction>>({});
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteName, setDeleteName] = useState<string | null>(null);
+  const [cloneSource, setCloneSource] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ message: string; error: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -216,7 +243,7 @@ export default function App() {
   ];
 
   return (
-    <Box sx={{ display: "flex", minHeight: "100vh" }}>
+    <Box sx={{ display: "flex", height: "100vh", overflow: "hidden" }}>
       <Drawer
         variant="permanent"
         sx={{ width: drawerWidth, flexShrink: 0, "& .MuiDrawer-paper": { width: drawerWidth, boxSizing: "border-box", bgcolor: "#111714", color: "#eaf2ed", border: 0 } }}
@@ -246,8 +273,8 @@ export default function App() {
         </Box>
       </Drawer>
 
-      <Box component="main" sx={{ flexGrow: 1, minWidth: 0 }}>
-        <AppBar position="sticky" color="inherit" elevation={0} sx={{ borderBottom: "1px solid", borderColor: "divider" }}>
+      <Box component="main" sx={{ display: "flex", flexDirection: "column", flexGrow: 1, minWidth: 0, minHeight: 0, overflow: "hidden" }}>
+        <AppBar position="static" color="inherit" elevation={0} sx={{ borderBottom: "1px solid", borderColor: "divider", flexShrink: 0 }}>
           <Toolbar sx={{ minHeight: "72px !important", gap: 2 }}>
             <Box sx={{ flexGrow: 1 }}>
               <Typography variant="h6">{nav.find((item) => item.id === page)?.label}</Typography>
@@ -258,12 +285,13 @@ export default function App() {
                 {page === "settings" && "Tools, paths and system readiness"}
               </Typography>
             </Box>
-            <Tooltip title="Refresh now"><span><Button variant="outlined" startIcon={<RefreshRounded />} onClick={() => void refresh(true)} disabled={!state}>Refresh</Button></span></Tooltip>
-            {page === "androids" && <Button variant="contained" startIcon={<AddRounded />} onClick={() => setCreateOpen(true)}>New Android</Button>}
+            <Tooltip title="Refresh now"><span><Button variant="outlined" startIcon={busy ? <CircularProgress size={17} /> : <RefreshRounded />} onClick={() => void refresh(true)} disabled={!state || busy}>Refresh</Button></span></Tooltip>
+            {page === "androids" && <Button variant="contained" startIcon={<AddRounded />} disabled={busy} onClick={() => setCreateOpen(true)}>New Android</Button>}
           </Toolbar>
         </AppBar>
 
-        <Box sx={{ p: { xs: 2, lg: 3 }, maxWidth: 1440, mx: "auto" }}>
+        <Fade in key={page} timeout={180}>
+        <Box sx={{ p: { xs: 2, lg: 3 }, width: "100%", maxWidth: 1440, mx: "auto", flexGrow: 1, minHeight: 0, overflowY: page === "androids" ? "hidden" : "auto" }}>
           {!state ? (
             <Stack alignItems="center" justifyContent="center" spacing={2} minHeight="60vh"><CircularProgress /><Typography color="text.secondary">Reading your Android setup…</Typography></Stack>
           ) : page === "androids" ? (
@@ -276,24 +304,28 @@ export default function App() {
               setPending={setPending}
               perform={perform}
               setDeleteName={setDeleteName}
+              setCloneSource={setCloneSource}
+              busy={busy}
             />
           ) : page === "monitor" ? (
             <MonitorPage state={state} />
           ) : page === "logs" ? (
             <LogsPage state={state} />
           ) : (
-            <SettingsPage state={state} perform={perform} />
+            <SettingsPage state={state} perform={perform} busy={busy} />
           )}
         </Box>
+        </Fade>
       </Box>
 
       {state && <CreateDialog open={createOpen} onClose={() => setCreateOpen(false)} state={state} busy={busy} perform={perform} onCreated={setSelectedName} />}
-      <Dialog open={Boolean(deleteName)} onClose={() => setDeleteName(null)} maxWidth="xs" fullWidth>
-        <DialogTitle>Delete {deleteName}?</DialogTitle>
+      <CloneDialog source={cloneSource} profiles={state?.profiles ?? []} onClose={() => setCloneSource(null)} busy={busy} perform={perform} onCreated={setSelectedName} />
+      <Dialog open={Boolean(deleteName)} onClose={busy ? undefined : () => setDeleteName(null)} maxWidth="xs" fullWidth>
+        <DialogTitle>Delete {deleteName ? displayProfileName(deleteName) : "Android"}?</DialogTitle>
         <DialogContent><Typography color="text.secondary">Its installed apps, files and emulator data will be permanently removed.</Typography></DialogContent>
         <DialogActions>
-          <Button onClick={() => setDeleteName(null)}>Cancel</Button>
-          <Button color="error" variant="contained" disabled={busy} onClick={() => deleteName && void perform(`/api/profiles/${encodeURIComponent(deleteName)}`, { method: "DELETE" }, () => setDeleteName(null))}>Delete Android</Button>
+          <Button onClick={() => setDeleteName(null)} disabled={busy}>Cancel</Button>
+          <Button color="error" variant="contained" startIcon={busy ? <CircularProgress size={18} color="inherit" /> : <DeleteOutlineRounded />} disabled={busy} onClick={() => deleteName && void perform(`/api/profiles/${encodeURIComponent(deleteName)}`, { method: "DELETE" }, () => setDeleteName(null))}>{busy ? "Deleting…" : "Delete Android"}</Button>
         </DialogActions>
       </Dialog>
       <Snackbar open={Boolean(notice)} autoHideDuration={3500} onClose={() => setNotice(null)} anchorOrigin={{ vertical: "bottom", horizontal: "center" }}>
@@ -305,7 +337,7 @@ export default function App() {
 
 type Perform = (path: string, init: RequestInit, success?: () => void) => Promise<void>;
 
-function AndroidsPage({ state, selected, selectedName, setSelectedName, pending, setPending, perform, setDeleteName }: {
+function AndroidsPage({ state, selected, selectedName, setSelectedName, pending, setPending, perform, setDeleteName, setCloneSource, busy }: {
   state: AppState;
   selected: AndroidProfile | null;
   selectedName: string | null;
@@ -314,28 +346,31 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
   setPending: React.Dispatch<React.SetStateAction<Record<string, PendingAction>>>;
   perform: Perform;
   setDeleteName: (name: string) => void;
+  setCloneSource: (name: string) => void;
+  busy: boolean;
 }) {
   return (
-    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(260px, 340px) minmax(0, 1fr)" }, gap: 3 }}>
-      <Stack spacing={1.5}>
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(260px, 340px) minmax(0, 1fr)" }, gridTemplateRows: { xs: "minmax(180px, auto) minmax(0, 1fr)", lg: "minmax(0, 1fr)" }, gap: 3, height: "100%", minHeight: 0 }}>
+      <Stack spacing={1.5} sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}>
         <Typography variant="overline" color="text.secondary">Your devices · {state.profiles.length}</Typography>
         {state.profiles.length === 0 ? (
           <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="No Androids yet" detail="Use New Android to create your first profile." />
         ) : state.profiles.map((profile) => {
           const running = Boolean(profile.running_serial);
+          const adbSlot = state.profile_options[profile.name]?.adb_port;
           return (
-            <Card key={profile.name} variant={selectedName === profile.name ? "elevation" : "outlined"} sx={{ borderColor: selectedName === profile.name ? "primary.main" : undefined }}>
+            <Card key={profile.name} variant="outlined" sx={{ borderColor: selectedName === profile.name ? "primary.main" : undefined, bgcolor: selectedName === profile.name ? "rgba(22, 117, 75, 0.045)" : "background.paper" }}>
               <ListItemButton selected={selectedName === profile.name} onClick={() => setSelectedName(profile.name)} sx={{ py: 1.5 }}>
                 <ListItemIcon><PhoneAndroidRounded color={running ? "success" : "action"} /></ListItemIcon>
-                <ListItemText primary={profile.name} secondary={`${profile.device_name || "Android device"}${profile.api_level ? ` · API ${profile.api_level}` : ""}`} primaryTypographyProps={{ fontWeight: 700 }} />
-                <Chip size="small" color={running ? "success" : "default"} label={statusLabel(profile, pending[profile.name])} />
+                <ListItemText primary={displayProfileName(profile.name)} secondary={`${profile.device_name || "Android device"}${profile.api_level ? ` · API ${profile.api_level}` : ""}${adbSlot ? ` · ADB ${adbSlot}` : ""}`} primaryTypographyProps={{ fontWeight: 700 }} />
+                <Chip size="small" color={pending[profile.name] ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending[profile.name])} />
               </ListItemButton>
             </Card>
           );
         })}
       </Stack>
       {selected ? (
-        <ProfileDetail profile={selected} options={state.profile_options[selected.name] ?? defaultOptions} pending={pending[selected.name]} setPending={setPending} perform={perform} setDeleteName={setDeleteName} />
+        <Fade in key={selected.name} timeout={160}><Box sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}><ProfileDetail profile={selected} options={state.profile_options[selected.name] ?? defaultOptions} pending={pending[selected.name]} setPending={setPending} perform={perform} setDeleteName={setDeleteName} setCloneSource={setCloneSource} busy={busy} /></Box></Fade>
       ) : (
         <EmptyState icon={<AndroidRounded fontSize="large" />} title="Choose an Android" detail="Its controls and settings will appear here." />
       )}
@@ -343,17 +378,21 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
   );
 }
 
-function ProfileDetail({ profile, options, pending, setPending, perform, setDeleteName }: {
+function ProfileDetail({ profile, options, pending, setPending, perform, setDeleteName, setCloneSource, busy }: {
   profile: AndroidProfile;
   options: ProfileOptions;
   pending?: PendingAction;
   setPending: React.Dispatch<React.SetStateAction<Record<string, PendingAction>>>;
   perform: Perform;
   setDeleteName: (name: string) => void;
+  setCloneSource: (name: string) => void;
+  busy: boolean;
 }) {
   const [draft, setDraft] = useState(options);
-  useEffect(() => setDraft(options), [profile.name, options]);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => setDraft(options), [profile.name]);
   const running = Boolean(profile.running_serial);
+  const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(options), [draft, options]);
 
   const toggleRun = async () => {
     const action: PendingAction = running ? "stopping" : "starting";
@@ -366,38 +405,60 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
   };
 
   const chooseSpeed = (speed: Speed) => {
-    const resources = { Efficient: [2, 2048], Balanced: [4, 4096], Fast: [8, 8192] } as const;
-    setDraft((value) => ({ ...value, speed, cores: resources[speed][0], memory_mb: resources[speed][1] }));
+    const resources = { Efficient: [2, 2048], LeanGaming: [2, 4096], Balanced: [4, 4096], Fast: [8, 8192] } as const;
+    setDraft((value) => ({
+      ...value,
+      speed,
+      cores: resources[speed][0],
+      memory_mb: resources[speed][1],
+      ...(speed === "LeanGaming" ? { picture: "Phone" as Picture, dpi: 240, gpu_mode: "host", mute_audio: true, rectangular_display: true } : {}),
+    }));
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await perform(`/api/profiles/${encodeURIComponent(profile.name)}/settings`, { method: "POST", body: JSON.stringify(draft) });
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
     <Stack spacing={3}>
       <Card><CardContent>
-        <Stack direction={{ xs: "column", sm: "row" }} gap={2} alignItems={{ sm: "center" }}>
-          <Box sx={{ width: 56, height: 56, borderRadius: 3, bgcolor: "primary.main", color: "primary.contrastText", display: "grid", placeItems: "center" }}><AndroidRounded fontSize="large" /></Box>
-          <Box sx={{ flexGrow: 1 }}>
-            <Typography variant="h5">{profile.name}</Typography>
-            <Typography color="text.secondary">{profile.device_name || "Android device"}{profile.api_level ? ` · Android API ${profile.api_level}` : ""}</Typography>
-            <Stack direction="row" gap={1} mt={1} flexWrap="wrap">
-              <Chip size="small" color={running ? "success" : "default"} label={statusLabel(profile, pending)} />
-              <Chip size="small" variant="outlined" label={`${resolutionLabel(options.picture)} configured`} />
-              {profile.running_serial && <Chip size="small" variant="outlined" label={profile.running_serial} />}
-            </Stack>
-          </Box>
-          <Button color="error" startIcon={<DeleteOutlineRounded />} disabled={running || Boolean(pending)} onClick={() => setDeleteName(profile.name)}>Delete</Button>
-          <Button variant="contained" color={running ? "error" : "primary"} startIcon={pending ? <CircularProgress size={18} color="inherit" /> : running ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending)} onClick={() => void toggleRun()}>{statusLabel(profile, pending) === "Stopped" ? "Start" : statusLabel(profile, pending) === "Running" ? "Stop" : statusLabel(profile, pending)}</Button>
+        <Stack spacing={2}>
+          <Stack direction="row" gap={2} alignItems="center">
+            <Box sx={{ width: 56, height: 56, borderRadius: 3, bgcolor: "primary.main", color: "primary.contrastText", display: "grid", flexShrink: 0, placeItems: "center" }}><AndroidRounded fontSize="large" /></Box>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="h5" noWrap>{displayProfileName(profile.name)}</Typography>
+              <Typography color="text.secondary">{profile.device_name || "Android device"}{profile.api_level ? ` · Android API ${profile.api_level}` : ""}</Typography>
+              <Stack direction="row" gap={1} mt={1} flexWrap="wrap">
+                <Chip size="small" color={pending ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending)} />
+                <Chip size="small" variant="outlined" label={`${resolutionLabel(options.picture)} configured`} />
+                <Chip size="small" variant="outlined" label={options.adb_port ? `ADB ${options.adb_port}` : "ADB automatic"} />
+                {profile.running_serial && <Chip size="small" variant="outlined" label={profile.running_serial} />}
+              </Stack>
+            </Box>
+          </Stack>
+          <Divider />
+          <Stack direction="row" gap={1} justifyContent="flex-end">
+            <Tooltip title={running ? "Stop this Android before cloning it" : "Copy apps, accounts and data"}><span><Button sx={{ minWidth: 104 }} variant="outlined" startIcon={<ContentCopyRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setCloneSource(profile.name)}>Clone</Button></span></Tooltip>
+            <Tooltip title={running ? "Stop this Android before deleting it" : "Delete this Android"}><span><Button sx={{ minWidth: 104 }} variant="outlined" color="error" startIcon={<DeleteOutlineRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setDeleteName(profile.name)}>Delete</Button></span></Tooltip>
+            <Button sx={{ minWidth: 112 }} variant="contained" color={running ? "error" : "primary"} startIcon={pending ? <CircularProgress size={18} color="inherit" /> : running ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending) || busy} onClick={() => void toggleRun()}>{runActionLabel(profile, pending)}</Button>
+          </Stack>
         </Stack>
       </CardContent></Card>
 
       <Card><CardContent>
         <Stack direction="row" alignItems="center" mb={2}>
           <Box sx={{ flexGrow: 1 }}><Typography variant="h6">Quick setup</Typography><Typography variant="body2" color="text.secondary">The useful controls, without emulator jargon.</Typography></Box>
-          <Button variant="contained" onClick={() => void perform(`/api/profiles/${encodeURIComponent(profile.name)}/settings`, { method: "POST", body: JSON.stringify(draft) })}>Save changes</Button>
+          <Button sx={{ minWidth: 132 }} variant={dirty ? "contained" : "outlined"} startIcon={saving ? <CircularProgress size={18} color="inherit" /> : !dirty ? <CheckCircleRounded /> : undefined} disabled={!dirty || saving || (busy && !saving)} onClick={() => void save()}>{saving ? "Saving…" : dirty ? "Save changes" : "Saved"}</Button>
         </Stack>
         <Divider />
         <SettingRow icon={<MemoryRounded />} title="Performance" description="Choose how much of this computer Android may use">
           <ToggleButtonGroup exclusive value={draft.speed} size="small" onChange={(_, value: Speed | null) => value && chooseSpeed(value)}>
-            <ToggleButton value="Efficient">Efficient</ToggleButton><ToggleButton value="Balanced">Balanced</ToggleButton><ToggleButton value="Fast">Fast</ToggleButton>
+            <ToggleButton value="Efficient">Efficient</ToggleButton><ToggleButton value="LeanGaming">Lean gaming</ToggleButton><ToggleButton value="Balanced">Balanced</ToggleButton><ToggleButton value="Fast">Fast</ToggleButton>
           </ToggleButtonGroup>
         </SettingRow>
         <Divider />
@@ -427,6 +488,10 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
           <Switch checked={draft.device_frame} onChange={(event) => setDraft({ ...draft, device_frame: event.target.checked })} />
         </SettingRow>
         <Divider />
+        <SettingRow icon={<AspectRatioRounded />} title="Rectangular app screen" description="Removes camera cutouts so automation coordinates line up">
+          <Switch checked={draft.rectangular_display} onChange={(event) => setDraft({ ...draft, rectangular_display: event.target.checked })} />
+        </SettingRow>
+        <Divider />
         <SettingRow icon={<VolumeOffRounded />} title="Mute Android audio" description="Launch this Android without sound output">
           <Switch checked={draft.mute_audio} onChange={(event) => setDraft({ ...draft, mute_audio: event.target.checked })} />
         </SettingRow>
@@ -437,7 +502,7 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
               <TextField label="CPU cores" type="number" value={draft.cores} onChange={(event) => setDraft({ ...draft, cores: Number(event.target.value) })} slotProps={{ htmlInput: { min: 1, max: 16 } }} />
               <TextField label="Memory (MB)" type="number" value={draft.memory_mb} onChange={(event) => setDraft({ ...draft, memory_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 512, max: 16384, step: 256 } }} />
               <FormControl><InputLabel>Graphics</InputLabel><Select label="Graphics" value={draft.gpu_mode} onChange={(event) => setDraft({ ...draft, gpu_mode: event.target.value })}><MenuItem value="auto">Automatic</MenuItem><MenuItem value="host">Hardware</MenuItem><MenuItem value="swiftshader_indirect">Software</MenuItem></Select></FormControl>
-              <TextField label="ADB port" type="number" value={draft.adb_port ?? ""} placeholder="Automatic" onChange={(event) => setDraft({ ...draft, adb_port: event.target.value ? Number(event.target.value) : null })} />
+              <TextField label="ADB slot" type="number" value={draft.adb_port ?? ""} placeholder="Assigned automatically" helperText="Stable slots use 5554, 5556, 5558…" onChange={(event) => setDraft({ ...draft, adb_port: event.target.value ? Number(event.target.value) : null })} slotProps={{ htmlInput: { min: 5554, max: 5682, step: 2 } }} />
               <FormControlLabel control={<Switch checked={draft.cold_boot} onChange={(event) => setDraft({ ...draft, cold_boot: event.target.checked })} />} label="Cold boot next time" />
             </Box>
           </AccordionDetails>
@@ -453,24 +518,45 @@ function SettingRow({ icon, title, description, children }: { icon: React.ReactN
 
 function CreateDialog({ open, onClose, state, busy, perform, onCreated }: { open: boolean; onClose: () => void; state: AppState; busy: boolean; perform: Perform; onCreated: (name: string) => void }) {
   const [name, setName] = useState("");
-  const [device, setDevice] = useState("pixel_8");
+  const [device, setDevice] = useState("Nexus 5X");
   const [image, setImage] = useState("");
-  useEffect(() => { if (open) { setName(""); setDevice("pixel_8"); setImage(state.system_images[0]?.package_id ?? ""); } }, [open, state.system_images]);
+  useEffect(() => { if (open) { setName(nextDeviceName(state.profiles)); setDevice("Nexus 5X"); setImage(state.system_images[0]?.package_id ?? ""); } }, [open]);
   const create = async () => {
     if (!name.trim() || !image) return;
+    const profileName = internalProfileName(name);
     try {
-      await perform("/api/profiles", { method: "POST", body: JSON.stringify({ name: name.trim(), device_id: device, package_id: image }) }, () => { onCreated(name.trim()); onClose(); });
+      await perform("/api/profiles", { method: "POST", body: JSON.stringify({ name: profileName, device_id: device, package_id: image }) }, () => { onCreated(profileName); onClose(); });
     } catch { /* Snackbar already shows the server message. */ }
   };
-  return <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
+  return <Dialog open={open} onClose={busy ? undefined : onClose} maxWidth="sm" fullWidth>
     <DialogTitle>Create a new Android</DialogTitle>
     <DialogContent><Stack spacing={2.5} pt={1}>
       <TextField autoFocus label="Name" placeholder="Work phone" value={name} onChange={(event) => setName(event.target.value)} helperText="A short name you will recognize" />
-      <FormControl><InputLabel>Device</InputLabel><Select label="Device" value={device} onChange={(event) => setDevice(event.target.value)}><MenuItem value="pixel_8">Pixel 8</MenuItem><MenuItem value="pixel_7">Pixel 7</MenuItem><MenuItem value="pixel_5">Pixel 5</MenuItem><MenuItem value="pixel_tablet">Pixel Tablet</MenuItem></Select></FormControl>
+      <FormControl><InputLabel>Device</InputLabel><Select label="Device" value={device} onChange={(event) => setDevice(event.target.value)}><MenuItem value="Nexus 5X">Automation phone (no cutout)</MenuItem><MenuItem value="pixel_8">Pixel 8</MenuItem><MenuItem value="pixel_7">Pixel 7</MenuItem><MenuItem value="pixel_5">Pixel 5</MenuItem><MenuItem value="pixel_tablet">Pixel Tablet</MenuItem></Select></FormControl>
       <FormControl disabled={!state.system_images.length}><InputLabel>Android version</InputLabel><Select label="Android version" value={image} onChange={(event) => setImage(event.target.value)}>{state.system_images.map((item) => <MenuItem key={item.package_id} value={item.package_id}>{item.label}</MenuItem>)}</Select></FormControl>
       {!state.system_images.length && <Alert severity="warning">No Android system image is installed. Install one with the Android SDK tools first.</Alert>}
     </Stack></DialogContent>
-    <DialogActions><Button onClick={onClose}>Cancel</Button><Button variant="contained" startIcon={busy ? <CircularProgress size={18} color="inherit" /> : <AddRounded />} disabled={busy || !name.trim() || !image} onClick={() => void create()}>Create Android</Button></DialogActions>
+    <DialogActions><Button onClick={onClose} disabled={busy}>Cancel</Button><Button variant="contained" startIcon={busy ? <CircularProgress size={18} color="inherit" /> : <AddRounded />} disabled={busy || !name.trim() || !image} onClick={() => void create()}>{busy ? "Creating…" : "Create Android"}</Button></DialogActions>
+  </Dialog>;
+}
+
+function CloneDialog({ source, profiles, onClose, busy, perform, onCreated }: { source: string | null; profiles: AndroidProfile[]; onClose: () => void; busy: boolean; perform: Perform; onCreated: (name: string) => void }) {
+  const [name, setName] = useState("");
+  useEffect(() => { if (source) setName(nextDeviceName(profiles)); }, [source]);
+  const clone = async () => {
+    if (!source || !name.trim()) return;
+    const cloneName = internalProfileName(name);
+    try {
+      await perform(`/api/profiles/${encodeURIComponent(source)}/clone`, { method: "POST", body: JSON.stringify({ name: cloneName }) }, () => { onCreated(cloneName); onClose(); });
+    } catch { /* Snackbar already shows the server message. */ }
+  };
+  return <Dialog open={Boolean(source)} onClose={busy ? undefined : onClose} maxWidth="xs" fullWidth>
+    <DialogTitle>Clone {source ? displayProfileName(source) : "Android"}</DialogTitle>
+    <DialogContent><Stack spacing={2} pt={1}>
+      <TextField autoFocus label="Clone name" value={name} onChange={(event) => setName(event.target.value)} helperText="Apps, accounts and Android data will be copied." />
+      <Alert severity="info">The source must be stopped. The clone keeps the source device type, apps and data, and receives the next available ADB slot.</Alert>
+    </Stack></DialogContent>
+    <DialogActions><Button onClick={onClose} disabled={busy}>Cancel</Button><Button variant="contained" startIcon={busy ? <CircularProgress size={18} color="inherit" /> : <ContentCopyRounded />} disabled={busy || !name.trim()} onClick={() => void clone()}>{busy ? "Cloning…" : "Clone Android"}</Button></DialogActions>
   </Dialog>;
 }
 
@@ -484,7 +570,7 @@ function MonitorPage({ state }: { state: AppState }) {
       <Metric title="Host memory" value={`${gib(used)} / ${gib(total)} GB`} progress={total ? used / total * 100 : 0} icon={<MonitorHeartRounded />} />
       <Metric title="Running now" value={`${running.length} Android${running.length === 1 ? "" : "s"}`} progress={state.profiles.length ? running.length / state.profiles.length * 100 : 0} icon={<PhoneAndroidRounded />} />
     </Box>
-    <Card><CardContent><Typography variant="h6" mb={2}>Live Androids</Typography>{running.length ? <List disablePadding>{running.map((profile) => <ListItem key={profile.name} divider><ListItemIcon><CheckCircleRounded color="success" /></ListItemIcon><ListItemText primary={profile.name} secondary={profile.device_name} /><Chip size="small" color="success" label={profile.running_serial} /></ListItem>)}</List> : <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="Nothing is running" detail="Start an Android to see it here." />}</CardContent></Card>
+    <Card><CardContent><Typography variant="h6" mb={2}>Live Androids</Typography>{running.length ? <List disablePadding>{running.map((profile) => <ListItem key={profile.name} divider><ListItemIcon><CheckCircleRounded color="success" /></ListItemIcon><ListItemText primary={displayProfileName(profile.name)} secondary={profile.device_name} /><Chip size="small" color="success" label={profile.running_serial} /></ListItem>)}</List> : <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="Nothing is running" detail="Start an Android to see it here." />}</CardContent></Card>
   </Stack>;
 }
 
@@ -496,10 +582,12 @@ function LogsPage({ state }: { state: AppState }) {
   return <Card><CardContent><Typography variant="h6">Recent activity</Typography><Typography variant="body2" color="text.secondary" mb={2}>Actions performed during this session</Typography><List disablePadding>{state.logs.length ? [...state.logs].reverse().map((entry, index) => <ListItem key={`${entry.at}-${index}`} divider={index < state.logs.length - 1}><ListItemIcon>{entry.level === "success" ? <CheckCircleRounded color="success" /> : entry.level === "error" ? <WarningAmberRounded color="error" /> : <ChevronRightRounded color="action" />}</ListItemIcon><ListItemText primary={entry.message} secondary={entry.level} /><Typography variant="caption" color="text.secondary">{relativeTime(entry.at)}</Typography></ListItem>) : <EmptyState icon={<TerminalRounded fontSize="large" />} title="No activity yet" detail="Actions will appear here." />}</List></CardContent></Card>;
 }
 
-function SettingsPage({ state, perform }: { state: AppState; perform: Perform }) {
+function SettingsPage({ state, perform, busy }: { state: AppState; perform: Perform; busy: boolean }) {
   const [sdkPath, setSdkPath] = useState(state.config.android_sdk_path);
   const [jdkPath, setJdkPath] = useState(state.config.jdk_path);
-  useEffect(() => { setSdkPath(state.config.android_sdk_path); setJdkPath(state.config.jdk_path); }, [state.config]);
+  useEffect(() => { setSdkPath(state.config.android_sdk_path); }, [state.config.android_sdk_path]);
+  useEffect(() => { setJdkPath(state.config.jdk_path); }, [state.config.jdk_path]);
+  const dirty = sdkPath !== state.config.android_sdk_path || jdkPath !== state.config.jdk_path;
   const checks = [
     ["Android Emulator", "Runs virtual devices", state.health.emulator],
     ["ADB", "Finds and controls running devices", state.health.adb],
@@ -508,7 +596,7 @@ function SettingsPage({ state, perform }: { state: AppState; perform: Perform })
     ["Java", "Runs Android SDK management tools", state.health.java],
   ] as const;
   return <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1.4fr) minmax(320px, 1fr)" }, gap: 3 }}>
-    <Card><CardContent><Stack direction="row" alignItems="center" mb={3}><Box sx={{ flexGrow: 1 }}><Typography variant="h6">Tool locations</Typography><Typography variant="body2" color="text.secondary">EmuMi normally detects these automatically.</Typography></Box><CodeRounded color="action" /></Stack><Stack spacing={2.5}><TextField fullWidth label="Android SDK path" value={sdkPath} onChange={(event) => setSdkPath(event.target.value)} helperText="Usually /home/you/Android/Sdk" /><TextField fullWidth label="JDK path" value={jdkPath} onChange={(event) => setJdkPath(event.target.value)} helperText="Leave blank to use Java from your PATH" /><Box><Button variant="contained" onClick={() => void perform("/api/settings", { method: "POST", body: JSON.stringify({ android_sdk_path: sdkPath, jdk_path: jdkPath }) })}>Save paths</Button></Box></Stack></CardContent></Card>
+    <Card><CardContent><Stack direction="row" alignItems="center" mb={3}><Box sx={{ flexGrow: 1 }}><Typography variant="h6">Tool locations</Typography><Typography variant="body2" color="text.secondary">EmuMi normally detects these automatically.</Typography></Box><CodeRounded color="action" /></Stack><Stack spacing={2.5}><TextField fullWidth label="Android SDK path" value={sdkPath} onChange={(event) => setSdkPath(event.target.value)} helperText="Usually /home/you/Android/Sdk" /><TextField fullWidth label="JDK path" value={jdkPath} onChange={(event) => setJdkPath(event.target.value)} helperText="Leave blank to use Java from your PATH" /><Box><Button sx={{ minWidth: 112 }} variant="contained" disabled={!dirty || busy} startIcon={busy ? <CircularProgress size={18} color="inherit" /> : undefined} onClick={() => void perform("/api/settings", { method: "POST", body: JSON.stringify({ android_sdk_path: sdkPath, jdk_path: jdkPath }) })}>{busy ? "Saving…" : dirty ? "Save paths" : "Saved"}</Button></Box></Stack></CardContent></Card>
     <Card><CardContent><Typography variant="h6">System check</Typography><Typography variant="body2" color="text.secondary" mb={2}>Everything required to create and run Androids</Typography><List disablePadding>{checks.map(([name, detail, ok]) => <ListItem key={name} disableGutters divider><ListItemIcon>{ok ? <CheckCircleRounded color="success" /> : <WarningAmberRounded color="warning" />}</ListItemIcon><ListItemText primary={name} secondary={detail} /><Chip size="small" color={ok ? "success" : "warning"} variant="outlined" label={ok ? "Ready" : "Check"} /></ListItem>)}</List><Alert severity="info" icon={<HelpOutlineRounded />} sx={{ mt: 2 }}>Changes take effect on the next refresh or launch.</Alert></CardContent></Card>
   </Box>;
 }

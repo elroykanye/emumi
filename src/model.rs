@@ -19,6 +19,7 @@ impl AndroidProfile {
 pub enum SpeedPreset {
     Efficient,
     #[default]
+    LeanGaming,
     Balanced,
     Fast,
 }
@@ -53,6 +54,7 @@ pub struct ProfileOptions {
     pub cold_boot: bool,
     pub host_keyboard: bool,
     pub device_frame: bool,
+    pub rectangular_display: bool,
     pub mute_audio: bool,
     pub window_scale: Option<f32>,
 }
@@ -60,19 +62,20 @@ pub struct ProfileOptions {
 impl Default for ProfileOptions {
     fn default() -> Self {
         Self {
-            speed: SpeedPreset::Balanced,
+            speed: SpeedPreset::LeanGaming,
             picture: PicturePreset::Phone,
             window: WindowPreset::Remember,
-            cores: 4,
+            cores: 2,
             memory_mb: 4096,
             dpi: 240,
             adb_port: None,
-            gpu_mode: "auto".into(),
+            gpu_mode: "host".into(),
             cold_boot: false,
             host_keyboard: true,
             device_frame: false,
-            mute_audio: false,
-            window_scale: None,
+            rectangular_display: true,
+            mute_audio: true,
+            window_scale: Some(0.55),
         }
     }
 }

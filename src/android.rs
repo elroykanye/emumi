@@ -6,6 +6,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,7 +110,15 @@ impl AndroidTools {
                 profile
             })
             .collect::<Vec<_>>();
-        profiles.sort_by_key(|profile| profile.name.to_lowercase());
+        profiles.sort_by_key(|profile| {
+            let created = home_path(&format!(".android/avd/{}.ini", profile.name))
+                .and_then(|path| fs::metadata(path).ok())
+                .and_then(|metadata| metadata.created().or_else(|_| metadata.modified()).ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or(u128::MAX);
+            (created, profile.name.to_lowercase())
+        });
         profiles
     }
 
@@ -220,6 +230,93 @@ impl AndroidTools {
         }
     }
 
+    pub fn clone_profile(&self, source_name: &str, clone_name: &str) -> Result<(), String> {
+        validate_profile_name(source_name)?;
+        validate_profile_name(clone_name)?;
+        if source_name == clone_name {
+            return Err("Give the clone a different name.".into());
+        }
+        if self
+            .running_avds()
+            .values()
+            .any(|running_name| running_name == source_name)
+        {
+            return Err("Stop the source Android before cloning it.".into());
+        }
+
+        let avd_root = home_path(".android/avd").ok_or("HOME is not set")?;
+        self.clone_profile_in_root(source_name, clone_name, &avd_root)
+    }
+
+    fn clone_profile_in_root(
+        &self,
+        source_name: &str,
+        clone_name: &str,
+        avd_root: &Path,
+    ) -> Result<(), String> {
+        let source_dir = avd_root.join(format!("{source_name}.avd"));
+        let source_ini = avd_root.join(format!("{source_name}.ini"));
+        let clone_dir = avd_root.join(format!("{clone_name}.avd"));
+        let clone_ini = avd_root.join(format!("{clone_name}.ini"));
+        if !source_dir.is_dir() || !source_ini.is_file() {
+            return Err(format!("Source Android {source_name} is incomplete."));
+        }
+        if clone_dir.exists() || clone_ini.exists() {
+            return Err(format!("An Android named {clone_name} already exists."));
+        }
+
+        let operation = format!("{}-{}", std::process::id(), now_millis());
+        let staging_dir = avd_root.join(format!(".{clone_name}.avd.emumi-{operation}"));
+        let staging_ini = avd_root.join(format!(".{clone_name}.ini.emumi-{operation}"));
+        let result = (|| {
+            let output = Command::new("cp")
+                .args(["--archive", "--reflink=auto", "--sparse=always", "--"])
+                .arg(&source_dir)
+                .arg(&staging_dir)
+                .output()
+                .map_err(|error| format!("Could not start the clone copy: {error}"))?;
+            if !output.status.success() {
+                let detail = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "Could not copy Android data: {}",
+                    detail.trim().lines().last().unwrap_or("copy failed")
+                ));
+            }
+
+            remove_clone_runtime_state(&staging_dir)?;
+            let config_path = staging_dir.join("config.ini");
+            let config = fs::read_to_string(&config_path)
+                .map_err(|error| format!("Could not read cloned config: {error}"))?;
+            let config = set_ini_value(&config, "avd.ini.displayname", clone_name);
+            let config = set_ini_value(&config, "avd.id", clone_name);
+            let config = set_ini_value(&config, "avd.name", clone_name);
+            fs::write(&config_path, config)
+                .map_err(|error| format!("Could not update cloned config: {error}"))?;
+
+            let outer = fs::read_to_string(&source_ini)
+                .map_err(|error| format!("Could not read source registration: {error}"))?;
+            let outer = set_ini_value(&outer, "path", &clone_dir.to_string_lossy());
+            let outer = set_ini_value(&outer, "path.rel", &format!("avd/{clone_name}.avd"));
+            fs::write(&staging_ini, outer)
+                .map_err(|error| format!("Could not register cloned Android: {error}"))?;
+
+            fs::rename(&staging_dir, &clone_dir)
+                .map_err(|error| format!("Could not finish cloned Android data: {error}"))?;
+            if let Err(error) = fs::rename(&staging_ini, &clone_ini) {
+                let _ = fs::remove_dir_all(&clone_dir);
+                return Err(format!(
+                    "Could not finish cloned Android registration: {error}"
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging_dir);
+            let _ = fs::remove_file(&staging_ini);
+        }
+        result
+    }
+
     pub fn start(&self, profile: &AndroidProfile, args: &[String]) -> Result<(), String> {
         let emulator = self
             .emulator
@@ -242,6 +339,84 @@ impl AndroidTools {
         command.spawn().map(|_| ()).map_err(|err| err.to_string())
     }
 
+    /// Android's Pixel hardware profiles can re-apply their device-shape overlay
+    /// several times while System UI settles. Keep normalizing the display for
+    /// the whole post-boot window instead of doing a single best-effort pass.
+    /// This is safe to run for newly started and already-running profiles.
+    pub fn watch_rectangular_display_after_start(&self, profile_name: &str) {
+        let Some(adb) = self.adb.clone() else {
+            return;
+        };
+        let profile_name = profile_name.to_owned();
+        thread::spawn(move || {
+            let mut found_serial = None;
+            for _ in 0..120 {
+                let devices = Command::new(&adb)
+                    .args(["devices"])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| parse_adb_devices(&String::from_utf8_lossy(&output.stdout)))
+                    .unwrap_or_default();
+                for candidate in devices {
+                    if running_avd_name(&adb, &candidate).as_deref() != Some(profile_name.as_str())
+                    {
+                        continue;
+                    }
+                    let booted = Command::new(&adb)
+                        .args(["-s", &candidate, "shell", "getprop", "sys.boot_completed"])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .is_some_and(|output| {
+                            String::from_utf8_lossy(&output.stdout).trim() == "1"
+                        });
+                    if !booted {
+                        continue;
+                    }
+                    found_serial = Some(candidate);
+                    break;
+                }
+                if found_serial.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+
+            let Some(serial) = found_serial else {
+                return;
+            };
+            // Pixel overlays may return after boot_completed while System UI is
+            // still restoring state. Re-check for one minute so the final state,
+            // not a transient state, is rectangular.
+            for _ in 0..120 {
+                if running_avd_name(&adb, &serial).as_deref() != Some(profile_name.as_str()) {
+                    return;
+                }
+                let overlays = Command::new(&adb)
+                    .args([
+                        "-s", &serial, "shell", "cmd", "overlay", "list", "--user", "0", "android",
+                    ])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| {
+                        enabled_display_shape_overlays(&String::from_utf8_lossy(&output.stdout))
+                    })
+                    .unwrap_or_default();
+                for overlay in overlays {
+                    let _ = Command::new(&adb)
+                        .args([
+                            "-s", &serial, "shell", "cmd", "overlay", "disable", "--user", "0",
+                            &overlay,
+                        ])
+                        .status();
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+    }
+
     pub fn configure_input_and_window(
         &self,
         profile_name: &str,
@@ -250,6 +425,7 @@ impl AndroidTools {
         display_width: u16,
         display_height: u16,
         display_dpi: u16,
+        lean_gaming: bool,
     ) -> Result<(), String> {
         validate_profile_name(profile_name)?;
         let path = home_path(&format!(".android/avd/{profile_name}.avd/config.ini"))
@@ -268,9 +444,100 @@ impl AndroidTools {
         );
         let text = set_ini_value(&text, "hw.lcd.width", &display_width.to_string());
         let text = set_ini_value(&text, "hw.lcd.height", &display_height.to_string());
-        let text = set_ini_value(&text, "hw.lcd.density", &display_dpi.to_string());
+        let mut text = set_ini_value(&text, "hw.lcd.density", &display_dpi.to_string());
+        // Whiteout's ARM translation path expects a normal phone hardware surface.
+        // Removing sensors/cameras saves almost nothing and caused repeatable native startup aborts.
+        let phone_hardware = [
+            ("hw.audioInput", if lean_gaming { "no" } else { "yes" }),
+            ("hw.audioOutput", if lean_gaming { "no" } else { "yes" }),
+            ("hw.camera.back", "emulated"),
+            ("hw.camera.front", "none"),
+            ("hw.sensors.accelerometer", "yes"),
+            ("hw.sensors.gyroscope", "yes"),
+            ("hw.sensors.light", "yes"),
+            ("hw.sensors.magnetic_field", "yes"),
+            ("hw.sensors.orientation", "yes"),
+            ("hw.sensors.pressure", "yes"),
+            ("hw.sensors.proximity", "yes"),
+        ];
+        for (key, value) in phone_hardware {
+            text = set_ini_value(&text, key, value);
+        }
         fs::write(&path, text)
             .map_err(|error| format!("Could not update {}: {error}", path.display()))
+    }
+
+    pub fn watch_lean_profile_after_start(&self, profile_name: &str) {
+        let Some(adb) = self.adb.clone() else {
+            return;
+        };
+        let profile_name = profile_name.to_owned();
+        thread::spawn(move || {
+            let Some(serial) = wait_for_booted_profile(&adb, &profile_name) else {
+                return;
+            };
+            for setting in [
+                "window_animation_scale",
+                "transition_animation_scale",
+                "animator_duration_scale",
+            ] {
+                let _ = Command::new(&adb)
+                    .args([
+                        "-s", &serial, "shell", "settings", "put", "global", setting, "0",
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = Command::new(&adb)
+                .args([
+                    "-s",
+                    &serial,
+                    "shell",
+                    "cmd",
+                    "netpolicy",
+                    "set",
+                    "restrict-background",
+                    "true",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = Command::new(&adb)
+                .args([
+                    "-s",
+                    &serial,
+                    "shell",
+                    "content",
+                    "set",
+                    "master_sync_enabled",
+                    "false",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            for package in [
+                "com.android.printspooler",
+                "com.android.dreams.basic",
+                "com.android.wallpaper.livepicker",
+                "com.google.android.apps.wallpaper",
+            ] {
+                let _ = Command::new(&adb)
+                    .args([
+                        "-s",
+                        &serial,
+                        "shell",
+                        "pm",
+                        "disable-user",
+                        "--user",
+                        "0",
+                        package,
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
     }
 
     pub fn configure_window_scale(&self, profile_name: &str, scale: f32) -> Result<(), String> {
@@ -325,15 +592,7 @@ impl AndroidTools {
         devices
             .into_iter()
             .filter_map(|serial| {
-                let output = Command::new(adb)
-                    .args(["-s", &serial, "emu", "avd", "name"])
-                    .output()
-                    .ok()?;
-                let name = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find(|line| !line.trim().is_empty() && line.trim() != "OK")?
-                    .trim()
-                    .to_owned();
+                let name = running_avd_name(adb, &serial)?;
                 Some((serial, name))
             })
             .collect()
@@ -375,6 +634,88 @@ pub fn parse_adb_devices(text: &str) -> Vec<String> {
             (columns.next()? == "device").then(|| serial.to_owned())
         })
         .collect()
+}
+
+fn running_avd_name(adb: &Path, serial: &str) -> Option<String> {
+    let output = Command::new(adb)
+        .args(["-s", serial, "emu", "avd", "name"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty() && line.trim() != "OK")
+        .map(|line| line.trim().to_owned())
+}
+
+fn wait_for_booted_profile(adb: &Path, profile_name: &str) -> Option<String> {
+    for _ in 0..120 {
+        let devices = Command::new(adb)
+            .args(["devices"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| parse_adb_devices(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_default();
+        for serial in devices {
+            if running_avd_name(adb, &serial).as_deref() != Some(profile_name) {
+                continue;
+            }
+            let booted = Command::new(adb)
+                .args(["-s", &serial, "shell", "getprop", "sys.boot_completed"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1");
+            if booted {
+                return Some(serial);
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+fn enabled_display_shape_overlays(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("[x] "))
+        .filter(|package| {
+            package.starts_with("com.android.internal.emulation.")
+                || package.starts_with("com.android.internal.display.cutout.emulation.")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn remove_clone_runtime_state(clone_dir: &Path) -> Result<(), String> {
+    for relative in [
+        "bootcompleted.ini",
+        "emu-launch-params.txt",
+        "hardware-qemu.ini",
+        "hardware-qemu.ini.lock",
+        "multiinstance.lock",
+        "read-snapshot.txt",
+    ] {
+        let path = clone_dir.join(relative);
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("Could not clean cloned runtime state: {error}"))?;
+        }
+    }
+    for relative in ["snapshots", "tmpAdbCmds"] {
+        let path = clone_dir.join(relative);
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .map_err(|error| format!("Could not clean cloned runtime state: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn read_avd_profile(name: &str) -> AndroidProfile {
@@ -488,6 +829,18 @@ mod tests {
     }
 
     #[test]
+    fn finds_only_enabled_display_shape_overlays() {
+        let overlays = "[x] com.android.internal.emulation.pixel_7\n[ ] com.android.internal.emulation.pixel_8\n[x] com.android.systemui:accent\n[x] com.android.internal.display.cutout.emulation.hole\n";
+        assert_eq!(
+            enabled_display_shape_overlays(overlays),
+            vec![
+                "com.android.internal.emulation.pixel_7",
+                "com.android.internal.display.cutout.emulation.hole"
+            ]
+        );
+    }
+
+    #[test]
     fn validates_safe_profile_names() {
         assert!(validate_profile_name("Pixel_7_work").is_ok());
         assert!(validate_profile_name("bad profile").is_err());
@@ -506,5 +859,46 @@ mod tests {
     fn removes_a_remembered_ini_value() {
         let updated = remove_ini_value("window.x = 10\nwindow.scale = 0.7\n", "window.scale");
         assert_eq!(updated, "window.x = 10\n");
+    }
+
+    #[test]
+    fn clones_avd_data_and_rewrites_registration() {
+        let root = std::env::temp_dir().join(format!("emumi-clone-test-{}", now_millis()));
+        let source = root.join("Source.avd");
+        fs::create_dir_all(source.join("snapshots/default_boot")).unwrap();
+        fs::create_dir_all(source.join("tmpAdbCmds")).unwrap();
+        fs::write(
+            source.join("config.ini"),
+            "avd.id=Source\navd.name=Source\navd.ini.displayname=Source\n",
+        )
+        .unwrap();
+        fs::write(source.join("userdata-qemu.img.qcow2"), b"android data").unwrap();
+        fs::write(source.join("multiinstance.lock"), b"").unwrap();
+        fs::write(
+            root.join("Source.ini"),
+            format!(
+                "avd.ini.encoding=UTF-8\npath={}\npath.rel=avd/Source.avd\ntarget=android-35\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        AndroidTools::default()
+            .clone_profile_in_root("Source", "Clone", &root)
+            .unwrap();
+
+        let config = fs::read_to_string(root.join("Clone.avd/config.ini")).unwrap();
+        let registration = fs::read_to_string(root.join("Clone.ini")).unwrap();
+        assert!(config.contains("avd.id=Clone"));
+        assert!(config.contains("avd.ini.displayname=Clone"));
+        assert!(registration.contains(&format!("path={}", root.join("Clone.avd").display())));
+        assert!(registration.contains("path.rel=avd/Clone.avd"));
+        assert_eq!(
+            fs::read(root.join("Clone.avd/userdata-qemu.img.qcow2")).unwrap(),
+            b"android data"
+        );
+        assert!(!root.join("Clone.avd/multiinstance.lock").exists());
+        assert!(!root.join("Clone.avd/snapshots").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

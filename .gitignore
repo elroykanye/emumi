@@ -4,6 +4,7 @@ frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 target/
+dist/
 gen/
 *.log
 .idea/
