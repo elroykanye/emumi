@@ -1,0 +1,43 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Please remove personal account data and secrets from logs and screenshots.
+  - type: input
+    id: version
+    attributes:
+      label: EmuMi version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Linux distribution and desktop
+      placeholder: Linux Mint 22, Cinnamon, X11
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell

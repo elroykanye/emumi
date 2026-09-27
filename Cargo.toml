@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "A friendly Android emulator manager for Linux"
 license = "MIT"
+repository = "https://github.com/elroykanye/emumi"
+homepage = "https://github.com/elroykanye/emumi"
+readme = "README.md"
+keywords = ["android", "emulator", "linux", "avd", "tauri"]
+categories = ["development-tools", "gui"]
 build = "build.rs"
 
 [dependencies]

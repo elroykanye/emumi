@@ -161,7 +161,7 @@ impl AndroidTools {
                 }
             }
         }
-        images.sort_by(|left, right| right.api_level.cmp(&left.api_level));
+        images.sort_by_key(|image| std::cmp::Reverse(image.api_level));
         images
     }
 
@@ -417,6 +417,7 @@ impl AndroidTools {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn configure_input_and_window(
         &self,
         profile_name: &str,

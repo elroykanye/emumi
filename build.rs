@@ -38,7 +38,7 @@ fn ensure_icon() {
     };
     for y in 25..47 {
         for x in 16..48 {
-            if (x >= 18 && x <= 45) || (y >= 28 && y <= 43) {
+            if (18..=45).contains(&x) || (28..=43).contains(&y) {
                 paint(&mut pixels, x, y);
             }
         }

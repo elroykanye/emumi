@@ -1,5 +1,9 @@
 # EmuMi
 
+[![CI](https://github.com/elroykanye/emumi/actions/workflows/ci.yml/badge.svg)](https://github.com/elroykanye/emumi/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/elroykanye/emumi)](https://github.com/elroykanye/emumi/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Android emulators, made easy on Linux.**
 
 EmuMi is a focused desktop manager for Android Virtual Devices. It provides a
@@ -85,4 +89,7 @@ EmuMi's local-only lifecycle API and stable ADB port assignments.
 
 ## License
 
-MIT
+EmuMi is available under the [MIT License](LICENSE).
+
+Security issues should be reported according to [SECURITY.md](SECURITY.md).
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).

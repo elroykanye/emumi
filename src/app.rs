@@ -162,21 +162,21 @@ impl Runtime {
         let mut used = BTreeSet::new();
         for name in profile_names {
             let options = self.config.profile_options.entry(name.clone()).or_default();
-            if let Some(port) = options.adb_port {
-                if !(5554..=5682).contains(&port) || port % 2 != 0 || !used.insert(port) {
-                    options.adb_port = None;
-                }
+            if let Some(port) = options.adb_port
+                && (!(5554..=5682).contains(&port) || port % 2 != 0 || !used.insert(port))
+            {
+                options.adb_port = None;
             }
         }
         let mut changed = false;
         for name in profile_names {
             let options = self.config.profile_options.entry(name.clone()).or_default();
-            if options.adb_port.is_none() {
-                if let Some(port) = (5554..=5682).step_by(2).find(|port| !used.contains(port)) {
-                    options.adb_port = Some(port);
-                    used.insert(port);
-                    changed = true;
-                }
+            if options.adb_port.is_none()
+                && let Some(port) = (5554..=5682).step_by(2).find(|port| !used.contains(port))
+            {
+                options.adb_port = Some(port);
+                used.insert(port);
+                changed = true;
             }
         }
         if changed {
@@ -304,8 +304,10 @@ async fn create_profile(
     tools
         .create_profile(request.name.trim(), &request.device_id, &image)
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
-    let mut options = ProfileOptions::default();
-    options.adb_port = runtime.next_profile_port();
+    let options = ProfileOptions {
+        adb_port: runtime.next_profile_port(),
+        ..ProfileOptions::default()
+    };
     runtime
         .config
         .profile_options
@@ -323,7 +325,7 @@ async fn start_profile(
 }
 
 fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
-    let mut runtime = lock(&shared)?;
+    let mut runtime = lock(shared)?;
     let tools = runtime.tools();
     let profile = tools
         .discover_profiles()
@@ -358,7 +360,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let (display_width, display_height) = display_dimensions(options.picture);
     let start_result = tools
         .configure_input_and_window(
-            &name,
+            name,
             options.host_keyboard,
             options.device_frame,
             display_width,
@@ -368,7 +370,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         )
         .and_then(|_| {
             if let Some(scale) = options.window_scale {
-                tools.configure_window_scale(&name, scale)
+                tools.configure_window_scale(name, scale)
             } else {
                 Ok(())
             }
@@ -380,7 +382,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     }
     if options.rectangular_display {
         runtime.rectangular_watchers.insert(name.to_owned());
-        tools.watch_rectangular_display_after_start(&name);
+        tools.watch_rectangular_display_after_start(name);
     }
     if options.speed == SpeedPreset::LeanGaming {
         tools.watch_lean_profile_after_start(name);
@@ -420,7 +422,7 @@ async fn stop_profile(
 }
 
 fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
-    let mut runtime = lock(&shared)?;
+    let mut runtime = lock(shared)?;
     runtime.starting_profiles.remove(name);
     let tools = runtime.tools();
     let profile = tools
@@ -631,6 +633,31 @@ fn display_dimensions(picture: PicturePreset) -> (u16, u16) {
     }
 }
 
+fn lock(
+    shared: &Shared,
+) -> Result<std::sync::MutexGuard<'_, Runtime>, (StatusCode, Json<ApiMessage>)> {
+    shared.lock().map_err(|_| {
+        error_tuple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "EmuMi state is unavailable",
+        )
+    })
+}
+
+fn message(text: impl Into<String>) -> Json<ApiMessage> {
+    Json(ApiMessage {
+        message: text.into(),
+    })
+}
+
+fn api_error<T>(status: StatusCode, text: impl Into<String>) -> ApiResult<T> {
+    Err(error_tuple(status, text))
+}
+
+fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json<ApiMessage>) {
+    (status, message(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::launch_args;
@@ -677,29 +704,4 @@ mod tests {
 
         assert_eq!(args.get(port + 1).map(String::as_str), Some("5558"));
     }
-}
-
-fn lock(
-    shared: &Shared,
-) -> Result<std::sync::MutexGuard<'_, Runtime>, (StatusCode, Json<ApiMessage>)> {
-    shared.lock().map_err(|_| {
-        error_tuple(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "EmuMi state is unavailable",
-        )
-    })
-}
-
-fn message(text: impl Into<String>) -> Json<ApiMessage> {
-    Json(ApiMessage {
-        message: text.into(),
-    })
-}
-
-fn api_error<T>(status: StatusCode, text: impl Into<String>) -> ApiResult<T> {
-    Err(error_tuple(status, text))
-}
-
-fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json<ApiMessage>) {
-    (status, message(text))
 }
