@@ -322,6 +322,7 @@ impl AndroidTools {
             .emulator
             .as_ref()
             .ok_or("Android Emulator was not found")?;
+        clear_stale_runtime_locks(&profile.name)?;
         let runtime_image = runtime_system_image(&profile.name);
         if let Some(image) = runtime_image.as_deref() {
             prepare_profile_runtime_overlay(&profile.name, image)?;
@@ -722,6 +723,70 @@ fn remove_clone_runtime_state(clone_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn clear_stale_runtime_locks(profile_name: &str) -> Result<(), String> {
+    let avd_root = home_path(".android/avd").ok_or("HOME is not set")?;
+    clear_stale_runtime_locks_in(&avd_root, Path::new("/proc"), profile_name)
+}
+
+fn clear_stale_runtime_locks_in(
+    avd_root: &Path,
+    proc_root: &Path,
+    profile_name: &str,
+) -> Result<(), String> {
+    let profile_dir = avd_root.join(format!("{profile_name}.avd"));
+    let locks = [
+        profile_dir.join("hardware-qemu.ini.lock"),
+        profile_dir.join("multiinstance.lock"),
+    ];
+    let owner = locks.iter().find_map(|path| read_lock_pid(path));
+    if owner.is_some_and(|pid| emulator_process_is_live(proc_root, pid, profile_name)) {
+        return Err(format!(
+            "{profile_name} already has a live emulator process; wait for it to finish starting"
+        ));
+    }
+    for path in locks {
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Could not remove stale emulator lock {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn read_lock_pid(path: &Path) -> Option<u32> {
+    let bytes = fs::read(path).ok()?;
+    let digits = bytes
+        .into_iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .collect::<Vec<_>>();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+fn emulator_process_is_live(proc_root: &Path, pid: u32, profile_name: &str) -> bool {
+    let process = proc_root.join(pid.to_string());
+    let stat = match fs::read_to_string(process.join("stat")) {
+        Ok(stat) => stat,
+        Err(_) => return false,
+    };
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, tail)| tail.chars().next());
+    if state == Some('Z') {
+        return false;
+    }
+    fs::read(process.join("cmdline"))
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+        .is_some_and(|command| {
+            command.contains(profile_name)
+                && (command.contains("qemu-system") || command.contains("/emulator"))
+        })
+}
+
 fn now_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1024,6 +1089,46 @@ mod tests {
         );
         assert!(!root.join("Clone.avd/multiinstance.lock").exists());
         assert!(!root.join("Clone.avd/snapshots").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removes_runtime_locks_left_by_a_dead_emulator() {
+        let root = std::env::temp_dir().join(format!("emumi-stale-lock-test-{}", now_millis()));
+        let avd_root = root.join("avd");
+        let profile = avd_root.join("Device_4.avd");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("hardware-qemu.ini.lock"), b"999999\0").unwrap();
+        fs::write(profile.join("multiinstance.lock"), b"").unwrap();
+
+        clear_stale_runtime_locks_in(&avd_root, &root.join("proc"), "Device_4").unwrap();
+
+        assert!(!profile.join("hardware-qemu.ini.lock").exists());
+        assert!(!profile.join("multiinstance.lock").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_locks_owned_by_a_live_matching_emulator() {
+        let root = std::env::temp_dir().join(format!("emumi-live-lock-test-{}", now_millis()));
+        let avd_root = root.join("avd");
+        let proc_root = root.join("proc");
+        let profile = avd_root.join("Device_4.avd");
+        let process = proc_root.join("1234");
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&process).unwrap();
+        fs::write(profile.join("hardware-qemu.ini.lock"), b"1234\0").unwrap();
+        fs::write(process.join("stat"), b"1234 (qemu-system-x86) S 1 1 1").unwrap();
+        fs::write(
+            process.join("cmdline"),
+            b"/sdk/qemu-system-x86_64\0-avd\0Device_4\0",
+        )
+        .unwrap();
+
+        let error = clear_stale_runtime_locks_in(&avd_root, &proc_root, "Device_4").unwrap_err();
+
+        assert!(error.contains("live emulator process"));
+        assert!(profile.join("hardware-qemu.ini.lock").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
