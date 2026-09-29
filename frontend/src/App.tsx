@@ -61,6 +61,7 @@ import {
   TerminalRounded,
   TuneRounded,
   VolumeOffRounded,
+  VisibilityOffRounded,
   WarningAmberRounded,
 } from "@mui/icons-material";
 
@@ -92,6 +93,30 @@ type ProfileOptions = {
   rectangular_display: boolean;
   mute_audio: boolean;
   window_scale: number | null;
+  headless_automation: boolean;
+  disable_vulkan: boolean;
+  host_memory_policy: boolean;
+  memory_high_mb: number;
+  memory_max_mb: number;
+  memory_swap_max_mb: number;
+};
+
+type DeviceHostStats = {
+  profile_name: string;
+  serial: string;
+  pid: number | null;
+  rss_bytes: number;
+  pss_bytes: number;
+  vm_swap_bytes: number;
+  scope_name: string | null;
+  memory_current_bytes: number | null;
+  memory_high_bytes: number | null;
+  memory_max_bytes: number | null;
+  memory_swap_current_bytes: number | null;
+  memory_events: Record<string, number>;
+  pressure_some_avg10: number | null;
+  pressure_full_avg10: number | null;
+  warning: string | null;
 };
 
 type AppState = {
@@ -99,8 +124,9 @@ type AppState = {
   profile_options: Record<string, ProfileOptions>;
   system_images: { package_id: string; label: string }[];
   config: { android_sdk_path: string; jdk_path: string };
-  health: { emulator: boolean; adb: boolean; avd_manager: boolean; kvm: boolean; java: boolean };
+  health: { emulator: boolean; adb: boolean; avd_manager: boolean; kvm: boolean; java: boolean; systemd_run: boolean };
   stats: { cpu_percent: number; memory_used_bytes: number; memory_total_bytes: number };
+  device_stats: DeviceHostStats[];
   logs: { at: number; level: string; message: string }[];
 };
 
@@ -120,6 +146,12 @@ const defaultOptions: ProfileOptions = {
   rectangular_display: true,
   mute_audio: true,
   window_scale: 0.55,
+  headless_automation: false,
+  disable_vulkan: false,
+  host_memory_policy: true,
+  memory_high_mb: 5120,
+  memory_max_mb: 6144,
+  memory_swap_max_mb: 2048,
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -162,6 +194,10 @@ function internalProfileName(name: string) {
 
 function gib(bytes: number) {
   return (bytes / 1024 / 1024 / 1024).toFixed(1);
+}
+
+function mib(bytes: number | null) {
+  return bytes === null ? "Unavailable" : `${Math.round(bytes / 1024 / 1024)} MB`;
 }
 
 function resolutionLabel(picture: Picture) {
@@ -411,7 +447,17 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
       speed,
       cores: resources[speed][0],
       memory_mb: resources[speed][1],
-      ...(speed === "LeanGaming" ? { picture: "Phone" as Picture, dpi: 240, gpu_mode: "host", mute_audio: true, rectangular_display: true } : {}),
+      ...(speed === "LeanGaming" ? {
+        picture: "Phone" as Picture,
+        dpi: 240,
+        gpu_mode: "host",
+        mute_audio: true,
+        rectangular_display: true,
+        host_memory_policy: true,
+        memory_high_mb: 5120,
+        memory_max_mb: 6144,
+        memory_swap_max_mb: 2048,
+      } : {}),
     }));
   };
 
@@ -495,6 +541,11 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
         <SettingRow icon={<VolumeOffRounded />} title="Mute Android audio" description="Launch this Android without sound output">
           <Switch checked={draft.mute_audio} onChange={(event) => setDraft({ ...draft, mute_audio: event.target.checked })} />
         </SettingRow>
+        <Divider />
+        <SettingRow icon={<VisibilityOffRounded />} title="Headless automation" description="Run without an emulator window; ADB screenshots and Frostguard input remain available">
+          <Switch checked={draft.headless_automation} onChange={(event) => setDraft({ ...draft, headless_automation: event.target.checked })} />
+        </SettingRow>
+        {draft.headless_automation && <Alert severity="info" sx={{ mt: 1 }}>Also disables both cameras and the boot animation. Verify Frostguard screenshots, OCR and taps at 720 × 1280 before relying on it unattended.</Alert>}
         <Accordion disableGutters elevation={0} sx={{ mt: 1, "&:before": { display: "none" } }}>
           <AccordionSummary expandIcon={<ExpandMoreRounded />}><TuneRounded sx={{ mr: 2 }} /><Box><Typography fontWeight={700}>Advanced settings</Typography><Typography variant="body2" color="text.secondary">CPU, memory, graphics, ports and boot behavior</Typography></Box></AccordionSummary>
           <AccordionDetails>
@@ -504,7 +555,18 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
               <FormControl><InputLabel>Graphics</InputLabel><Select label="Graphics" value={draft.gpu_mode} onChange={(event) => setDraft({ ...draft, gpu_mode: event.target.value })}><MenuItem value="auto">Automatic</MenuItem><MenuItem value="host">Hardware</MenuItem><MenuItem value="swiftshader_indirect">Software</MenuItem></Select></FormControl>
               <TextField label="ADB slot" type="number" value={draft.adb_port ?? ""} placeholder="Assigned automatically" helperText="Stable slots use 5554, 5556, 5558…" onChange={(event) => setDraft({ ...draft, adb_port: event.target.value ? Number(event.target.value) : null })} slotProps={{ htmlInput: { min: 5554, max: 5682, step: 2 } }} />
               <FormControlLabel control={<Switch checked={draft.cold_boot} onChange={(event) => setDraft({ ...draft, cold_boot: event.target.checked })} />} label="Cold boot next time" />
+              <FormControlLabel control={<Switch checked={draft.disable_vulkan} onChange={(event) => setDraft({ ...draft, disable_vulkan: event.target.checked })} />} label="Experimental: disable Vulkan" />
             </Box>
+            <Divider sx={{ my: 2 }} />
+            <FormControlLabel control={<Switch checked={draft.host_memory_policy} onChange={(event) => setDraft({ ...draft, host_memory_policy: event.target.checked })} />} label="Protect the Linux host with per-emulator resource controls" />
+            {draft.host_memory_policy && <Stack spacing={2} mt={2}>
+              <Alert severity="info">EmuMi gives this Android lower CPU and disk priority under contention, starts memory reclaim at MemoryHigh, and treats MemoryMax as a last-resort ceiling. Android still receives its configured guest memory.</Alert>
+              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "repeat(3, 1fr)" }, gap: 2 }}>
+                <TextField label="MemoryHigh (MB)" type="number" value={draft.memory_high_mb} helperText="Reclaim begins here" onChange={(event) => setDraft({ ...draft, memory_high_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 4096, step: 256 } }} />
+                <TextField label="MemoryMax (MB)" type="number" value={draft.memory_max_mb} helperText="Last-resort ceiling" onChange={(event) => setDraft({ ...draft, memory_max_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 4096, step: 256 } }} />
+                <TextField label="SwapMax (MB)" type="number" value={draft.memory_swap_max_mb} helperText="Host swap allowance" onChange={(event) => setDraft({ ...draft, memory_swap_max_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 0, step: 256 } }} />
+              </Box>
+            </Stack>}
           </AccordionDetails>
         </Accordion>
       </CardContent></Card>
@@ -570,7 +632,12 @@ function MonitorPage({ state }: { state: AppState }) {
       <Metric title="Host memory" value={`${gib(used)} / ${gib(total)} GB`} progress={total ? used / total * 100 : 0} icon={<MonitorHeartRounded />} />
       <Metric title="Running now" value={`${running.length} Android${running.length === 1 ? "" : "s"}`} progress={state.profiles.length ? running.length / state.profiles.length * 100 : 0} icon={<PhoneAndroidRounded />} />
     </Box>
-    <Card><CardContent><Typography variant="h6" mb={2}>Live Androids</Typography>{running.length ? <List disablePadding>{running.map((profile) => <ListItem key={profile.name} divider><ListItemIcon><CheckCircleRounded color="success" /></ListItemIcon><ListItemText primary={displayProfileName(profile.name)} secondary={profile.device_name} /><Chip size="small" color="success" label={profile.running_serial} /></ListItem>)}</List> : <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="Nothing is running" detail="Start an Android to see it here." />}</CardContent></Card>
+    <Card><CardContent><Typography variant="h6" mb={2}>Live Androids</Typography>{running.length ? <Stack spacing={2}>{running.map((profile) => {
+      const sample = state.device_stats.find((item) => item.profile_name === profile.name);
+      return <Box key={profile.name}><Stack direction={{ xs: "column", md: "row" }} gap={2} alignItems={{ md: "center" }}><ListItemIcon><CheckCircleRounded color="success" /></ListItemIcon><Box sx={{ flexGrow: 1 }}><Typography fontWeight={700}>{displayProfileName(profile.name)}</Typography><Typography variant="body2" color="text.secondary">{profile.running_serial}{sample?.pid ? ` · PID ${sample.pid}` : ""}{sample?.scope_name ? ` · ${sample.scope_name}` : " · unconstrained"}</Typography></Box><Stack direction="row" gap={1} flexWrap="wrap"><Chip size="small" variant="outlined" label={`RSS ${mib(sample?.rss_bytes ?? null)}`} /><Chip size="small" variant="outlined" label={`PSS ${mib(sample?.pss_bytes ?? null)}`} /><Chip size="small" variant="outlined" label={`Swap ${mib(sample?.vm_swap_bytes ?? null)}`} /></Stack></Stack>
+        {sample?.scope_name && <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", md: "repeat(4, 1fr)" }, gap: 1, mt: 1.5 }}><Typography variant="caption">Current: {mib(sample.memory_current_bytes)}</Typography><Typography variant="caption">High: {mib(sample.memory_high_bytes)}</Typography><Typography variant="caption">Max: {mib(sample.memory_max_bytes)}</Typography><Typography variant="caption">Scope swap: {mib(sample.memory_swap_current_bytes)}</Typography><Typography variant="caption">High events: {sample.memory_events.high ?? 0}</Typography><Typography variant="caption">Max events: {sample.memory_events.max ?? 0}</Typography><Typography variant="caption">Pressure some: {(sample.pressure_some_avg10 ?? 0).toFixed(2)}%</Typography><Typography variant="caption">Pressure full: {(sample.pressure_full_avg10 ?? 0).toFixed(2)}%</Typography></Box>}
+        {sample?.warning && <Alert severity="warning" sx={{ mt: 1.5 }}>{sample.warning}</Alert>}<Divider sx={{ mt: 2 }} /></Box>;
+    })}</Stack> : <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="Nothing is running" detail="Start an Android to see it here." />}</CardContent></Card>
   </Stack>;
 }
 
@@ -594,6 +661,7 @@ function SettingsPage({ state, perform, busy }: { state: AppState; perform: Perf
     ["AVD Manager", "Creates and removes Android profiles", state.health.avd_manager],
     ["KVM acceleration", "Provides fast Linux virtualization", state.health.kvm],
     ["Java", "Runs Android SDK management tools", state.health.java],
+    ["systemd scopes", "Per-emulator CPU, disk, memory and swap controls", state.health.systemd_run],
   ] as const;
   return <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1.4fr) minmax(320px, 1fr)" }, gap: 3 }}>
     <Card><CardContent><Stack direction="row" alignItems="center" mb={3}><Box sx={{ flexGrow: 1 }}><Typography variant="h6">Tool locations</Typography><Typography variant="body2" color="text.secondary">EmuMi normally detects these automatically.</Typography></Box><CodeRounded color="action" /></Stack><Stack spacing={2.5}><TextField fullWidth label="Android SDK path" value={sdkPath} onChange={(event) => setSdkPath(event.target.value)} helperText="Usually /home/you/Android/Sdk" /><TextField fullWidth label="JDK path" value={jdkPath} onChange={(event) => setJdkPath(event.target.value)} helperText="Leave blank to use Java from your PATH" /><Box><Button sx={{ minWidth: 112 }} variant="contained" disabled={!dirty || busy} startIcon={busy ? <CircularProgress size={18} color="inherit" /> : undefined} onClick={() => void perform("/api/settings", { method: "POST", body: JSON.stringify({ android_sdk_path: sdkPath, jdk_path: jdkPath }) })}>{busy ? "Saving…" : dirty ? "Save paths" : "Saved"}</Button></Box></Stack></CardContent></Card>

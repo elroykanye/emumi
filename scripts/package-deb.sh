@@ -22,6 +22,7 @@ install -Dm644 "$project_dir/packaging/dev.elroy.emumi.desktop" \
 install -Dm644 "$project_dir/icons/icon.png" \
   "$package_root/usr/share/icons/hicolor/256x256/apps/dev.elroy.emumi.png"
 install -Dm644 "$project_dir/README.md" "$package_root/usr/share/doc/emumi/README.md"
+install -Dm644 "$project_dir/CHANGELOG.md" "$package_root/usr/share/doc/emumi/CHANGELOG.md"
 install -Dm644 "$project_dir/LICENSE" "$package_root/usr/share/doc/emumi/copyright"
 
 mkdir -p "$package_root/DEBIAN" "$output_dir"

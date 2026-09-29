@@ -1,7 +1,8 @@
-use crate::model::AndroidProfile;
+use crate::model::{AndroidProfile, ProfileOptions};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
+    ffi::OsString,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -41,6 +42,7 @@ pub struct AndroidTools {
     pub adb: Option<PathBuf>,
     pub avd_manager: Option<PathBuf>,
     pub kvm_available: bool,
+    pub systemd_run_available: bool,
 }
 
 impl AndroidTools {
@@ -89,6 +91,8 @@ impl AndroidTools {
             adb,
             avd_manager,
             kvm_available: Path::new("/dev/kvm").exists(),
+            systemd_run_available: path_command("systemd-run").is_some()
+                && path_command("systemctl").is_some(),
         }
     }
 
@@ -317,7 +321,12 @@ impl AndroidTools {
         result
     }
 
-    pub fn start(&self, profile: &AndroidProfile, args: &[String]) -> Result<(), String> {
+    pub fn start(
+        &self,
+        profile: &AndroidProfile,
+        args: &[String],
+        options: &ProfileOptions,
+    ) -> Result<(), String> {
         let emulator = self
             .emulator
             .as_ref()
@@ -327,26 +336,31 @@ impl AndroidTools {
         if let Some(image) = runtime_image.as_deref() {
             prepare_profile_runtime_overlay(&profile.name, image)?;
         }
-        let log_path = state_path("emulator.log").ok_or("HOME is not set")?;
+        validate_memory_policy(options)?;
+        let log_path =
+            state_path(&format!("emulators/{}.log", profile.name)).ok_or("HOME is not set")?;
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
         let log = fs::File::create(log_path).map_err(|err| err.to_string())?;
-        let mut command = Command::new(emulator);
-        command
-            .arg("-avd")
-            .arg(&profile.name)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
-            .stderr(Stdio::from(log))
-            .process_group(0);
+        let mut emulator_args = vec![OsString::from("-avd"), OsString::from(&profile.name)];
+        emulator_args.extend(args.iter().map(OsString::from));
         if let Some(image) = runtime_image {
             // Compatibility runtimes are private EmuMi copies. Each AVD still
             // receives its own writable QCOW overlay and keeps userdata fully
             // separate from every other profile.
-            command.arg("-system").arg(image).arg("-writable-system");
+            emulator_args.push(OsString::from("-system"));
+            emulator_args.push(image.into_os_string());
+            emulator_args.push(OsString::from("-writable-system"));
         }
+        let launch = launch_spec(emulator, &emulator_args, &profile.name, options)?;
+        let mut command = Command::new(&launch.program);
+        command
+            .args(&launch.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
+            .stderr(Stdio::from(log))
+            .process_group(0);
         command.spawn().map(|_| ()).map_err(|err| err.to_string())
     }
 
@@ -609,6 +623,96 @@ impl AndroidTools {
             })
             .collect()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LaunchSpec {
+    program: PathBuf,
+    args: Vec<OsString>,
+}
+
+fn launch_spec(
+    emulator: &Path,
+    emulator_args: &[OsString],
+    profile_name: &str,
+    options: &ProfileOptions,
+) -> Result<LaunchSpec, String> {
+    if !options.host_memory_policy {
+        return Ok(LaunchSpec {
+            program: emulator.to_owned(),
+            args: emulator_args.to_vec(),
+        });
+    }
+    let systemd_run = path_command("systemd-run")
+        .ok_or("Per-emulator memory policy needs systemd-run, but it was not found in PATH")?;
+    let systemctl = path_command("systemctl")
+        .ok_or("Per-emulator memory policy needs systemctl, but it was not found in PATH")?;
+    let user_manager = Command::new(systemctl)
+        .args(["--user", "show-environment"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Could not contact the user systemd manager: {error}"))?;
+    if !user_manager.success() {
+        return Err("Per-emulator memory policy needs an available user systemd manager".into());
+    }
+    Ok(systemd_scope_launch_spec(
+        systemd_run,
+        emulator,
+        emulator_args,
+        profile_name,
+        options,
+    ))
+}
+
+fn systemd_scope_launch_spec(
+    systemd_run: PathBuf,
+    emulator: &Path,
+    emulator_args: &[OsString],
+    profile_name: &str,
+    options: &ProfileOptions,
+) -> LaunchSpec {
+    let unit = format!("emumi-{profile_name}");
+    let mut args = vec![
+        OsString::from("--user"),
+        OsString::from("--scope"),
+        OsString::from("--quiet"),
+        OsString::from("--collect"),
+        OsString::from(format!("--unit={unit}")),
+        OsString::from(format!("--property=MemoryHigh={}M", options.memory_high_mb)),
+        OsString::from(format!("--property=MemoryMax={}M", options.memory_max_mb)),
+        OsString::from(format!(
+            "--property=MemorySwapMax={}M",
+            options.memory_swap_max_mb
+        )),
+        // Emulator work stays responsive, but competes below normal desktop
+        // applications when several Androids are busy at once.
+        OsString::from("--property=CPUWeight=50"),
+        OsString::from("--property=IOWeight=50"),
+        OsString::from("--"),
+        emulator.as_os_str().to_owned(),
+    ];
+    args.extend_from_slice(emulator_args);
+    LaunchSpec {
+        program: systemd_run,
+        args,
+    }
+}
+
+fn validate_memory_policy(options: &ProfileOptions) -> Result<(), String> {
+    if !options.host_memory_policy {
+        return Ok(());
+    }
+    if options.memory_high_mb < 4096 {
+        return Err("MemoryHigh must be at least 4096 MB for the first safe trials".into());
+    }
+    if options.memory_max_mb < options.memory_high_mb {
+        return Err("MemoryMax must be greater than or equal to MemoryHigh".into());
+    }
+    if options.memory_max_mb < options.memory_mb {
+        return Err("MemoryMax cannot be lower than Android guest memory".into());
+    }
+    Ok(())
 }
 
 pub fn validate_profile_name(name: &str) -> Result<(), String> {
@@ -1049,6 +1153,37 @@ mod tests {
     fn removes_a_remembered_ini_value() {
         let updated = remove_ini_value("window.x = 10\nwindow.scale = 0.7\n", "window.scale");
         assert_eq!(updated, "window.x = 10\n");
+    }
+
+    #[test]
+    fn wraps_only_one_emulator_in_its_own_memory_scope() {
+        let options = ProfileOptions {
+            host_memory_policy: true,
+            ..ProfileOptions::default()
+        };
+        let spec = systemd_scope_launch_spec(
+            PathBuf::from("/usr/bin/systemd-run"),
+            Path::new("/sdk/emulator"),
+            &[OsString::from("-avd"), OsString::from("Device_2")],
+            "Device_2",
+            &options,
+        );
+        let args = spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert_eq!(spec.program, PathBuf::from("/usr/bin/systemd-run"));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5120M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6144M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed(
+            "--property=MemorySwapMax=2048M"
+        )));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=50")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=50")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
     }
 
     #[test]
