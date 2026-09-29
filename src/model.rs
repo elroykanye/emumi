@@ -57,6 +57,12 @@ pub struct ProfileOptions {
     pub rectangular_display: bool,
     pub mute_audio: bool,
     pub window_scale: Option<f32>,
+    pub headless_automation: bool,
+    pub disable_vulkan: bool,
+    pub host_memory_policy: bool,
+    pub memory_high_mb: u32,
+    pub memory_max_mb: u32,
+    pub memory_swap_max_mb: u32,
 }
 
 impl Default for ProfileOptions {
@@ -76,6 +82,12 @@ impl Default for ProfileOptions {
             rectangular_display: true,
             mute_audio: true,
             window_scale: Some(0.55),
+            headless_automation: false,
+            disable_vulkan: false,
+            host_memory_policy: true,
+            memory_high_mb: 5120,
+            memory_max_mb: 6144,
+            memory_swap_max_mb: 2048,
         }
     }
 }
@@ -85,4 +97,39 @@ pub struct HostStats {
     pub cpu_percent: f32,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DeviceHostStats {
+    pub profile_name: String,
+    pub serial: String,
+    pub pid: Option<u32>,
+    pub rss_bytes: u64,
+    pub pss_bytes: u64,
+    pub vm_swap_bytes: u64,
+    pub scope_name: Option<String>,
+    pub memory_current_bytes: Option<u64>,
+    pub memory_high_bytes: Option<u64>,
+    pub memory_max_bytes: Option<u64>,
+    pub memory_swap_current_bytes: Option<u64>,
+    pub memory_events: std::collections::BTreeMap<String, u64>,
+    pub pressure_some_avg10: Option<f32>,
+    pub pressure_full_avg10: Option<f32>,
+    pub warning: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProfileOptions;
+
+    #[test]
+    fn older_profiles_inherit_the_lean_host_policy() {
+        let options: ProfileOptions =
+            serde_json::from_str(r#"{"speed":"LeanGaming","cores":2,"memory_mb":4096}"#).unwrap();
+
+        assert!(options.host_memory_policy);
+        assert_eq!(options.memory_high_mb, 5120);
+        assert_eq!(options.memory_max_mb, 6144);
+        assert_eq!(options.memory_swap_max_mb, 2048);
+    }
 }

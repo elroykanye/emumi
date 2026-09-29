@@ -17,6 +17,8 @@ stopping Android profiles without requiring Android Studio.
 - Stable sequential ADB ports (`5554`, `5556`, `5558`, ...)
 - Simple performance, resolution, window-size and audio controls
 - Lean Gaming defaults: 2 CPU cores, 4 GB RAM, 720 × 1280 at 240 dpi and host GPU
+- Per-emulator Linux scopes with memory/swap ceilings and contention-friendly CPU/I/O priority
+- Optional windowless automation while preserving ADB screenshots and input
 - Up to four concurrently running Android devices
 - Live device state plus host CPU and memory monitoring
 - Automatic Android SDK, Java, ADB, emulator and KVM discovery
@@ -44,7 +46,7 @@ sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 Download the `.deb` from the latest GitHub release and install it with:
 
 ```bash
-sudo apt install ./emumi_0.1.1_amd64.deb
+sudo apt install ./emumi_0.2.0_amd64.deb
 ```
 
 EmuMi then appears in the desktop application menu.
@@ -87,6 +89,18 @@ Create the Debian package with:
 
 EmuMi is independent from Frostguard/WOSBot. Frostguard integration uses
 EmuMi's local-only lifecycle API and stable ADB port assignments.
+
+## Resource policy
+
+Lean Gaming profiles launch in an individual systemd user scope. Android receives two virtual
+CPU cores and 4 GB of guest RAM, while Linux begins reclaiming host memory above 5 GB and applies
+a 6 GB last-resort ceiling plus a 2 GB swap ceiling. Emulator CPU and disk work use a lower weight
+than normal desktop applications, helping Linux stay responsive when several devices are busy.
+
+These controls do not pretend that a 4 GB Android guest consumes no memory. The Monitor page shows
+each emulator's resident/proportional memory, swap, scope limits and pressure events so limits can
+be tuned from evidence. Headless automation is optional because it removes the emulator window;
+visible profiles retain the same resource policy.
 
 ## Compatibility runtimes
 

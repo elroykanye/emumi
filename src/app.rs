@@ -2,7 +2,7 @@ use crate::{
     android::AndroidTools,
     config::AppConfig,
     model::{PicturePreset, ProfileOptions, SpeedPreset},
-    monitor::HostMonitor,
+    monitor::{HostMonitor, sample_devices},
 };
 use axum::{
     Json, Router,
@@ -36,6 +36,7 @@ struct Runtime {
     monitor: HostMonitor,
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
+    memory_warnings: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -53,6 +54,7 @@ struct AppState {
     config: SettingsDto,
     health: HealthDto,
     stats: crate::model::HostStats,
+    device_stats: Vec<crate::model::DeviceHostStats>,
     logs: Vec<ApiLog>,
 }
 
@@ -75,6 +77,7 @@ struct HealthDto {
     avd_manager: bool,
     kvm: bool,
     java: bool,
+    systemd_run: bool,
 }
 
 #[derive(Serialize)]
@@ -103,6 +106,7 @@ impl EmuMiApp {
             monitor: HostMonitor::default(),
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
+            memory_warnings: BTreeMap::new(),
         }));
 
         let app = Router::new()
@@ -254,6 +258,28 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             package_id: image.package_id,
         })
         .collect();
+    let device_stats = sample_devices(&profiles);
+    let running_profile_names = device_stats
+        .iter()
+        .map(|sample| sample.profile_name.clone())
+        .collect::<BTreeSet<_>>();
+    runtime
+        .memory_warnings
+        .retain(|name, _| running_profile_names.contains(name));
+    for sample in &device_stats {
+        match &sample.warning {
+            Some(warning) if runtime.memory_warnings.get(&sample.profile_name) != Some(warning) => {
+                runtime
+                    .memory_warnings
+                    .insert(sample.profile_name.clone(), warning.clone());
+                runtime.log("warning", format!("{}: {warning}", sample.profile_name));
+            }
+            None => {
+                runtime.memory_warnings.remove(&sample.profile_name);
+            }
+            _ => {}
+        }
+    }
     let state = AppState {
         profiles,
         profile_options: runtime.config.profile_options.clone(),
@@ -268,8 +294,10 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             avd_manager: tools.avd_manager.is_some(),
             kvm: tools.kvm_available,
             java: tools.java_home.is_some(),
+            systemd_run: tools.systemd_run_available,
         },
         stats: runtime.monitor.sample(),
+        device_stats,
         logs: runtime.logs.clone(),
     };
     Ok(Json(state))
@@ -375,7 +403,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
                 Ok(())
             }
         })
-        .and_then(|_| tools.start(&profile, &launch_args(&options)));
+        .and_then(|_| tools.start(&profile, &launch_args(&options), &options));
     if let Err(message) = start_result {
         runtime.starting_profiles.remove(name);
         return Err(error_tuple(StatusCode::BAD_REQUEST, message));
@@ -561,6 +589,8 @@ async fn save_profile_settings(
     Json(options): Json<ProfileOptions>,
 ) -> ApiResult<ApiMessage> {
     let mut runtime = lock(&shared)?;
+    validate_profile_options(&options)
+        .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
     if options.window_scale.is_none() {
         runtime
             .tools()
@@ -612,7 +642,41 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
     if options.mute_audio {
         args.push("-no-audio".into());
     }
+    if options.headless_automation {
+        args.extend([
+            "-no-window".into(),
+            "-camera-back".into(),
+            "none".into(),
+            "-camera-front".into(),
+            "none".into(),
+            "-no-boot-anim".into(),
+        ]);
+    }
+    if options.disable_vulkan {
+        args.extend(["-feature".into(), "-Vulkan".into()]);
+    }
     args
+}
+
+fn validate_profile_options(options: &ProfileOptions) -> Result<(), String> {
+    if options.cores == 0 || options.cores > 16 {
+        return Err("CPU cores must be between 1 and 16".into());
+    }
+    if options.memory_mb < 512 || options.memory_mb > 16_384 {
+        return Err("Android memory must be between 512 and 16384 MB".into());
+    }
+    if options.host_memory_policy {
+        if options.memory_high_mb < 4096 {
+            return Err("MemoryHigh must be at least 4096 MB for safe initial testing".into());
+        }
+        if options.memory_max_mb < options.memory_high_mb {
+            return Err("MemoryMax must be greater than or equal to MemoryHigh".into());
+        }
+        if options.memory_max_mb < options.memory_mb {
+            return Err("MemoryMax cannot be lower than Android guest memory".into());
+        }
+    }
+    Ok(())
 }
 
 fn write_api_endpoint(url: &str) -> std::io::Result<()> {
@@ -660,7 +724,7 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 
 #[cfg(test)]
 mod tests {
-    use super::launch_args;
+    use super::{launch_args, validate_profile_options};
     use crate::model::{ProfileOptions, SpeedPreset};
 
     #[test]
@@ -681,6 +745,9 @@ mod tests {
         assert_eq!(options.cores, 2);
         assert_eq!(options.memory_mb, 4096);
         assert_eq!(options.gpu_mode, "host");
+        assert!(options.host_memory_policy);
+        assert_eq!(options.memory_high_mb, 5120);
+        assert_eq!(options.memory_max_mb, 6144);
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
         assert!(args.contains(&"-no-audio".to_owned()));
     }
@@ -703,5 +770,58 @@ mod tests {
         let port = args.iter().position(|arg| arg == "-port").unwrap();
 
         assert_eq!(args.get(port + 1).map(String::as_str), Some("5558"));
+    }
+
+    #[test]
+    fn headless_automation_keeps_adb_and_disables_window_peripherals() {
+        let options = ProfileOptions {
+            adb_port: Some(5554),
+            headless_automation: true,
+            ..ProfileOptions::default()
+        };
+        let args = launch_args(&options);
+
+        assert!(args.contains(&"-no-window".to_owned()));
+        assert!(args.contains(&"-no-boot-anim".to_owned()));
+        assert!(args.windows(2).any(|pair| pair == ["-camera-back", "none"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-camera-front", "none"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-port", "5554"]));
+    }
+
+    #[test]
+    fn vulkan_disable_is_explicit_and_off_by_default() {
+        assert!(!launch_args(&ProfileOptions::default()).contains(&"-Vulkan".to_owned()));
+        let options = ProfileOptions {
+            disable_vulkan: true,
+            ..ProfileOptions::default()
+        };
+        assert!(
+            launch_args(&options)
+                .windows(2)
+                .any(|pair| pair == ["-feature", "-Vulkan"])
+        );
+    }
+
+    #[test]
+    fn validates_conservative_per_emulator_memory_limits() {
+        let safe = ProfileOptions {
+            host_memory_policy: true,
+            ..ProfileOptions::default()
+        };
+        assert!(validate_profile_options(&safe).is_ok());
+        let unsafe_high = ProfileOptions {
+            memory_high_mb: 3840,
+            ..safe.clone()
+        };
+        assert!(validate_profile_options(&unsafe_high).is_err());
+        let inverted = ProfileOptions {
+            memory_high_mb: 6144,
+            memory_max_mb: 5120,
+            ..safe
+        };
+        assert!(validate_profile_options(&inverted).is_err());
     }
 }
