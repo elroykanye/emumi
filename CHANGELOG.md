@@ -3,6 +3,33 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-09-29
+
+### Added
+
+- 30, 45 and 60 Hz automation frame-rate controls, with 30 Hz as the Lean Gaming default.
+- Adaptive sequential startup: later launch requests queue until the current Android has booted and
+  host CPU has settled.
+- Automatic NVIDIA PRIME render offload for hardware-rendered profiles on hybrid-GPU Linux hosts.
+- Optional Play Store and restore-service suspension during automation, reversible on the next launch.
+- Explicit queued, starting and ready lifecycle states in the UI and activity log.
+
+### Changed
+
+- Lean Gaming now uses a measured 6.5 GB soft host threshold, 7 GB hard ceiling and 1 GB swap
+  allowance for a 4 GB Android guest.
+- Profile configuration writes are idempotent so unchanged settings no longer invalidate Quick Boot.
+- Cold boot is a one-shot recovery action; normal launches return to saved-state boot automatically.
+- Compatibility system images remain immutable so launches avoid large temporary writable-system
+  copies.
+
+### Fixed
+
+- Recover stale snapshot locks left by interrupted emulator processes.
+- Use a unique systemd memory scope for every launch so a shared `netsimd` helper cannot block a
+  stopped profile from restarting.
+- Re-enable Play Store services when automation suspension is turned off.
+
 ## [0.2.0] - 2026-09-29
 
 ### Added
@@ -44,3 +71,4 @@ All notable changes to EmuMi are documented here. This project follows
 [0.1.0]: https://github.com/elroykanye/emumi/releases/tag/v0.1.0
 [0.1.1]: https://github.com/elroykanye/emumi/releases/tag/v0.1.1
 [0.2.0]: https://github.com/elroykanye/emumi/releases/tag/v0.2.0
+[0.2.1]: https://github.com/elroykanye/emumi/releases/tag/v0.2.1

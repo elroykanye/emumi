@@ -16,7 +16,10 @@ stopping Android profiles without requiring Android Studio.
 - Preserve apps, accounts and Android data when cloning a stopped profile
 - Stable sequential ADB ports (`5554`, `5556`, `5558`, ...)
 - Simple performance, resolution, window-size and audio controls
-- Lean Gaming defaults: 2 CPU cores, 4 GB RAM, 720 × 1280 at 240 dpi and host GPU
+- Lean Gaming defaults: 2 CPU cores, 4 GB RAM, 720 × 1280 at 240 dpi, 30 Hz and host GPU
+- Adaptive sequential startup instead of simultaneous emulator boot storms
+- Automatic NVIDIA PRIME render offload on supported hybrid-GPU Linux systems
+- Quick Boot with one-shot cold recovery and stale-lock cleanup
 - Per-emulator Linux scopes with memory/swap ceilings and contention-friendly CPU/I/O priority
 - Optional windowless automation while preserving ADB screenshots and input
 - Up to four concurrently running Android devices
@@ -46,7 +49,7 @@ sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 Download the `.deb` from the latest GitHub release and install it with:
 
 ```bash
-sudo apt install ./emumi_0.2.0_amd64.deb
+sudo apt install ./emumi_0.2.1_amd64.deb
 ```
 
 EmuMi then appears in the desktop application menu.
@@ -93,8 +96,8 @@ EmuMi's local-only lifecycle API and stable ADB port assignments.
 ## Resource policy
 
 Lean Gaming profiles launch in an individual systemd user scope. Android receives two virtual
-CPU cores and 4 GB of guest RAM, while Linux begins reclaiming host memory above 5 GB and applies
-a 6 GB last-resort ceiling plus a 2 GB swap ceiling. Emulator CPU and disk work use a lower weight
+CPU cores and 4 GB of guest RAM, while Linux begins reclaiming host memory above 6.5 GB and applies
+a 7 GB last-resort ceiling plus a 1 GB swap ceiling. Emulator CPU and disk work use a lower weight
 than normal desktop applications, helping Linux stay responsive when several devices are busy.
 
 These controls do not pretend that a 4 GB Android guest consumes no memory. The Monitor page shows
@@ -109,16 +112,13 @@ EmuMi can select a locally prepared compatibility system image from
 `XDG_DATA_HOME` is unset. The Android SDK's original system image is never
 modified.
 
-Every profile continues to use its own userdata disk and writable system
-overlay. When a compatibility runtime changes, EmuMi preserves the profile's
-previous system overlay as a `pre-emumi-runtime` backup before creating a new
-overlay against the updated runtime. Apps, Google accounts and game data stay
-in that profile's separate userdata image.
+Every profile continues to use its own userdata disk. Compatibility system
+images are launched as immutable private copies, which avoids a large temporary
+writable-system copy and keeps Quick Boot reliable. Apps, Google accounts and
+game data stay in the profile's separate userdata image.
 
 Locally modified Android system images require verified boot to be disabled
-inside the emulator guest. This does not change Linux host security, and EmuMi
-only enables writable-system mode for profiles whose matching private runtime
-is present.
+inside the emulator guest. This does not change Linux host security.
 
 ## License
 
