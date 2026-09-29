@@ -346,12 +346,12 @@ impl AndroidTools {
         let mut emulator_args = vec![OsString::from("-avd"), OsString::from(&profile.name)];
         emulator_args.extend(args.iter().map(OsString::from));
         if let Some(image) = runtime_image {
-            // Compatibility runtimes are private EmuMi copies. Each AVD still
-            // receives its own writable QCOW overlay and keeps userdata fully
-            // separate from every other profile.
+            // Compatibility runtimes are immutable private EmuMi copies. Do not
+            // add -writable-system here: the emulator creates a large temporary
+            // system copy for that flag and disables reliable Quick Boot. Apps,
+            // accounts and game data live in the AVD's separate userdata image.
             emulator_args.push(OsString::from("-system"));
             emulator_args.push(image.into_os_string());
-            emulator_args.push(OsString::from("-writable-system"));
         }
         let launch = launch_spec(emulator, &emulator_args, &profile.name, options)?;
         let mut command = Command::new(&launch.program);
@@ -361,6 +361,12 @@ impl AndroidTools {
             .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
             .stderr(Stdio::from(log))
             .process_group(0);
+        if options.gpu_mode == "host" && nvidia_gpu_available() {
+            command
+                .env("__NV_PRIME_RENDER_OFFLOAD", "1")
+                .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+                .env("__VK_LAYER_NV_optimus", "NVIDIA_only");
+        }
         command.spawn().map(|_| ()).map_err(|err| err.to_string())
     }
 
@@ -456,10 +462,10 @@ impl AndroidTools {
         validate_profile_name(profile_name)?;
         let path = home_path(&format!(".android/avd/{profile_name}.avd/config.ini"))
             .ok_or("HOME is not set")?;
-        let text = fs::read_to_string(&path)
+        let original = fs::read_to_string(&path)
             .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
         let text = set_ini_value(
-            &text,
+            &original,
             "hw.keyboard",
             if host_keyboard { "yes" } else { "no" },
         );
@@ -489,11 +495,18 @@ impl AndroidTools {
         for (key, value) in phone_hardware {
             text = set_ini_value(&text, key, value);
         }
-        fs::write(&path, text)
-            .map_err(|error| format!("Could not update {}: {error}", path.display()))
+        if text != original {
+            fs::write(&path, text)
+                .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
+        }
+        Ok(())
     }
 
-    pub fn watch_lean_profile_after_start(&self, profile_name: &str) {
+    pub fn watch_lean_profile_after_start(
+        &self,
+        profile_name: &str,
+        suspend_store_during_automation: bool,
+    ) {
         let Some(adb) = self.adb.clone() else {
             return;
         };
@@ -542,12 +555,49 @@ impl AndroidTools {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            for package in [
+            let mut packages = vec![
                 "com.android.printspooler",
                 "com.android.dreams.basic",
                 "com.android.wallpaper.livepicker",
                 "com.google.android.apps.wallpaper",
-            ] {
+                "com.google.android.apps.youtube.music",
+                "com.google.android.apps.photos",
+                "com.google.android.apps.wellbeing",
+                "com.google.android.googlequicksearchbox",
+                "com.google.android.apps.messaging",
+                "com.google.android.dialer",
+                "com.google.android.tts",
+                "com.google.android.projection.gearhead",
+                "com.google.android.marvin.talkback",
+                "com.google.android.accessibility.switchaccess",
+                "com.google.android.apps.accessibility.voiceaccess",
+                "com.google.android.apps.docs",
+                "com.google.android.apps.maps",
+                "com.google.android.apps.safetyhub",
+                "com.google.android.as",
+                "com.google.android.as.oss",
+                "com.google.android.federatedcompute",
+                "com.google.android.health.connect.backuprestore",
+                "com.google.android.healthconnect.controller",
+                "com.google.android.ondevicepersonalization.services",
+                "com.google.android.deskclock",
+                "com.android.chrome",
+                "com.android.camera2",
+            ];
+            if suspend_store_during_automation {
+                packages.extend(["com.android.vending", "com.google.android.apps.restore"]);
+            } else {
+                for package in ["com.android.vending", "com.google.android.apps.restore"] {
+                    let _ = Command::new(&adb)
+                        .args([
+                            "-s", &serial, "shell", "pm", "enable", "--user", "0", package,
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+            for package in packages {
                 let _ = Command::new(&adb)
                     .args([
                         "-s",
@@ -566,6 +616,21 @@ impl AndroidTools {
         });
     }
 
+    pub fn profile_boot_completed(&self, profile_name: &str) -> bool {
+        let Some(adb) = &self.adb else {
+            return false;
+        };
+        self.running_avds().into_iter().any(|(serial, name)| {
+            name == profile_name
+                && Command::new(adb)
+                    .args(["-s", &serial, "shell", "getprop", "sys.boot_completed"])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1")
+        })
+    }
+
     pub fn configure_window_scale(&self, profile_name: &str, scale: f32) -> Result<(), String> {
         validate_profile_name(profile_name)?;
         let path = home_path(&format!(
@@ -574,9 +639,12 @@ impl AndroidTools {
         .ok_or("HOME is not set")?;
         let text = fs::read_to_string(&path).unwrap_or_default();
         let scale = scale.clamp(0.45, 1.0);
-        let text = set_ini_value(&text, "window.scale", &format!("{scale:.6}"));
-        fs::write(&path, text)
-            .map_err(|error| format!("Could not update {}: {error}", path.display()))
+        let updated = set_ini_value(&text, "window.scale", &format!("{scale:.6}"));
+        if updated != text {
+            fs::write(&path, updated)
+                .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn forget_window_scale(&self, profile_name: &str) -> Result<(), String> {
@@ -661,6 +729,7 @@ fn launch_spec(
         emulator,
         emulator_args,
         profile_name,
+        now_millis(),
         options,
     ))
 }
@@ -670,9 +739,14 @@ fn systemd_scope_launch_spec(
     emulator: &Path,
     emulator_args: &[OsString],
     profile_name: &str,
+    launch_id: u128,
     options: &ProfileOptions,
 ) -> LaunchSpec {
-    let unit = format!("emumi-{profile_name}");
+    // netsimd is shared by emulator processes and can legitimately outlive the
+    // AVD that first spawned it. A fixed scope name then makes systemd reject a
+    // later restart even though the emulator itself is gone. Per-launch scope
+    // identities preserve accounting without coupling restarts to helper life.
+    let unit = format!("emumi-{profile_name}-{launch_id}");
     let mut args = vec![
         OsString::from("--user"),
         OsString::from("--scope"),
@@ -809,6 +883,7 @@ fn remove_clone_runtime_state(clone_dir: &Path) -> Result<(), String> {
         "hardware-qemu.ini",
         "hardware-qemu.ini.lock",
         "multiinstance.lock",
+        "snapshot.lock.lock",
         "read-snapshot.txt",
     ] {
         let path = clone_dir.join(relative);
@@ -841,6 +916,7 @@ fn clear_stale_runtime_locks_in(
     let locks = [
         profile_dir.join("hardware-qemu.ini.lock"),
         profile_dir.join("multiinstance.lock"),
+        profile_dir.join("snapshot.lock.lock"),
     ];
     let owner = locks.iter().find_map(|path| read_lock_pid(path));
     if owner.is_some_and(|pid| emulator_process_is_live(proc_root, pid, profile_name)) {
@@ -859,6 +935,10 @@ fn clear_stale_runtime_locks_in(
         }
     }
     Ok(())
+}
+
+fn nvidia_gpu_available() -> bool {
+    Path::new("/proc/driver/nvidia/gpus").is_dir()
 }
 
 fn read_lock_pid(path: &Path) -> Option<u32> {
@@ -1166,6 +1246,7 @@ mod tests {
             Path::new("/sdk/emulator"),
             &[OsString::from("-avd"), OsString::from("Device_2")],
             "Device_2",
+            12345,
             &options,
         );
         let args = spec
@@ -1175,11 +1256,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(spec.program, PathBuf::from("/usr/bin/systemd-run"));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5120M")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6144M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2-12345")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=6656M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=7168M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed(
-            "--property=MemorySwapMax=2048M"
+            "--property=MemorySwapMax=1024M"
         )));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=50")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=50")));
@@ -1235,11 +1316,13 @@ mod tests {
         fs::create_dir_all(&profile).unwrap();
         fs::write(profile.join("hardware-qemu.ini.lock"), b"999999\0").unwrap();
         fs::write(profile.join("multiinstance.lock"), b"").unwrap();
+        fs::write(profile.join("snapshot.lock.lock"), b"999999\0").unwrap();
 
         clear_stale_runtime_locks_in(&avd_root, &root.join("proc"), "Device_4").unwrap();
 
         assert!(!profile.join("hardware-qemu.ini.lock").exists());
         assert!(!profile.join("multiinstance.lock").exists());
+        assert!(!profile.join("snapshot.lock.lock").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

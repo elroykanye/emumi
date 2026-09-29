@@ -95,6 +95,8 @@ type ProfileOptions = {
   window_scale: number | null;
   headless_automation: boolean;
   disable_vulkan: boolean;
+  refresh_rate_hz: number;
+  suspend_store_during_automation: boolean;
   host_memory_policy: boolean;
   memory_high_mb: number;
   memory_max_mb: number;
@@ -122,6 +124,8 @@ type DeviceHostStats = {
 type AppState = {
   profiles: AndroidProfile[];
   profile_options: Record<string, ProfileOptions>;
+  starting_profiles: string[];
+  queued_profiles: string[];
   system_images: { package_id: string; label: string }[];
   config: { android_sdk_path: string; jdk_path: string };
   health: { emulator: boolean; adb: boolean; avd_manager: boolean; kvm: boolean; java: boolean; systemd_run: boolean };
@@ -148,10 +152,12 @@ const defaultOptions: ProfileOptions = {
   window_scale: 0.55,
   headless_automation: false,
   disable_vulkan: false,
+  refresh_rate_hz: 30,
+  suspend_store_during_automation: true,
   host_memory_policy: true,
-  memory_high_mb: 5120,
-  memory_max_mb: 6144,
-  memory_swap_max_mb: 2048,
+  memory_high_mb: 6656,
+  memory_max_mb: 7168,
+  memory_swap_max_mb: 1024,
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -164,13 +170,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-function statusLabel(profile: AndroidProfile, pending?: PendingAction) {
+function statusLabel(profile: AndroidProfile, pending?: PendingAction, phase?: "starting" | "queued") {
+  if (phase === "queued") return "Queued";
+  if (phase === "starting") return "Starting…";
   if (pending === "starting") return "Starting…";
   if (pending === "stopping") return "Stopping…";
   return profile.running_serial ? "Running" : "Stopped";
 }
 
-function runActionLabel(profile: AndroidProfile, pending?: PendingAction) {
+function runActionLabel(profile: AndroidProfile, pending?: PendingAction, phase?: "starting" | "queued") {
+  if (phase === "queued") return "Cancel";
+  if (phase === "starting") return "Starting…";
   if (pending === "starting") return "Starting…";
   if (pending === "stopping") return "Stopping…";
   return profile.running_serial ? "Stop" : "Start";
@@ -236,7 +246,8 @@ export default function App() {
         const updated = { ...current };
         for (const [name, action] of Object.entries(updated)) {
           const profile = next.profiles.find((item) => item.name === name);
-          if (!profile || (action === "starting" && profile.running_serial) || (action === "stopping" && !profile.running_serial)) {
+          const activeStart = next.starting_profiles.includes(name) || next.queued_profiles.includes(name);
+          if (!profile || (action === "starting" && (profile.running_serial || activeStart)) || (action === "stopping" && !profile.running_serial && !activeStart)) {
             delete updated[name];
           }
         }
@@ -393,20 +404,21 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
           <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="No Androids yet" detail="Use New Android to create your first profile." />
         ) : state.profiles.map((profile) => {
           const running = Boolean(profile.running_serial);
+          const phase = state.queued_profiles.includes(profile.name) ? "queued" : state.starting_profiles.includes(profile.name) ? "starting" : undefined;
           const adbSlot = state.profile_options[profile.name]?.adb_port;
           return (
             <Card key={profile.name} variant="outlined" sx={{ borderColor: selectedName === profile.name ? "primary.main" : undefined, bgcolor: selectedName === profile.name ? "rgba(22, 117, 75, 0.045)" : "background.paper" }}>
               <ListItemButton selected={selectedName === profile.name} onClick={() => setSelectedName(profile.name)} sx={{ py: 1.5 }}>
                 <ListItemIcon><PhoneAndroidRounded color={running ? "success" : "action"} /></ListItemIcon>
                 <ListItemText primary={displayProfileName(profile.name)} secondary={`${profile.device_name || "Android device"}${profile.api_level ? ` · API ${profile.api_level}` : ""}${adbSlot ? ` · ADB ${adbSlot}` : ""}`} primaryTypographyProps={{ fontWeight: 700 }} />
-                <Chip size="small" color={pending[profile.name] ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending[profile.name])} />
+                <Chip size="small" color={pending[profile.name] || phase ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending[profile.name], phase)} />
               </ListItemButton>
             </Card>
           );
         })}
       </Stack>
       {selected ? (
-        <Fade in key={selected.name} timeout={160}><Box sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}><ProfileDetail profile={selected} options={state.profile_options[selected.name] ?? defaultOptions} pending={pending[selected.name]} setPending={setPending} perform={perform} setDeleteName={setDeleteName} setCloneSource={setCloneSource} busy={busy} /></Box></Fade>
+        <Fade in key={selected.name} timeout={160}><Box sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}><ProfileDetail profile={selected} options={state.profile_options[selected.name] ?? defaultOptions} pending={pending[selected.name]} phase={state.queued_profiles.includes(selected.name) ? "queued" : state.starting_profiles.includes(selected.name) ? "starting" : undefined} setPending={setPending} perform={perform} setDeleteName={setDeleteName} setCloneSource={setCloneSource} busy={busy} /></Box></Fade>
       ) : (
         <EmptyState icon={<AndroidRounded fontSize="large" />} title="Choose an Android" detail="Its controls and settings will appear here." />
       )}
@@ -414,10 +426,11 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
   );
 }
 
-function ProfileDetail({ profile, options, pending, setPending, perform, setDeleteName, setCloneSource, busy }: {
+function ProfileDetail({ profile, options, pending, phase, setPending, perform, setDeleteName, setCloneSource, busy }: {
   profile: AndroidProfile;
   options: ProfileOptions;
   pending?: PendingAction;
+  phase?: "starting" | "queued";
   setPending: React.Dispatch<React.SetStateAction<Record<string, PendingAction>>>;
   perform: Perform;
   setDeleteName: (name: string) => void;
@@ -431,10 +444,11 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(options), [draft, options]);
 
   const toggleRun = async () => {
-    const action: PendingAction = running ? "stopping" : "starting";
+    const shouldStop = running || phase === "queued";
+    const action: PendingAction = shouldStop ? "stopping" : "starting";
     setPending((value) => ({ ...value, [profile.name]: action }));
     try {
-      await perform(`/api/profiles/${encodeURIComponent(profile.name)}/${running ? "stop" : "start"}`, { method: "POST" });
+      await perform(`/api/profiles/${encodeURIComponent(profile.name)}/${shouldStop ? "stop" : "start"}`, { method: "POST" });
     } catch {
       setPending((value) => { const next = { ...value }; delete next[profile.name]; return next; });
     }
@@ -453,10 +467,12 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
         gpu_mode: "host",
         mute_audio: true,
         rectangular_display: true,
+        refresh_rate_hz: 30,
+        suspend_store_during_automation: true,
         host_memory_policy: true,
-        memory_high_mb: 5120,
-        memory_max_mb: 6144,
-        memory_swap_max_mb: 2048,
+        memory_high_mb: 6656,
+        memory_max_mb: 7168,
+        memory_swap_max_mb: 1024,
       } : {}),
     }));
   };
@@ -480,7 +496,7 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
               <Typography variant="h5" noWrap>{displayProfileName(profile.name)}</Typography>
               <Typography color="text.secondary">{profile.device_name || "Android device"}{profile.api_level ? ` · Android API ${profile.api_level}` : ""}</Typography>
               <Stack direction="row" gap={1} mt={1} flexWrap="wrap">
-                <Chip size="small" color={pending ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending)} />
+                <Chip size="small" color={pending || phase ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending, phase)} />
                 <Chip size="small" variant="outlined" label={`${resolutionLabel(options.picture)} configured`} />
                 <Chip size="small" variant="outlined" label={options.adb_port ? `ADB ${options.adb_port}` : "ADB automatic"} />
                 {profile.running_serial && <Chip size="small" variant="outlined" label={profile.running_serial} />}
@@ -491,7 +507,7 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
           <Stack direction="row" gap={1} justifyContent="flex-end">
             <Tooltip title={running ? "Stop this Android before cloning it" : "Copy apps, accounts and data"}><span><Button sx={{ minWidth: 104 }} variant="outlined" startIcon={<ContentCopyRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setCloneSource(profile.name)}>Clone</Button></span></Tooltip>
             <Tooltip title={running ? "Stop this Android before deleting it" : "Delete this Android"}><span><Button sx={{ minWidth: 104 }} variant="outlined" color="error" startIcon={<DeleteOutlineRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setDeleteName(profile.name)}>Delete</Button></span></Tooltip>
-            <Button sx={{ minWidth: 112 }} variant="contained" color={running ? "error" : "primary"} startIcon={pending ? <CircularProgress size={18} color="inherit" /> : running ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending) || busy} onClick={() => void toggleRun()}>{runActionLabel(profile, pending)}</Button>
+            <Button sx={{ minWidth: 112 }} variant="contained" color={running || phase === "queued" ? "error" : "primary"} startIcon={pending || phase === "starting" ? <CircularProgress size={18} color="inherit" /> : running || phase === "queued" ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending) || phase === "starting" || busy} onClick={() => void toggleRun()}>{runActionLabel(profile, pending, phase)}</Button>
           </Stack>
         </Stack>
       </CardContent></Card>
@@ -546,12 +562,23 @@ function ProfileDetail({ profile, options, pending, setPending, perform, setDele
           <Switch checked={draft.headless_automation} onChange={(event) => setDraft({ ...draft, headless_automation: event.target.checked })} />
         </SettingRow>
         {draft.headless_automation && <Alert severity="info" sx={{ mt: 1 }}>Also disables both cameras and the boot animation. Verify Frostguard screenshots, OCR and taps at 720 × 1280 before relying on it unattended.</Alert>}
+        <Divider />
+        <SettingRow icon={<MonitorHeartRounded />} title="Automation frame rate" description="30 Hz cuts continuous rendering work; use 60 Hz only for interactive play">
+          <ToggleButtonGroup exclusive value={draft.refresh_rate_hz} size="small" onChange={(_, value: number | null) => value && setDraft({ ...draft, refresh_rate_hz: value })}>
+            <ToggleButton value={30}>30 Hz</ToggleButton><ToggleButton value={45}>45 Hz</ToggleButton><ToggleButton value={60}>60 Hz</ToggleButton>
+          </ToggleButtonGroup>
+        </SettingRow>
+        <Divider />
+        <SettingRow icon={<RefreshRounded />} title="Pause app updates during automation" description="Keeps Play Store installed but prevents restores and updates from consuming CPU while bots run">
+          <Switch checked={draft.suspend_store_during_automation} onChange={(event) => setDraft({ ...draft, suspend_store_during_automation: event.target.checked })} />
+        </SettingRow>
         <Accordion disableGutters elevation={0} sx={{ mt: 1, "&:before": { display: "none" } }}>
           <AccordionSummary expandIcon={<ExpandMoreRounded />}><TuneRounded sx={{ mr: 2 }} /><Box><Typography fontWeight={700}>Advanced settings</Typography><Typography variant="body2" color="text.secondary">CPU, memory, graphics, ports and boot behavior</Typography></Box></AccordionSummary>
           <AccordionDetails>
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 2 }}>
               <TextField label="CPU cores" type="number" value={draft.cores} onChange={(event) => setDraft({ ...draft, cores: Number(event.target.value) })} slotProps={{ htmlInput: { min: 1, max: 16 } }} />
               <TextField label="Memory (MB)" type="number" value={draft.memory_mb} onChange={(event) => setDraft({ ...draft, memory_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 512, max: 16384, step: 256 } }} />
+              <TextField label="Refresh rate (Hz)" type="number" value={draft.refresh_rate_hz} onChange={(event) => setDraft({ ...draft, refresh_rate_hz: Number(event.target.value) })} slotProps={{ htmlInput: { min: 15, max: 120, step: 1 } }} />
               <FormControl><InputLabel>Graphics</InputLabel><Select label="Graphics" value={draft.gpu_mode} onChange={(event) => setDraft({ ...draft, gpu_mode: event.target.value })}><MenuItem value="auto">Automatic</MenuItem><MenuItem value="host">Hardware</MenuItem><MenuItem value="swiftshader_indirect">Software</MenuItem></Select></FormControl>
               <TextField label="ADB slot" type="number" value={draft.adb_port ?? ""} placeholder="Assigned automatically" helperText="Stable slots use 5554, 5556, 5558…" onChange={(event) => setDraft({ ...draft, adb_port: event.target.value ? Number(event.target.value) : null })} slotProps={{ htmlInput: { min: 5554, max: 5682, step: 2 } }} />
               <FormControlLabel control={<Switch checked={draft.cold_boot} onChange={(event) => setDraft({ ...draft, cold_boot: event.target.checked })} />} label="Cold boot next time" />

@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -36,6 +36,7 @@ struct Runtime {
     monitor: HostMonitor,
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
+    queued_profiles: VecDeque<String>,
     memory_warnings: BTreeMap<String, String>,
 }
 
@@ -50,6 +51,8 @@ struct ApiLog {
 struct AppState {
     profiles: Vec<crate::model::AndroidProfile>,
     profile_options: BTreeMap<String, ProfileOptions>,
+    starting_profiles: BTreeSet<String>,
+    queued_profiles: Vec<String>,
     system_images: Vec<ImageDto>,
     config: SettingsDto,
     health: HealthDto,
@@ -106,6 +109,7 @@ impl EmuMiApp {
             monitor: HostMonitor::default(),
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
+            queued_profiles: VecDeque::new(),
             memory_warnings: BTreeMap::new(),
         }));
 
@@ -283,6 +287,8 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
     let state = AppState {
         profiles,
         profile_options: runtime.config.profile_options.clone(),
+        starting_profiles: runtime.starting_profiles.clone(),
+        queued_profiles: runtime.queued_profiles.iter().cloned().collect(),
         system_images,
         config: SettingsDto {
             android_sdk_path: runtime.config.android_sdk_path.clone(),
@@ -367,16 +373,29 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     if runtime.starting_profiles.contains(name) {
         return Ok(message("Android is already starting"));
     }
+    if runtime.queued_profiles.iter().any(|queued| queued == name) {
+        return Ok(message("Android is already queued"));
+    }
     let running = tools
         .discover_profiles()
         .into_iter()
         .filter(|candidate| candidate.is_running())
         .count();
-    if running + runtime.starting_profiles.len() >= MAX_RUNNING_PROFILES {
+    if running + runtime.starting_profiles.len() + runtime.queued_profiles.len()
+        >= MAX_RUNNING_PROFILES
+    {
         return api_error(
             StatusCode::CONFLICT,
             "This computer is limited to four running Androids. Stop an idle one first.",
         );
+    }
+    if !runtime.starting_profiles.is_empty() {
+        runtime.queued_profiles.push_back(name.to_owned());
+        runtime.log(
+            "info",
+            format!("Queued {name} until the current Android settles"),
+        );
+        return Ok(message("Android is queued for an adaptive start"));
     }
     let options = runtime
         .config
@@ -413,33 +432,75 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         tools.watch_rectangular_display_after_start(name);
     }
     if options.speed == SpeedPreset::LeanGaming {
-        tools.watch_lean_profile_after_start(name);
+        tools.watch_lean_profile_after_start(name, options.suspend_store_during_automation);
+    }
+    if options.cold_boot
+        && let Some(saved) = runtime.config.profile_options.get_mut(name)
+    {
+        saved.cold_boot = false;
+        let _ = runtime.config.save();
     }
     runtime.log("success", format!("Starting {name}"));
-    let cleanup_shared = Arc::clone(shared);
-    let cleanup_name = name.to_owned();
+    watch_profile_start(Arc::clone(shared), name.to_owned());
+    Ok(message("Android is starting"))
+}
+
+fn watch_profile_start(shared: Shared, name: String) {
     tokio::spawn(async move {
+        let mut booted = false;
         for _ in 0..240 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let Ok(mut runtime) = cleanup_shared.lock() else {
+            let Ok(runtime) = shared.lock() else {
                 return;
             };
-            let running = runtime
-                .tools()
-                .discover_profiles()
-                .into_iter()
-                .any(|profile| profile.name == cleanup_name && profile.is_running());
-            if running {
-                runtime.starting_profiles.remove(&cleanup_name);
-                return;
+            if runtime.tools().profile_boot_completed(&name) {
+                booted = true;
+                break;
             }
         }
-        if let Ok(mut runtime) = cleanup_shared.lock() {
-            runtime.starting_profiles.remove(&cleanup_name);
-            runtime.log("warning", format!("{cleanup_name} did not finish starting"));
+
+        if booted {
+            // Give login, Play services and the automation target time to warm up.
+            // Then require three calm host samples before admitting the next AVD.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let mut monitor = HostMonitor::default();
+            let _ = monitor.sample();
+            let mut calm_samples = 0;
+            for _ in 0..45 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if monitor.sample().cpu_percent < 85.0 {
+                    calm_samples += 1;
+                    if calm_samples >= 3 {
+                        break;
+                    }
+                } else {
+                    calm_samples = 0;
+                }
+            }
+        }
+
+        let next = if let Ok(mut runtime) = shared.lock() {
+            runtime.starting_profiles.remove(&name);
+            if booted {
+                runtime.log("success", format!("{name} is ready"));
+            } else {
+                runtime.log("warning", format!("{name} did not finish starting"));
+            }
+            runtime.queued_profiles.pop_front()
+        } else {
+            None
+        };
+        if let Some(next) = next
+            && let Err((_, Json(error))) = start_named_profile(&shared, &next)
+            && let Ok(mut runtime) = shared.lock()
+        {
+            runtime.log(
+                "error",
+                format!("Could not start queued {next}: {}", error.message),
+            );
+            runtime.starting_profiles.remove(&next);
         }
     });
-    Ok(message("Android is starting"))
 }
 
 async fn stop_profile(
@@ -452,6 +513,7 @@ async fn stop_profile(
 fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let mut runtime = lock(shared)?;
     runtime.starting_profiles.remove(name);
+    runtime.queued_profiles.retain(|queued| queued != name);
     let tools = runtime.tools();
     let profile = tools
         .discover_profiles()
@@ -632,6 +694,8 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         options.gpu_mode.clone(),
         "-skin".into(),
         format!("{display_width}x{display_height}"),
+        "-vsync-rate".into(),
+        options.refresh_rate_hz.to_string(),
     ];
     if let Some(port) = options.adb_port {
         args.extend(["-port".into(), port.to_string()]);
@@ -664,6 +728,9 @@ fn validate_profile_options(options: &ProfileOptions) -> Result<(), String> {
     }
     if options.memory_mb < 512 || options.memory_mb > 16_384 {
         return Err("Android memory must be between 512 and 16384 MB".into());
+    }
+    if !(15..=120).contains(&options.refresh_rate_hz) {
+        return Err("Refresh rate must be between 15 and 120 Hz".into());
     }
     if options.host_memory_policy {
         if options.memory_high_mb < 4096 {
@@ -746,9 +813,12 @@ mod tests {
         assert_eq!(options.memory_mb, 4096);
         assert_eq!(options.gpu_mode, "host");
         assert!(options.host_memory_policy);
-        assert_eq!(options.memory_high_mb, 5120);
-        assert_eq!(options.memory_max_mb, 6144);
+        assert_eq!(options.refresh_rate_hz, 30);
+        assert!(options.suspend_store_during_automation);
+        assert_eq!(options.memory_high_mb, 6656);
+        assert_eq!(options.memory_max_mb, 7168);
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(args.windows(2).any(|pair| pair == ["-vsync-rate", "30"]));
         assert!(args.contains(&"-no-audio".to_owned()));
     }
 

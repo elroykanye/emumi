@@ -59,6 +59,8 @@ pub struct ProfileOptions {
     pub window_scale: Option<f32>,
     pub headless_automation: bool,
     pub disable_vulkan: bool,
+    pub refresh_rate_hz: u16,
+    pub suspend_store_during_automation: bool,
     pub host_memory_policy: bool,
     pub memory_high_mb: u32,
     pub memory_max_mb: u32,
@@ -84,10 +86,12 @@ impl Default for ProfileOptions {
             window_scale: Some(0.55),
             headless_automation: false,
             disable_vulkan: false,
+            refresh_rate_hz: 30,
+            suspend_store_during_automation: true,
             host_memory_policy: true,
-            memory_high_mb: 5120,
-            memory_max_mb: 6144,
-            memory_swap_max_mb: 2048,
+            memory_high_mb: 6656,
+            memory_max_mb: 7168,
+            memory_swap_max_mb: 1024,
         }
     }
 }
@@ -128,8 +132,10 @@ mod tests {
             serde_json::from_str(r#"{"speed":"LeanGaming","cores":2,"memory_mb":4096}"#).unwrap();
 
         assert!(options.host_memory_policy);
-        assert_eq!(options.memory_high_mb, 5120);
-        assert_eq!(options.memory_max_mb, 6144);
-        assert_eq!(options.memory_swap_max_mb, 2048);
+        assert_eq!(options.refresh_rate_hz, 30);
+        assert!(options.suspend_store_during_automation);
+        assert_eq!(options.memory_high_mb, 6656);
+        assert_eq!(options.memory_max_mb, 7168);
+        assert_eq!(options.memory_swap_max_mb, 1024);
     }
 }
