@@ -572,6 +572,7 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
         <SettingRow icon={<RefreshRounded />} title="Pause app updates during automation" description="Keeps Play Store installed but prevents restores and updates from consuming CPU while bots run">
           <Switch checked={draft.suspend_store_during_automation} onChange={(event) => setDraft({ ...draft, suspend_store_during_automation: event.target.checked })} />
         </SettingRow>
+        {draft.speed === "LeanGaming" && <Alert severity="info" sx={{ mt: 1 }}>Lean Gaming always starts Android from a clean boot so native games do not inherit a broken saved-memory state. Installed apps, game data and accounts are preserved.</Alert>}
         <Accordion disableGutters elevation={0} sx={{ mt: 1, "&:before": { display: "none" } }}>
           <AccordionSummary expandIcon={<ExpandMoreRounded />}><TuneRounded sx={{ mr: 2 }} /><Box><Typography fontWeight={700}>Advanced settings</Typography><Typography variant="body2" color="text.secondary">CPU, memory, graphics, ports and boot behavior</Typography></Box></AccordionSummary>
           <AccordionDetails>
@@ -581,7 +582,7 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
               <TextField label="Refresh rate (Hz)" type="number" value={draft.refresh_rate_hz} onChange={(event) => setDraft({ ...draft, refresh_rate_hz: Number(event.target.value) })} slotProps={{ htmlInput: { min: 15, max: 120, step: 1 } }} />
               <FormControl><InputLabel>Graphics</InputLabel><Select label="Graphics" value={draft.gpu_mode} onChange={(event) => setDraft({ ...draft, gpu_mode: event.target.value })}><MenuItem value="auto">Automatic</MenuItem><MenuItem value="host">Hardware</MenuItem><MenuItem value="swiftshader_indirect">Software</MenuItem></Select></FormControl>
               <TextField label="ADB slot" type="number" value={draft.adb_port ?? ""} placeholder="Assigned automatically" helperText="Stable slots use 5554, 5556, 5558…" onChange={(event) => setDraft({ ...draft, adb_port: event.target.value ? Number(event.target.value) : null })} slotProps={{ htmlInput: { min: 5554, max: 5682, step: 2 } }} />
-              <FormControlLabel control={<Switch checked={draft.cold_boot} onChange={(event) => setDraft({ ...draft, cold_boot: event.target.checked })} />} label="Cold boot next time" />
+              <FormControlLabel control={<Switch checked={draft.speed === "LeanGaming" || draft.cold_boot} disabled={draft.speed === "LeanGaming"} onChange={(event) => setDraft({ ...draft, cold_boot: event.target.checked })} />} label={draft.speed === "LeanGaming" ? "Clean boot always on" : "Cold boot next time"} />
               <FormControlLabel control={<Switch checked={draft.disable_vulkan} onChange={(event) => setDraft({ ...draft, disable_vulkan: event.target.checked })} />} label="Experimental: disable Vulkan" />
             </Box>
             <Divider sx={{ my: 2 }} />

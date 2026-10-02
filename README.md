@@ -49,7 +49,7 @@ sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 Download the `.deb` from the latest GitHub release and install it with:
 
 ```bash
-sudo apt install ./emumi_0.2.1_amd64.deb
+sudo apt install ./emumi_0.2.2_amd64.deb
 ```
 
 EmuMi then appears in the desktop application menu.

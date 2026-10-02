@@ -440,7 +440,14 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         saved.cold_boot = false;
         let _ = runtime.config.save();
     }
-    runtime.log("success", format!("Starting {name}"));
+    if options.speed == SpeedPreset::LeanGaming {
+        runtime.log(
+            "success",
+            format!("Starting {name} with a clean Lean Gaming boot"),
+        );
+    } else {
+        runtime.log("success", format!("Starting {name}"));
+    }
     watch_profile_start(Arc::clone(shared), name.to_owned());
     Ok(message("Android is starting"))
 }
@@ -479,28 +486,50 @@ fn watch_profile_start(shared: Shared, name: String) {
             }
         }
 
-        let next = if let Ok(mut runtime) = shared.lock() {
+        if let Ok(mut runtime) = shared.lock() {
             runtime.starting_profiles.remove(&name);
             if booted {
                 runtime.log("success", format!("{name} is ready"));
             } else {
                 runtime.log("warning", format!("{name} did not finish starting"));
             }
-            runtime.queued_profiles.pop_front()
-        } else {
-            None
-        };
-        if let Some(next) = next
-            && let Err((_, Json(error))) = start_named_profile(&shared, &next)
-            && let Ok(mut runtime) = shared.lock()
-        {
-            runtime.log(
-                "error",
-                format!("Could not start queued {next}: {}", error.message),
-            );
-            runtime.starting_profiles.remove(&next);
         }
+        start_next_queued_profile(&shared);
     });
+}
+
+fn start_next_queued_profile(shared: &Shared) {
+    loop {
+        let next = match shared.lock() {
+            Ok(mut runtime) => runtime.queued_profiles.pop_front(),
+            Err(_) => return,
+        };
+        let Some(next) = next else {
+            return;
+        };
+        match start_named_profile(shared, &next) {
+            Ok(_) => {
+                let is_now_starting = shared
+                    .lock()
+                    .map(|runtime| runtime.starting_profiles.contains(&next))
+                    .unwrap_or(false);
+                if is_now_starting {
+                    return;
+                }
+                // The queued profile may have been started outside EmuMi while it waited.
+                // In that case no watcher will drain the rest of this queue, so keep going.
+            }
+            Err((_, Json(error))) => {
+                if let Ok(mut runtime) = shared.lock() {
+                    runtime.log(
+                        "error",
+                        format!("Could not start queued {next}: {}", error.message),
+                    );
+                    runtime.starting_profiles.remove(&next);
+                }
+            }
+        }
+    }
 }
 
 async fn stop_profile(
@@ -700,7 +729,9 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
     if let Some(port) = options.adb_port {
         args.extend(["-port".into(), port.to_string()]);
     }
-    if options.cold_boot {
+    // Lean Gaming profiles favor a deterministic guest boot over Quick Boot.
+    // This skips saved RAM state without touching userdata, installed apps, or accounts.
+    if options.cold_boot || options.speed == SpeedPreset::LeanGaming {
         args.push("-no-snapshot-load".into());
     }
     if options.mute_audio {
@@ -820,6 +851,23 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
         assert!(args.windows(2).any(|pair| pair == ["-vsync-rate", "30"]));
         assert!(args.contains(&"-no-audio".to_owned()));
+        assert!(args.contains(&"-no-snapshot-load".to_owned()));
+    }
+
+    #[test]
+    fn non_lean_profiles_only_clean_boot_when_requested() {
+        let normal = ProfileOptions {
+            speed: SpeedPreset::Efficient,
+            cold_boot: false,
+            ..ProfileOptions::default()
+        };
+        assert!(!launch_args(&normal).contains(&"-no-snapshot-load".to_owned()));
+
+        let recovery = ProfileOptions {
+            cold_boot: true,
+            ..normal
+        };
+        assert!(launch_args(&recovery).contains(&"-no-snapshot-load".to_owned()));
     }
 
     #[test]

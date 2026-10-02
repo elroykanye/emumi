@@ -3,6 +3,18 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-10-02
+
+### Changed
+
+- Lean Gaming profiles always perform a clean Android boot without deleting userdata, installed
+  apps or accounts, preventing native games from inheriting an invalid saved-memory state.
+
+### Fixed
+
+- Continue through the sequential startup queue when one profile fails before launch instead of
+  leaving every later profile stranded.
+
 ## [0.2.1] - 2026-09-29
 
 ### Added
@@ -72,3 +84,4 @@ All notable changes to EmuMi are documented here. This project follows
 [0.1.1]: https://github.com/elroykanye/emumi/releases/tag/v0.1.1
 [0.2.0]: https://github.com/elroykanye/emumi/releases/tag/v0.2.0
 [0.2.1]: https://github.com/elroykanye/emumi/releases/tag/v0.2.1
+[0.2.2]: https://github.com/elroykanye/emumi/releases/tag/v0.2.2
