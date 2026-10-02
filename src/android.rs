@@ -343,16 +343,7 @@ impl AndroidTools {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
         let log = fs::File::create(log_path).map_err(|err| err.to_string())?;
-        let mut emulator_args = vec![OsString::from("-avd"), OsString::from(&profile.name)];
-        emulator_args.extend(args.iter().map(OsString::from));
-        if let Some(image) = runtime_image {
-            // Compatibility runtimes are immutable private EmuMi copies. Do not
-            // add -writable-system here: the emulator creates a large temporary
-            // system copy for that flag and disables reliable Quick Boot. Apps,
-            // accounts and game data live in the AVD's separate userdata image.
-            emulator_args.push(OsString::from("-system"));
-            emulator_args.push(image.into_os_string());
-        }
+        let emulator_args = emulator_launch_args(&profile.name, args, runtime_image);
         let launch = launch_spec(emulator, &emulator_args, &profile.name, options)?;
         let mut command = Command::new(&launch.program);
         command
@@ -1036,6 +1027,26 @@ fn runtime_system_image(profile_name: &str) -> Option<PathBuf> {
     image.is_file().then_some(image)
 }
 
+fn emulator_launch_args(
+    profile_name: &str,
+    args: &[String],
+    runtime_image: Option<PathBuf>,
+) -> Vec<OsString> {
+    let mut emulator_args = vec![OsString::from("-avd"), OsString::from(profile_name)];
+    emulator_args.extend(args.iter().map(OsString::from));
+    if let Some(image) = runtime_image {
+        // Without -writable-system the emulator ignores -system and opens the
+        // SDK's stock system.img read-only, so the compatibility runtime (and
+        // its patched native bridge) never reaches the guest. With it, the
+        // emulator boots the profile's small system.img.qcow2 overlay backed
+        // by the private runtime.
+        emulator_args.push(OsString::from("-system"));
+        emulator_args.push(image.into_os_string());
+        emulator_args.push(OsString::from("-writable-system"));
+    }
+    emulator_args
+}
+
 fn runtime_key_from_image_sysdir(image_sysdir: &str) -> Option<String> {
     let mut components = image_sysdir
         .trim_matches('/')
@@ -1218,6 +1229,57 @@ mod tests {
                 "system-images/android-36/google_apis_playstore/x86_64/extra"
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn launches_with_compatibility_runtime_boot_that_runtime() {
+        let image = PathBuf::from("/data/emumi/runtime/android-36/system.img");
+        let emulator_args = emulator_launch_args(
+            "Device_3",
+            &["-port".into(), "5558".into()],
+            Some(image.clone()),
+        );
+        let direct = launch_spec(
+            Path::new("/sdk/emulator"),
+            &emulator_args,
+            "Device_3",
+            &ProfileOptions {
+                host_memory_policy: false,
+                ..ProfileOptions::default()
+            },
+        )
+        .unwrap();
+        let scoped = systemd_scope_launch_spec(
+            PathBuf::from("/usr/bin/systemd-run"),
+            Path::new("/sdk/emulator"),
+            &emulator_args,
+            "Device_3",
+            12345,
+            &ProfileOptions::default(),
+        );
+
+        for spec in [direct, scoped] {
+            let system = spec
+                .args
+                .iter()
+                .position(|arg| arg == "-system")
+                .expect("compatibility runtime launch must pass -system");
+            assert_eq!(
+                spec.args.get(system + 1),
+                Some(&image.clone().into_os_string())
+            );
+            assert!(spec.args.iter().any(|arg| arg == "-writable-system"));
+        }
+    }
+
+    #[test]
+    fn launches_without_compatibility_runtime_use_the_sdk_image() {
+        let emulator_args = emulator_launch_args("Device_3", &[], None);
+        assert!(
+            !emulator_args
+                .iter()
+                .any(|arg| arg == "-system" || arg == "-writable-system")
         );
     }
 

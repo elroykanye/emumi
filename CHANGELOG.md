@@ -3,6 +3,14 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.4] - 2026-10-02
+
+### Fixed
+
+- Profiles with a compatibility runtime boot that runtime again. Since 0.2.1 the emulator was
+  ignoring it and opening the stock SDK system image instead, so the patched native bridge never loaded
+  and Whiteout Survival crashed on Android 36 (`Unknown x86_64 sa_restorer in host sigaction`).
+
 ## [0.2.3] - 2026-10-02
 
 ### Added
