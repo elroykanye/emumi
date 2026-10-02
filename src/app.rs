@@ -36,6 +36,8 @@ struct Runtime {
     monitor: HostMonitor,
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
+    startup_generations: BTreeMap<String, u64>,
+    next_startup_generation: u64,
     queued_profiles: VecDeque<String>,
     memory_warnings: BTreeMap<String, String>,
 }
@@ -88,6 +90,13 @@ struct ApiMessage {
     message: String,
 }
 
+#[derive(Serialize)]
+struct PortReadiness {
+    ready: bool,
+    phase: &'static str,
+    message: String,
+}
+
 #[derive(Deserialize)]
 struct CreateRequest {
     name: String,
@@ -109,6 +118,8 @@ impl EmuMiApp {
             monitor: HostMonitor::default(),
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
+            startup_generations: BTreeMap::new(),
+            next_startup_generation: 1,
             queued_profiles: VecDeque::new(),
             memory_warnings: BTreeMap::new(),
         }));
@@ -125,6 +136,7 @@ impl EmuMiApp {
             .route("/api/profiles/{name}/settings", post(save_profile_settings))
             .route("/api/ports/{port}/start", post(start_port))
             .route("/api/ports/{port}/stop", post(stop_port))
+            .route("/api/ports/{port}/readiness", get(port_readiness))
             .route("/api/settings", post(save_settings))
             .with_state(runtime);
 
@@ -366,15 +378,14 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         .into_iter()
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
-    if profile.is_running() {
-        runtime.starting_profiles.remove(name);
-        return Ok(message("Android is already running"));
-    }
     if runtime.starting_profiles.contains(name) {
         return Ok(message("Android is already starting"));
     }
     if runtime.queued_profiles.iter().any(|queued| queued == name) {
         return Ok(message("Android is already queued"));
+    }
+    if profile.is_running() {
+        return Ok(message("Android is already running"));
     }
     let running = tools
         .discover_profiles()
@@ -404,6 +415,11 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         .or_default()
         .clone();
     runtime.starting_profiles.insert(name.to_owned());
+    let startup_generation = runtime.next_startup_generation;
+    runtime.next_startup_generation = runtime.next_startup_generation.wrapping_add(1).max(1);
+    runtime
+        .startup_generations
+        .insert(name.to_owned(), startup_generation);
     let (display_width, display_height) = display_dimensions(options.picture);
     let start_result = tools
         .configure_input_and_window(
@@ -425,6 +441,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         .and_then(|_| tools.start(&profile, &launch_args(&options), &options));
     if let Err(message) = start_result {
         runtime.starting_profiles.remove(name);
+        runtime.startup_generations.remove(name);
         return Err(error_tuple(StatusCode::BAD_REQUEST, message));
     }
     if options.rectangular_display {
@@ -448,11 +465,11 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     } else {
         runtime.log("success", format!("Starting {name}"));
     }
-    watch_profile_start(Arc::clone(shared), name.to_owned());
+    watch_profile_start(Arc::clone(shared), name.to_owned(), startup_generation);
     Ok(message("Android is starting"))
 }
 
-fn watch_profile_start(shared: Shared, name: String) {
+fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
     tokio::spawn(async move {
         let mut booted = false;
         for _ in 0..240 {
@@ -487,7 +504,11 @@ fn watch_profile_start(shared: Shared, name: String) {
         }
 
         if let Ok(mut runtime) = shared.lock() {
+            if runtime.startup_generations.get(&name) != Some(&startup_generation) {
+                return;
+            }
             runtime.starting_profiles.remove(&name);
+            runtime.startup_generations.remove(&name);
             if booted {
                 runtime.log("success", format!("{name} is ready"));
             } else {
@@ -526,6 +547,7 @@ fn start_next_queued_profile(shared: &Shared) {
                         format!("Could not start queued {next}: {}", error.message),
                     );
                     runtime.starting_profiles.remove(&next);
+                    runtime.startup_generations.remove(&next);
                 }
             }
         }
@@ -542,6 +564,7 @@ async fn stop_profile(
 fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let mut runtime = lock(shared)?;
     runtime.starting_profiles.remove(name);
+    runtime.startup_generations.remove(name);
     runtime.queued_profiles.retain(|queued| queued != name);
     let tools = runtime.tools();
     let profile = tools
@@ -567,6 +590,61 @@ async fn start_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiR
 async fn stop_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiResult<ApiMessage> {
     let name = profile_name_for_port(&shared, port)?;
     stop_named_profile(&shared, &name)
+}
+
+async fn port_readiness(
+    State(shared): State<Shared>,
+    Path(port): Path<u16>,
+) -> ApiResult<PortReadiness> {
+    let runtime = lock(&shared)?;
+    let name = runtime
+        .config
+        .profile_options
+        .iter()
+        .find_map(|(name, options)| (options.adb_port == Some(port)).then(|| name.clone()))
+        .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "No profile uses that ADB port"))?;
+
+    let readiness = if runtime.queued_profiles.iter().any(|queued| queued == &name) {
+        PortReadiness {
+            ready: false,
+            phase: "queued",
+            message: format!("{name} is queued for startup"),
+        }
+    } else if runtime.starting_profiles.contains(&name) {
+        PortReadiness {
+            ready: false,
+            phase: "starting",
+            message: format!("{name} is still completing its clean boot"),
+        }
+    } else {
+        let tools = runtime.tools();
+        let profile = tools
+            .discover_profiles()
+            .into_iter()
+            .find(|profile| profile.name == name)
+            .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
+        if !profile.is_running() {
+            PortReadiness {
+                ready: false,
+                phase: "stopped",
+                message: format!("{name} is stopped"),
+            }
+        } else if !tools.profile_boot_completed(&name) {
+            PortReadiness {
+                ready: false,
+                phase: "booting",
+                message: format!("{name} is visible to ADB but Android has not completed boot"),
+            }
+        } else {
+            PortReadiness {
+                ready: true,
+                phase: "ready",
+                message: format!("{name} is ready for app launch"),
+            }
+        }
+    };
+
+    Ok(Json(readiness))
 }
 
 fn profile_name_for_port(

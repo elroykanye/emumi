@@ -3,6 +3,19 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] - 2026-10-02
+
+### Added
+
+- A per-port readiness endpoint so automation clients can distinguish an ADB-visible emulator from
+  an Android instance that has completed EmuMi's clean-boot warm-up.
+
+### Fixed
+
+- Repeated start requests no longer erase a profile's in-progress startup state.
+- A stale watcher from an older boot can no longer mark a newer restart ready.
+- Frostguard can now defer Whiteout launch until the emulator is explicitly launch-ready.
+
 ## [0.2.2] - 2026-10-02
 
 ### Changed
