@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn migrates_existing_profiles_to_the_four_emulator_defaults_once() {
         let mut config: AppConfig = serde_json::from_str(
-            r#"{"profile_options":{"Device_1":{"memory_mb":2048,"picture":"Sharp","headless_automation":false,"mute_audio":false,"memory_high_mb":7168,"memory_max_mb":8192}}}"#,
+            r#"{"profile_options":{"Device_1":{"cores":8,"memory_mb":2048,"picture":"Sharp","gpu_mode":"auto","adb_port":5554,"cold_boot":true,"headless_automation":false,"mute_audio":false,"memory_high_mb":7168,"memory_max_mb":8192},"Device_Intel":{"cores":8,"memory_mb":4096,"gpu_mode":"host-intel","adb_port":5556}}}"#,
         )
         .unwrap();
 
@@ -103,11 +103,19 @@ mod tests {
         let options = &config.profile_options["Device_1"];
         assert_eq!(config.policy_version, CURRENT_POLICY_VERSION);
         assert_eq!(options.picture, PicturePreset::Phone);
+        assert_eq!(options.cores, 2);
         assert_eq!(options.memory_mb, 4096);
+        assert_eq!(options.gpu_mode, "host");
+        assert_eq!(options.adb_port, Some(5554));
+        assert!(options.cold_boot);
         assert!(options.headless_automation);
         assert!(options.mute_audio);
         assert_eq!(options.memory_high_mb, 5632);
         assert_eq!(options.memory_max_mb, 6656);
+        let intel = &config.profile_options["Device_Intel"];
+        assert_eq!(intel.cores, 2);
+        assert_eq!(intel.gpu_mode, "host-intel");
+        assert_eq!(intel.adb_port, Some(5556));
         assert!(!config.migrate_policy());
     }
 }

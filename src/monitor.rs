@@ -5,9 +5,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Default)]
 pub struct HostMonitor {
     previous_cpu: Option<(u64, u64)>,
+    proc_root: PathBuf,
+    sys_root: PathBuf,
+}
+
+impl Default for HostMonitor {
+    fn default() -> Self {
+        Self {
+            previous_cpu: None,
+            proc_root: PathBuf::from("/proc"),
+            sys_root: PathBuf::from("/sys"),
+        }
+    }
 }
 
 pub fn sample_devices(profiles: &[AndroidProfile]) -> Vec<DeviceHostStats> {
@@ -159,18 +170,19 @@ impl HostMonitor {
     pub fn sample(&mut self) -> HostStats {
         let (cpu_percent, next_cpu) = self.cpu_sample();
         self.previous_cpu = next_cpu;
-        let (memory_used_bytes, memory_total_bytes, memory_available_bytes) = memory_sample();
+        let (memory_used_bytes, memory_total_bytes, memory_available_bytes) =
+            memory_sample(&self.proc_root.join("meminfo"));
         HostStats {
             cpu_percent,
             memory_used_bytes,
             memory_total_bytes,
             memory_available_bytes,
-            cpu_temperature_c: cpu_temperature_c(),
+            cpu_temperature_c: cpu_temperature_c(&self.sys_root),
         }
     }
 
     fn cpu_sample(&self) -> (f32, Option<(u64, u64)>) {
-        let Some(line) = fs::read_to_string("/proc/stat")
+        let Some(line) = fs::read_to_string(self.proc_root.join("stat"))
             .ok()
             .and_then(|text| text.lines().next().map(str::to_owned))
         else {
@@ -194,10 +206,19 @@ impl HostMonitor {
             .unwrap_or(0.0);
         (usage, Some((total, idle)))
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_roots(proc_root: PathBuf, sys_root: PathBuf) -> Self {
+        Self {
+            previous_cpu: None,
+            proc_root,
+            sys_root,
+        }
+    }
 }
 
-fn memory_sample() -> (u64, u64, u64) {
-    let Ok(text) = fs::read_to_string("/proc/meminfo") else {
+fn memory_sample(path: &Path) -> (u64, u64, u64) {
+    let Ok(text) = fs::read_to_string(path) else {
         return (0, 0, 0);
     };
     let mut total_kb = 0;
@@ -216,9 +237,9 @@ fn memory_sample() -> (u64, u64, u64) {
     )
 }
 
-fn cpu_temperature_c() -> Option<f32> {
+fn cpu_temperature_c(sys_root: &Path) -> Option<f32> {
     let mut readings = Vec::new();
-    if let Ok(zones) = fs::read_dir("/sys/class/thermal") {
+    if let Ok(zones) = fs::read_dir(sys_root.join("class/thermal")) {
         for zone in zones.flatten() {
             let path = zone.path();
             let sensor_type = fs::read_to_string(path.join("type"))
@@ -231,7 +252,7 @@ fn cpu_temperature_c() -> Option<f32> {
             }
         }
     }
-    if let Ok(devices) = fs::read_dir("/sys/class/hwmon") {
+    if let Ok(devices) = fs::read_dir(sys_root.join("class/hwmon")) {
         for device in devices.flatten() {
             let path = device.path();
             let name = fs::read_to_string(path.join("name"))
@@ -298,5 +319,31 @@ mod tests {
         assert!(memory_warning(&sample).unwrap().contains("MemoryHigh"));
         sample.memory_events.insert("oom_kill".into(), 1);
         assert!(memory_warning(&sample).unwrap().contains("ceiling"));
+    }
+
+    #[test]
+    fn samples_available_memory_and_millidegree_cpu_temperature() {
+        let root = std::env::temp_dir().join(format!("emumi-monitor-test-{}", std::process::id()));
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        let sensor = sys_root.join("class/hwmon/hwmon0");
+        fs::create_dir_all(&proc_root).unwrap();
+        fs::create_dir_all(&sensor).unwrap();
+        fs::write(proc_root.join("stat"), "cpu 100 0 100 800 0 0 0 0\n").unwrap();
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 16777216 kB\nMemAvailable: 9437184 kB\n",
+        )
+        .unwrap();
+        fs::write(sensor.join("name"), "coretemp\n").unwrap();
+        fs::write(sensor.join("temp1_input"), "77000\n").unwrap();
+
+        let mut monitor = HostMonitor::for_roots(proc_root, sys_root);
+        let sample = monitor.sample();
+
+        assert_eq!(sample.memory_total_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(sample.memory_available_bytes, 9 * 1024 * 1024 * 1024);
+        assert_eq!(sample.cpu_temperature_c, Some(77.0));
+        fs::remove_dir_all(root).unwrap();
     }
 }

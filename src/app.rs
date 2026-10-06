@@ -411,8 +411,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         );
         return Ok(message("Android is queued for an adaptive start"));
     }
-    let host = runtime.monitor.sample();
-    if let Some(reason) = launch_block_reason(&host) {
+    if let Err(reason) = enforce_launch_admission(&mut runtime.monitor) {
         return api_error(StatusCode::CONFLICT, reason);
     }
     let options = runtime
@@ -867,7 +866,7 @@ fn validate_profile_options(options: &ProfileOptions) -> Result<(), String> {
 }
 
 fn launch_block_reason(host: &HostStats) -> Option<String> {
-    if host.memory_available_bytes > 0 && host.memory_available_bytes < MIN_AVAILABLE_MEMORY_BYTES {
+    if host.memory_available_bytes < MIN_AVAILABLE_MEMORY_BYTES {
         return Some(
             "EmuMi needs at least 8 GB of available host memory before starting another Android"
                 .into(),
@@ -880,6 +879,14 @@ fn launch_block_reason(host: &HostStats) -> Option<String> {
         return Some("CPU temperature is at or above 90 C; let the computer cool before starting another Android".into());
     }
     None
+}
+
+fn enforce_launch_admission(monitor: &mut HostMonitor) -> Result<(), String> {
+    enforce_launch_admission_with(|| monitor.sample())
+}
+
+fn enforce_launch_admission_with(sample: impl FnOnce() -> HostStats) -> Result<(), String> {
+    launch_block_reason(&sample()).map_or(Ok(()), Err)
 }
 
 fn write_api_endpoint(url: &str) -> std::io::Result<()> {
@@ -926,8 +933,13 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_args, launch_block_reason, validate_profile_options};
+    use super::{
+        STARTUP_SETTLE_SECONDS, enforce_launch_admission, launch_args, launch_block_reason,
+        validate_profile_options,
+    };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
+    use crate::monitor::HostMonitor;
+    use std::fs;
 
     #[test]
     fn launch_admission_protects_host_memory_and_temperature() {
@@ -937,6 +949,22 @@ mod tests {
             ..HostStats::default()
         };
         assert_eq!(launch_block_reason(&safe), None);
+
+        let unavailable_or_exhausted = HostStats {
+            memory_available_bytes: 0,
+            ..safe.clone()
+        };
+        assert!(
+            launch_block_reason(&unavailable_or_exhausted)
+                .unwrap()
+                .contains("8 GB")
+        );
+
+        let exact_boundary = HostStats {
+            memory_available_bytes: 8 * 1024 * 1024 * 1024,
+            ..safe.clone()
+        };
+        assert_eq!(launch_block_reason(&exact_boundary), None);
 
         let low_memory = HostStats {
             memory_available_bytes: 7 * 1024 * 1024 * 1024,
@@ -950,6 +978,33 @@ mod tests {
             ..safe
         };
         assert!(launch_block_reason(&too_hot).unwrap().contains("90"));
+    }
+
+    #[test]
+    fn launch_entry_samples_and_enforces_admission() {
+        let root =
+            std::env::temp_dir().join(format!("emumi-admission-test-{}", std::process::id()));
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        fs::create_dir_all(&proc_root).unwrap();
+        fs::create_dir_all(&sys_root).unwrap();
+        fs::write(proc_root.join("stat"), "cpu 100 0 100 800 0 0 0 0\n").unwrap();
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 16777216 kB\nMemAvailable: 0 kB\n",
+        )
+        .unwrap();
+        let mut monitor = HostMonitor::for_roots(proc_root, sys_root);
+
+        let result = enforce_launch_admission(&mut monitor);
+
+        assert!(result.unwrap_err().contains("8 GB"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_start_waits_twenty_seconds_after_boot() {
+        assert_eq!(STARTUP_SETTLE_SECONDS, 20);
     }
 
     #[test]
