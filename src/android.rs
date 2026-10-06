@@ -352,7 +352,10 @@ impl AndroidTools {
             .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
             .stderr(Stdio::from(log))
             .process_group(0);
-        if options.gpu_mode == "host" && nvidia_gpu_available() {
+        if options.gpu_mode == "host-intel" {
+            let (device, manifest) = intel_renderer()?;
+            configure_intel_renderer(&mut command, &device, &manifest);
+        } else if options.gpu_mode == "host" && nvidia_gpu_available() {
             command
                 .env("__NV_PRIME_RENDER_OFFLOAD", "1")
                 .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
@@ -750,10 +753,13 @@ fn systemd_scope_launch_spec(
             "--property=MemorySwapMax={}M",
             options.memory_swap_max_mb
         )),
+        // Four active emulators receive at most 3.2 host CPUs in aggregate,
+        // leaving capacity for Frostguard, the desktop and system services.
+        OsString::from("--property=CPUQuota=80%"),
         // Emulator work stays responsive, but competes below normal desktop
         // applications when several Androids are busy at once.
-        OsString::from("--property=CPUWeight=50"),
-        OsString::from("--property=IOWeight=50"),
+        OsString::from("--property=CPUWeight=25"),
+        OsString::from("--property=IOWeight=25"),
         OsString::from("--"),
         emulator.as_os_str().to_owned(),
     ];
@@ -930,6 +936,47 @@ fn clear_stale_runtime_locks_in(
 
 fn nvidia_gpu_available() -> bool {
     Path::new("/proc/driver/nvidia/gpus").is_dir()
+}
+
+// Select both APIs: DRI_PRIME alone still lets gfxstream pick NVIDIA for Vulkan.
+// Fail closed rather than silently falling back to a different GPU or the CPU.
+fn intel_renderer() -> Result<(String, PathBuf), String> {
+    let devices = fs::read_dir("/sys/bus/pci/devices")
+        .map_err(|error| format!("Could not inspect Intel graphics: {error}"))?;
+    let mut candidates = devices
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let vendor = fs::read_to_string(path.join("vendor")).ok()?;
+            let class = fs::read_to_string(path.join("class")).ok()?;
+            (vendor.trim() == "0x8086" && class.trim().starts_with("0x03"))
+                .then(|| entry.file_name().to_string_lossy().replace([':', '.'], "_"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    let device = candidates
+        .first()
+        .ok_or("Intel hardware graphics requested, but no Intel display adapter was found")?;
+    let manifest = [
+        "/usr/share/vulkan/icd.d/intel_icd.json",
+        "/usr/share/vulkan/icd.d/intel_icd.x86_64.json",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .ok_or("Intel hardware graphics needs the Mesa Intel Vulkan driver manifest")?;
+    Ok((format!("pci-{device}"), manifest))
+}
+
+fn configure_intel_renderer(command: &mut Command, device: &str, manifest: &Path) {
+    command
+        .env_remove("__NV_PRIME_RENDER_OFFLOAD")
+        .env_remove("__NV_PRIME_RENDER_OFFLOAD_PROVIDER")
+        .env_remove("__VK_LAYER_NV_optimus")
+        .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+        .env("DRI_PRIME", device)
+        .env("VK_DRIVER_FILES", manifest)
+        .env("VK_ICD_FILENAMES", manifest);
 }
 
 fn read_lock_pid(path: &Path) -> Option<u32> {
@@ -1184,6 +1231,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn intel_renderer_selects_both_graphics_apis_without_nvidia_offload() {
+        let mut command = Command::new("emulator");
+        command.env("__NV_PRIME_RENDER_OFFLOAD", "1");
+        command.env("__VK_LAYER_NV_optimus", "NVIDIA_only");
+        configure_intel_renderer(
+            &mut command,
+            "pci-0000_00_02_0",
+            Path::new("/test/intel.json"),
+        );
+        let env: HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(env["__GLX_VENDOR_LIBRARY_NAME"].as_deref(), Some("mesa"));
+        assert_eq!(env["DRI_PRIME"].as_deref(), Some("pci-0000_00_02_0"));
+        assert_eq!(env["VK_DRIVER_FILES"].as_deref(), Some("/test/intel.json"));
+        assert_eq!(env["VK_ICD_FILENAMES"].as_deref(), Some("/test/intel.json"));
+        assert_eq!(env["__NV_PRIME_RENDER_OFFLOAD"], None);
+        assert_eq!(env["__VK_LAYER_NV_optimus"], None);
+    }
+
+    #[test]
     fn parses_avd_names() {
         assert_eq!(
             parse_avd_list("Pixel_7\nTablet\n\n"),
@@ -1319,13 +1393,14 @@ mod tests {
 
         assert_eq!(spec.program, PathBuf::from("/usr/bin/systemd-run"));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2-12345")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=6656M")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=7168M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5632M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6656M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed(
             "--property=MemorySwapMax=1024M"
         )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=50")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=50")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=80%")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
     }
 

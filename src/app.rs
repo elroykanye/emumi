@@ -1,7 +1,7 @@
 use crate::{
     android::AndroidTools,
     config::AppConfig,
-    model::{PicturePreset, ProfileOptions, SpeedPreset},
+    model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
 };
 use axum::{
@@ -24,6 +24,9 @@ use tokio::net::TcpListener;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const MAX_RUNNING_PROFILES: usize = 4;
+const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
+const STARTUP_SETTLE_SECONDS: u64 = 20;
 
 type Shared = Arc<Mutex<Runtime>>;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
@@ -408,6 +411,10 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         );
         return Ok(message("Android is queued for an adaptive start"));
     }
+    let host = runtime.monitor.sample();
+    if let Some(reason) = launch_block_reason(&host) {
+        return api_error(StatusCode::CONFLICT, reason);
+    }
     let options = runtime
         .config
         .profile_options
@@ -486,7 +493,7 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
         if booted {
             // Give login, Play services and the automation target time to warm up.
             // Then require three calm host samples before admitting the next AVD.
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
             let mut monitor = HostMonitor::default();
             let _ = monitor.sample();
             let mut calm_samples = 0;
@@ -798,7 +805,11 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         "-memory".into(),
         options.memory_mb.to_string(),
         "-gpu".into(),
-        options.gpu_mode.clone(),
+        if options.gpu_mode == "host-intel" {
+            "host".into()
+        } else {
+            options.gpu_mode.clone()
+        },
         "-skin".into(),
         format!("{display_width}x{display_height}"),
         "-vsync-rate".into(),
@@ -855,6 +866,22 @@ fn validate_profile_options(options: &ProfileOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn launch_block_reason(host: &HostStats) -> Option<String> {
+    if host.memory_available_bytes > 0 && host.memory_available_bytes < MIN_AVAILABLE_MEMORY_BYTES {
+        return Some(
+            "EmuMi needs at least 8 GB of available host memory before starting another Android"
+                .into(),
+        );
+    }
+    if host
+        .cpu_temperature_c
+        .is_some_and(|temperature| temperature >= MAX_LAUNCH_TEMPERATURE_C)
+    {
+        return Some("CPU temperature is at or above 90 C; let the computer cool before starting another Android".into());
+    }
+    None
+}
+
 fn write_api_endpoint(url: &str) -> std::io::Result<()> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -865,12 +892,11 @@ fn write_api_endpoint(url: &str) -> std::io::Result<()> {
     fs::write(directory.join("api-url"), format!("{url}\n"))
 }
 
-fn display_dimensions(picture: PicturePreset) -> (u16, u16) {
-    match picture {
-        PicturePreset::Compact => (540, 960),
-        PicturePreset::Phone => (720, 1280),
-        PicturePreset::Sharp => (1080, 1920),
-    }
+fn display_dimensions(_picture: PicturePreset) -> (u16, u16) {
+    // Frostguard's screenshots, OCR regions and tap coordinates use this exact canvas.
+    // Keep the serialized picture choice for backwards-compatible config parsing, but
+    // never let an older profile launch at a different automation resolution.
+    (720, 1280)
 }
 
 fn lock(
@@ -900,8 +926,43 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_args, validate_profile_options};
-    use crate::model::{ProfileOptions, SpeedPreset};
+    use super::{launch_args, launch_block_reason, validate_profile_options};
+    use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
+
+    #[test]
+    fn launch_admission_protects_host_memory_and_temperature() {
+        let safe = HostStats {
+            memory_available_bytes: 9 * 1024 * 1024 * 1024,
+            cpu_temperature_c: Some(89.9),
+            ..HostStats::default()
+        };
+        assert_eq!(launch_block_reason(&safe), None);
+
+        let low_memory = HostStats {
+            memory_available_bytes: 7 * 1024 * 1024 * 1024,
+            ..safe.clone()
+        };
+        assert!(launch_block_reason(&low_memory).unwrap().contains("8 GB"));
+
+        let too_hot = HostStats {
+            memory_available_bytes: 12 * 1024 * 1024 * 1024,
+            cpu_temperature_c: Some(90.0),
+            ..safe
+        };
+        assert!(launch_block_reason(&too_hot).unwrap().contains("90"));
+    }
+
+    #[test]
+    fn intel_choice_uses_hardware_not_an_unknown_emulator_gpu_mode() {
+        let options = ProfileOptions {
+            gpu_mode: "host-intel".into(),
+            ..ProfileOptions::default()
+        };
+        let args = launch_args(&options);
+        assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(!args.iter().any(|arg| arg == "host-intel"));
+        assert!(args.contains(&"-no-snapshot-load".into()));
+    }
 
     #[test]
     fn disables_emulator_audio_when_profile_is_muted() {
@@ -924,8 +985,8 @@ mod tests {
         assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
-        assert_eq!(options.memory_high_mb, 6656);
-        assert_eq!(options.memory_max_mb, 7168);
+        assert_eq!(options.memory_high_mb, 5632);
+        assert_eq!(options.memory_max_mb, 6656);
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
         assert!(args.windows(2).any(|pair| pair == ["-vsync-rate", "30"]));
         assert!(args.contains(&"-no-audio".to_owned()));
@@ -954,6 +1015,41 @@ mod tests {
         let skin = args.iter().position(|arg| arg == "-skin").unwrap();
 
         assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+    }
+
+    #[test]
+    fn enforces_frostguard_resolution_for_every_profile() {
+        for picture in [
+            PicturePreset::Compact,
+            PicturePreset::Phone,
+            PicturePreset::Sharp,
+        ] {
+            let options = ProfileOptions {
+                picture,
+                ..ProfileOptions::default()
+            };
+            let args = launch_args(&options);
+            let skin = args.iter().position(|arg| arg == "-skin").unwrap();
+
+            assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+        }
+    }
+
+    #[test]
+    fn automation_safe_peripherals_are_disabled_by_default() {
+        let options = ProfileOptions::default();
+        let args = launch_args(&options);
+
+        assert!(options.headless_automation);
+        assert!(options.mute_audio);
+        assert!(args.contains(&"-no-window".to_owned()));
+        assert!(args.contains(&"-no-audio".to_owned()));
+        assert!(args.contains(&"-no-boot-anim".to_owned()));
+        assert!(args.windows(2).any(|pair| pair == ["-camera-back", "none"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-camera-front", "none"])
+        );
     }
 
     #[test]

@@ -1,13 +1,28 @@
-use crate::model::ProfileOptions;
+use crate::model::{PicturePreset, ProfileOptions};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io, path::PathBuf};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+const CURRENT_POLICY_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub android_sdk_path: String,
     pub jdk_path: String,
     pub profile_options: BTreeMap<String, ProfileOptions>,
+    #[serde(default = "legacy_policy_version")]
+    pub policy_version: u32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            android_sdk_path: String::new(),
+            jdk_path: String::new(),
+            profile_options: BTreeMap::new(),
+            policy_version: CURRENT_POLICY_VERSION,
+        }
+    }
 }
 
 impl AppConfig {
@@ -15,10 +30,14 @@ impl AppConfig {
         let Some(path) = config_path() else {
             return Self::default();
         };
-        fs::read_to_string(path)
+        let mut config: Self = fs::read_to_string(path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if config.migrate_policy() {
+            let _ = config.save();
+        }
+        config
     }
 
     pub fn save(&self) -> io::Result<PathBuf> {
@@ -30,6 +49,34 @@ impl AppConfig {
         fs::write(&path, body)?;
         Ok(path)
     }
+
+    fn migrate_policy(&mut self) -> bool {
+        if self.policy_version >= CURRENT_POLICY_VERSION {
+            return false;
+        }
+        for options in self.profile_options.values_mut() {
+            options.picture = PicturePreset::Phone;
+            options.cores = 2;
+            options.memory_mb = 4096;
+            options.dpi = 240;
+            if options.gpu_mode != "host-intel" {
+                options.gpu_mode = "host".into();
+            }
+            options.mute_audio = true;
+            options.headless_automation = true;
+            options.refresh_rate_hz = 30;
+            options.host_memory_policy = true;
+            options.memory_high_mb = 5632;
+            options.memory_max_mb = 6656;
+            options.memory_swap_max_mb = 1024;
+        }
+        self.policy_version = CURRENT_POLICY_VERSION;
+        true
+    }
+}
+
+fn legacy_policy_version() -> u32 {
+    0
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -37,4 +84,30 @@ pub fn config_path() -> Option<PathBuf> {
         return Some(PathBuf::from(base).join("emumi/config.json"));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/emumi/config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, CURRENT_POLICY_VERSION};
+    use crate::model::PicturePreset;
+
+    #[test]
+    fn migrates_existing_profiles_to_the_four_emulator_defaults_once() {
+        let mut config: AppConfig = serde_json::from_str(
+            r#"{"profile_options":{"Device_1":{"memory_mb":2048,"picture":"Sharp","headless_automation":false,"mute_audio":false,"memory_high_mb":7168,"memory_max_mb":8192}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.policy_version, 0);
+        assert!(config.migrate_policy());
+        let options = &config.profile_options["Device_1"];
+        assert_eq!(config.policy_version, CURRENT_POLICY_VERSION);
+        assert_eq!(options.picture, PicturePreset::Phone);
+        assert_eq!(options.memory_mb, 4096);
+        assert!(options.headless_automation);
+        assert!(options.mute_audio);
+        assert_eq!(options.memory_high_mb, 5632);
+        assert_eq!(options.memory_max_mb, 6656);
+        assert!(!config.migrate_policy());
+    }
 }

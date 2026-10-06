@@ -159,11 +159,13 @@ impl HostMonitor {
     pub fn sample(&mut self) -> HostStats {
         let (cpu_percent, next_cpu) = self.cpu_sample();
         self.previous_cpu = next_cpu;
-        let (memory_used_bytes, memory_total_bytes) = memory_sample();
+        let (memory_used_bytes, memory_total_bytes, memory_available_bytes) = memory_sample();
         HostStats {
             cpu_percent,
             memory_used_bytes,
             memory_total_bytes,
+            memory_available_bytes,
+            cpu_temperature_c: cpu_temperature_c(),
         }
     }
 
@@ -194,9 +196,9 @@ impl HostMonitor {
     }
 }
 
-fn memory_sample() -> (u64, u64) {
+fn memory_sample() -> (u64, u64, u64) {
     let Ok(text) = fs::read_to_string("/proc/meminfo") else {
-        return (0, 0);
+        return (0, 0, 0);
     };
     let mut total_kb = 0;
     let mut available_kb = 0;
@@ -207,7 +209,65 @@ fn memory_sample() -> (u64, u64) {
             available_kb = parse_kb(value);
         }
     }
-    ((total_kb - available_kb) * 1024, total_kb * 1024)
+    (
+        (total_kb - available_kb) * 1024,
+        total_kb * 1024,
+        available_kb * 1024,
+    )
+}
+
+fn cpu_temperature_c() -> Option<f32> {
+    let mut readings = Vec::new();
+    if let Ok(zones) = fs::read_dir("/sys/class/thermal") {
+        for zone in zones.flatten() {
+            let path = zone.path();
+            let sensor_type = fs::read_to_string(path.join("type"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if (sensor_type.contains("cpu") || sensor_type.contains("x86_pkg_temp"))
+                && let Some(value) = read_temperature(path.join("temp"))
+            {
+                readings.push(value);
+            }
+        }
+    }
+    if let Ok(devices) = fs::read_dir("/sys/class/hwmon") {
+        for device in devices.flatten() {
+            let path = device.path();
+            let name = fs::read_to_string(path.join("name"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !["coretemp", "k10temp", "zenpower"]
+                .iter()
+                .any(|driver| name.trim() == *driver)
+            {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                if file_name.starts_with("temp")
+                    && file_name.ends_with("_input")
+                    && let Some(value) = read_temperature(entry.path())
+                {
+                    readings.push(value);
+                }
+            }
+        }
+    }
+    readings.into_iter().reduce(f32::max)
+}
+
+fn read_temperature(path: PathBuf) -> Option<f32> {
+    let value: f32 = fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    Some(if value > 1000.0 {
+        value / 1000.0
+    } else {
+        value
+    })
 }
 
 fn parse_kb(value: &str) -> u64 {
