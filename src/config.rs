@@ -110,8 +110,11 @@ mod tests {
         assert!(options.cold_boot);
         assert!(options.headless_automation);
         assert!(options.mute_audio);
+        assert_eq!(options.refresh_rate_hz, 30);
+        assert!(options.host_memory_policy);
         assert_eq!(options.memory_high_mb, 5632);
         assert_eq!(options.memory_max_mb, 6656);
+        assert_eq!(options.memory_swap_max_mb, 1024);
         let intel = &config.profile_options["Device_Intel"];
         assert_eq!(intel.cores, 2);
         assert_eq!(intel.gpu_mode, "host-intel");

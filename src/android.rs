@@ -1,4 +1,4 @@
-use crate::model::{AndroidProfile, ProfileOptions};
+use crate::model::{AndroidProfile, LaunchAdmission, ProfileOptions};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -326,6 +326,7 @@ impl AndroidTools {
         profile: &AndroidProfile,
         args: &[String],
         options: &ProfileOptions,
+        _admission: LaunchAdmission,
     ) -> Result<(), String> {
         let emulator = self
             .emulator

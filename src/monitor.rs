@@ -327,8 +327,10 @@ mod tests {
         let proc_root = root.join("proc");
         let sys_root = root.join("sys");
         let sensor = sys_root.join("class/hwmon/hwmon0");
+        let thermal_zone = sys_root.join("class/thermal/thermal_zone0");
         fs::create_dir_all(&proc_root).unwrap();
         fs::create_dir_all(&sensor).unwrap();
+        fs::create_dir_all(&thermal_zone).unwrap();
         fs::write(proc_root.join("stat"), "cpu 100 0 100 800 0 0 0 0\n").unwrap();
         fs::write(
             proc_root.join("meminfo"),
@@ -337,13 +339,16 @@ mod tests {
         .unwrap();
         fs::write(sensor.join("name"), "coretemp\n").unwrap();
         fs::write(sensor.join("temp1_input"), "77000\n").unwrap();
+        fs::write(sensor.join("temp2_input"), "80000\n").unwrap();
+        fs::write(thermal_zone.join("type"), "x86_pkg_temp\n").unwrap();
+        fs::write(thermal_zone.join("temp"), "91000\n").unwrap();
 
         let mut monitor = HostMonitor::for_roots(proc_root, sys_root);
         let sample = monitor.sample();
 
         assert_eq!(sample.memory_total_bytes, 16 * 1024 * 1024 * 1024);
         assert_eq!(sample.memory_available_bytes, 9 * 1024 * 1024 * 1024);
-        assert_eq!(sample.cpu_temperature_c, Some(77.0));
+        assert_eq!(sample.cpu_temperature_c, Some(91.0));
         fs::remove_dir_all(root).unwrap();
     }
 }

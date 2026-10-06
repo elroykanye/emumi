@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaunchAdmission {
+    _private: (),
+}
+
+impl LaunchAdmission {
+    pub(crate) fn granted() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AndroidProfile {
     pub name: String,

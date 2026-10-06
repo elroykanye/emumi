@@ -1,7 +1,7 @@
 use crate::{
     android::AndroidTools,
     config::AppConfig,
-    model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset},
+    model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
 };
 use axum::{
@@ -411,9 +411,8 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         );
         return Ok(message("Android is queued for an adaptive start"));
     }
-    if let Err(reason) = enforce_launch_admission(&mut runtime.monitor) {
-        return api_error(StatusCode::CONFLICT, reason);
-    }
+    let launch_admission = enforce_launch_admission(&mut runtime.monitor)
+        .map_err(|reason| error_tuple(StatusCode::CONFLICT, reason))?;
     let options = runtime
         .config
         .profile_options
@@ -444,7 +443,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
                 Ok(())
             }
         })
-        .and_then(|_| tools.start(&profile, &launch_args(&options), &options));
+        .and_then(|_| tools.start(&profile, &launch_args(&options), &options, launch_admission));
     if let Err(message) = start_result {
         runtime.starting_profiles.remove(name);
         runtime.startup_generations.remove(name);
@@ -489,10 +488,10 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
             }
         }
 
-        if booted {
+        let completion = if booted {
             // Give login, Play services and the automation target time to warm up.
             // Then require three calm host samples before admitting the next AVD.
-            tokio::time::sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
+            let settled = settle_after_boot().await;
             let mut monitor = HostMonitor::default();
             let _ = monitor.sample();
             let mut calm_samples = 0;
@@ -507,7 +506,10 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
                     calm_samples = 0;
                 }
             }
-        }
+            StartupCompletion::Settled(settled)
+        } else {
+            StartupCompletion::TimedOut
+        };
 
         if let Ok(mut runtime) = shared.lock() {
             if runtime.startup_generations.get(&name) != Some(&startup_generation) {
@@ -521,11 +523,37 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
                 runtime.log("warning", format!("{name} did not finish starting"));
             }
         }
-        start_next_queued_profile(&shared);
+        start_next_queued_profile(&shared, completion);
     });
 }
 
-fn start_next_queued_profile(shared: &Shared) {
+#[derive(Debug)]
+struct StartupSettled;
+
+#[derive(Debug)]
+enum StartupCompletion {
+    Settled(StartupSettled),
+    TimedOut,
+}
+
+async fn settle_after_boot() -> StartupSettled {
+    settle_after_boot_with(tokio::time::sleep).await
+}
+
+async fn settle_after_boot_with<F, Fut>(sleep: F) -> StartupSettled
+where
+    F: FnOnce(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
+    StartupSettled
+}
+
+fn start_next_queued_profile(shared: &Shared, completion: StartupCompletion) {
+    match completion {
+        StartupCompletion::Settled(_proof) => {}
+        StartupCompletion::TimedOut => {}
+    }
     loop {
         let next = match shared.lock() {
             Ok(mut runtime) => runtime.queued_profiles.pop_front(),
@@ -872,21 +900,29 @@ fn launch_block_reason(host: &HostStats) -> Option<String> {
                 .into(),
         );
     }
-    if host
-        .cpu_temperature_c
-        .is_some_and(|temperature| temperature >= MAX_LAUNCH_TEMPERATURE_C)
-    {
-        return Some("CPU temperature is at or above 90 C; let the computer cool before starting another Android".into());
+    match host.cpu_temperature_c {
+        Some(temperature) if temperature.is_finite() && temperature < MAX_LAUNCH_TEMPERATURE_C => {}
+        Some(temperature) if temperature.is_finite() => {
+            return Some("CPU temperature is at or above 90 C; let the computer cool before starting another Android".into());
+        }
+        _ => {
+            return Some(
+                "EmuMi could not verify CPU temperature; restore hardware monitoring before starting another Android"
+                    .into(),
+            );
+        }
     }
     None
 }
 
-fn enforce_launch_admission(monitor: &mut HostMonitor) -> Result<(), String> {
+fn enforce_launch_admission(monitor: &mut HostMonitor) -> Result<LaunchAdmission, String> {
     enforce_launch_admission_with(|| monitor.sample())
 }
 
-fn enforce_launch_admission_with(sample: impl FnOnce() -> HostStats) -> Result<(), String> {
-    launch_block_reason(&sample()).map_or(Ok(()), Err)
+fn enforce_launch_admission_with(
+    sample: impl FnOnce() -> HostStats,
+) -> Result<LaunchAdmission, String> {
+    launch_block_reason(&sample()).map_or_else(|| Ok(LaunchAdmission::granted()), Err)
 }
 
 fn write_api_endpoint(url: &str) -> std::io::Result<()> {
@@ -935,7 +971,7 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 mod tests {
     use super::{
         STARTUP_SETTLE_SECONDS, enforce_launch_admission, launch_args, launch_block_reason,
-        validate_profile_options,
+        settle_after_boot_with, validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
     use crate::monitor::HostMonitor;
@@ -978,6 +1014,27 @@ mod tests {
             ..safe
         };
         assert!(launch_block_reason(&too_hot).unwrap().contains("90"));
+
+        let missing_temperature = HostStats {
+            memory_available_bytes: 12 * 1024 * 1024 * 1024,
+            cpu_temperature_c: None,
+            ..HostStats::default()
+        };
+        assert!(
+            launch_block_reason(&missing_temperature)
+                .unwrap()
+                .contains("could not verify")
+        );
+
+        let invalid_temperature = HostStats {
+            cpu_temperature_c: Some(f32::NAN),
+            ..missing_temperature
+        };
+        assert!(
+            launch_block_reason(&invalid_temperature)
+                .unwrap()
+                .contains("could not verify")
+        );
     }
 
     #[test]
@@ -1002,8 +1059,18 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn staged_start_waits_twenty_seconds_after_boot() {
+    #[tokio::test]
+    async fn staged_start_waits_twenty_seconds_after_boot() {
+        let observed = std::cell::Cell::new(std::time::Duration::ZERO);
+        settle_after_boot_with(|duration| {
+            observed.set(duration);
+            async {}
+        })
+        .await;
+        assert_eq!(
+            observed.get(),
+            std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)
+        );
         assert_eq!(STARTUP_SETTLE_SECONDS, 20);
     }
 
