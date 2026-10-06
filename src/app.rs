@@ -1,7 +1,7 @@
 use crate::{
     android::AndroidTools,
     config::AppConfig,
-    model::{PicturePreset, ProfileOptions, SpeedPreset},
+    model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
 };
 use axum::{
@@ -24,6 +24,9 @@ use tokio::net::TcpListener;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const MAX_RUNNING_PROFILES: usize = 4;
+const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
+const STARTUP_SETTLE_SECONDS: u64 = 20;
 
 type Shared = Arc<Mutex<Runtime>>;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
@@ -408,6 +411,8 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         );
         return Ok(message("Android is queued for an adaptive start"));
     }
+    let launch_admission = enforce_launch_admission(&mut runtime.monitor)
+        .map_err(|reason| error_tuple(StatusCode::CONFLICT, reason))?;
     let options = runtime
         .config
         .profile_options
@@ -438,7 +443,7 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
                 Ok(())
             }
         })
-        .and_then(|_| tools.start(&profile, &launch_args(&options), &options));
+        .and_then(|_| tools.start(&profile, &launch_args(&options), &options, launch_admission));
     if let Err(message) = start_result {
         runtime.starting_profiles.remove(name);
         runtime.startup_generations.remove(name);
@@ -483,10 +488,10 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
             }
         }
 
-        if booted {
+        let completion = if booted {
             // Give login, Play services and the automation target time to warm up.
             // Then require three calm host samples before admitting the next AVD.
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let settled = settle_after_boot().await;
             let mut monitor = HostMonitor::default();
             let _ = monitor.sample();
             let mut calm_samples = 0;
@@ -501,7 +506,10 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
                     calm_samples = 0;
                 }
             }
-        }
+            StartupCompletion::Settled(settled)
+        } else {
+            StartupCompletion::TimedOut
+        };
 
         if let Ok(mut runtime) = shared.lock() {
             if runtime.startup_generations.get(&name) != Some(&startup_generation) {
@@ -515,11 +523,37 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
                 runtime.log("warning", format!("{name} did not finish starting"));
             }
         }
-        start_next_queued_profile(&shared);
+        start_next_queued_profile(&shared, completion);
     });
 }
 
-fn start_next_queued_profile(shared: &Shared) {
+#[derive(Debug)]
+struct StartupSettled;
+
+#[derive(Debug)]
+enum StartupCompletion {
+    Settled(StartupSettled),
+    TimedOut,
+}
+
+async fn settle_after_boot() -> StartupSettled {
+    settle_after_boot_with(tokio::time::sleep).await
+}
+
+async fn settle_after_boot_with<F, Fut>(sleep: F) -> StartupSettled
+where
+    F: FnOnce(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
+    StartupSettled
+}
+
+fn start_next_queued_profile(shared: &Shared, completion: StartupCompletion) {
+    match completion {
+        StartupCompletion::Settled(_proof) => {}
+        StartupCompletion::TimedOut => {}
+    }
     loop {
         let next = match shared.lock() {
             Ok(mut runtime) => runtime.queued_profiles.pop_front(),
@@ -859,6 +893,38 @@ fn validate_profile_options(options: &ProfileOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn launch_block_reason(host: &HostStats) -> Option<String> {
+    if host.memory_available_bytes < MIN_AVAILABLE_MEMORY_BYTES {
+        return Some(
+            "EmuMi needs at least 8 GB of available host memory before starting another Android"
+                .into(),
+        );
+    }
+    match host.cpu_temperature_c {
+        Some(temperature) if temperature.is_finite() && temperature < MAX_LAUNCH_TEMPERATURE_C => {}
+        Some(temperature) if temperature.is_finite() => {
+            return Some("CPU temperature is at or above 90 C; let the computer cool before starting another Android".into());
+        }
+        _ => {
+            return Some(
+                "EmuMi could not verify CPU temperature; restore hardware monitoring before starting another Android"
+                    .into(),
+            );
+        }
+    }
+    None
+}
+
+fn enforce_launch_admission(monitor: &mut HostMonitor) -> Result<LaunchAdmission, String> {
+    enforce_launch_admission_with(|| monitor.sample())
+}
+
+fn enforce_launch_admission_with(
+    sample: impl FnOnce() -> HostStats,
+) -> Result<LaunchAdmission, String> {
+    launch_block_reason(&sample()).map_or_else(|| Ok(LaunchAdmission::granted()), Err)
+}
+
 fn write_api_endpoint(url: &str) -> std::io::Result<()> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -869,12 +935,11 @@ fn write_api_endpoint(url: &str) -> std::io::Result<()> {
     fs::write(directory.join("api-url"), format!("{url}\n"))
 }
 
-fn display_dimensions(picture: PicturePreset) -> (u16, u16) {
-    match picture {
-        PicturePreset::Compact => (540, 960),
-        PicturePreset::Phone => (720, 1280),
-        PicturePreset::Sharp => (1080, 1920),
-    }
+fn display_dimensions(_picture: PicturePreset) -> (u16, u16) {
+    // Frostguard's screenshots, OCR regions and tap coordinates use this exact canvas.
+    // Keep the serialized picture choice for backwards-compatible config parsing, but
+    // never let an older profile launch at a different automation resolution.
+    (720, 1280)
 }
 
 fn lock(
@@ -904,8 +969,110 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_args, validate_profile_options};
-    use crate::model::{ProfileOptions, SpeedPreset};
+    use super::{
+        STARTUP_SETTLE_SECONDS, enforce_launch_admission, launch_args, launch_block_reason,
+        settle_after_boot_with, validate_profile_options,
+    };
+    use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
+    use crate::monitor::HostMonitor;
+    use std::fs;
+
+    #[test]
+    fn launch_admission_protects_host_memory_and_temperature() {
+        let safe = HostStats {
+            memory_available_bytes: 9 * 1024 * 1024 * 1024,
+            cpu_temperature_c: Some(89.9),
+            ..HostStats::default()
+        };
+        assert_eq!(launch_block_reason(&safe), None);
+
+        let unavailable_or_exhausted = HostStats {
+            memory_available_bytes: 0,
+            ..safe.clone()
+        };
+        assert!(
+            launch_block_reason(&unavailable_or_exhausted)
+                .unwrap()
+                .contains("8 GB")
+        );
+
+        let exact_boundary = HostStats {
+            memory_available_bytes: 8 * 1024 * 1024 * 1024,
+            ..safe.clone()
+        };
+        assert_eq!(launch_block_reason(&exact_boundary), None);
+
+        let low_memory = HostStats {
+            memory_available_bytes: 7 * 1024 * 1024 * 1024,
+            ..safe.clone()
+        };
+        assert!(launch_block_reason(&low_memory).unwrap().contains("8 GB"));
+
+        let too_hot = HostStats {
+            memory_available_bytes: 12 * 1024 * 1024 * 1024,
+            cpu_temperature_c: Some(90.0),
+            ..safe
+        };
+        assert!(launch_block_reason(&too_hot).unwrap().contains("90"));
+
+        let missing_temperature = HostStats {
+            memory_available_bytes: 12 * 1024 * 1024 * 1024,
+            cpu_temperature_c: None,
+            ..HostStats::default()
+        };
+        assert!(
+            launch_block_reason(&missing_temperature)
+                .unwrap()
+                .contains("could not verify")
+        );
+
+        let invalid_temperature = HostStats {
+            cpu_temperature_c: Some(f32::NAN),
+            ..missing_temperature
+        };
+        assert!(
+            launch_block_reason(&invalid_temperature)
+                .unwrap()
+                .contains("could not verify")
+        );
+    }
+
+    #[test]
+    fn launch_entry_samples_and_enforces_admission() {
+        let root =
+            std::env::temp_dir().join(format!("emumi-admission-test-{}", std::process::id()));
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        fs::create_dir_all(&proc_root).unwrap();
+        fs::create_dir_all(&sys_root).unwrap();
+        fs::write(proc_root.join("stat"), "cpu 100 0 100 800 0 0 0 0\n").unwrap();
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 16777216 kB\nMemAvailable: 0 kB\n",
+        )
+        .unwrap();
+        let mut monitor = HostMonitor::for_roots(proc_root, sys_root);
+
+        let result = enforce_launch_admission(&mut monitor);
+
+        assert!(result.unwrap_err().contains("8 GB"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_start_waits_twenty_seconds_after_boot() {
+        let observed = std::cell::Cell::new(std::time::Duration::ZERO);
+        settle_after_boot_with(|duration| {
+            observed.set(duration);
+            async {}
+        })
+        .await;
+        assert_eq!(
+            observed.get(),
+            std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)
+        );
+        assert_eq!(STARTUP_SETTLE_SECONDS, 20);
+    }
 
     #[test]
     fn intel_choice_uses_hardware_not_an_unknown_emulator_gpu_mode() {
@@ -940,8 +1107,8 @@ mod tests {
         assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
-        assert_eq!(options.memory_high_mb, 6656);
-        assert_eq!(options.memory_max_mb, 7168);
+        assert_eq!(options.memory_high_mb, 5632);
+        assert_eq!(options.memory_max_mb, 6656);
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
         assert!(args.windows(2).any(|pair| pair == ["-vsync-rate", "30"]));
         assert!(args.contains(&"-no-audio".to_owned()));
@@ -970,6 +1137,41 @@ mod tests {
         let skin = args.iter().position(|arg| arg == "-skin").unwrap();
 
         assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+    }
+
+    #[test]
+    fn enforces_frostguard_resolution_for_every_profile() {
+        for picture in [
+            PicturePreset::Compact,
+            PicturePreset::Phone,
+            PicturePreset::Sharp,
+        ] {
+            let options = ProfileOptions {
+                picture,
+                ..ProfileOptions::default()
+            };
+            let args = launch_args(&options);
+            let skin = args.iter().position(|arg| arg == "-skin").unwrap();
+
+            assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+        }
+    }
+
+    #[test]
+    fn automation_safe_peripherals_are_disabled_by_default() {
+        let options = ProfileOptions::default();
+        let args = launch_args(&options);
+
+        assert!(options.headless_automation);
+        assert!(options.mute_audio);
+        assert!(args.contains(&"-no-window".to_owned()));
+        assert!(args.contains(&"-no-audio".to_owned()));
+        assert!(args.contains(&"-no-boot-anim".to_owned()));
+        assert!(args.windows(2).any(|pair| pair == ["-camera-back", "none"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-camera-front", "none"])
+        );
     }
 
     #[test]

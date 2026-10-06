@@ -129,7 +129,7 @@ type AppState = {
   system_images: { package_id: string; label: string }[];
   config: { android_sdk_path: string; jdk_path: string };
   health: { emulator: boolean; adb: boolean; avd_manager: boolean; kvm: boolean; java: boolean; systemd_run: boolean };
-  stats: { cpu_percent: number; memory_used_bytes: number; memory_total_bytes: number };
+  stats: { cpu_percent: number; memory_used_bytes: number; memory_total_bytes: number; memory_available_bytes: number; cpu_temperature_c: number | null };
   device_stats: DeviceHostStats[];
   logs: { at: number; level: string; message: string }[];
 };
@@ -150,13 +150,13 @@ const defaultOptions: ProfileOptions = {
   rectangular_display: true,
   mute_audio: true,
   window_scale: 0.55,
-  headless_automation: false,
+  headless_automation: true,
   disable_vulkan: false,
   refresh_rate_hz: 30,
   suspend_store_during_automation: true,
   host_memory_policy: true,
-  memory_high_mb: 6656,
-  memory_max_mb: 7168,
+  memory_high_mb: 5632,
+  memory_max_mb: 6656,
   memory_swap_max_mb: 1024,
 };
 
@@ -208,10 +208,6 @@ function gib(bytes: number) {
 
 function mib(bytes: number | null) {
   return bytes === null ? "Unavailable" : `${Math.round(bytes / 1024 / 1024)} MB`;
-}
-
-function resolutionLabel(picture: Picture) {
-  return picture === "Compact" ? "540 × 960" : picture === "Sharp" ? "1080 × 1920" : "720 × 1280";
 }
 
 function relativeTime(seconds: number) {
@@ -466,12 +462,13 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
         dpi: 240,
         gpu_mode: value.gpu_mode === "host-intel" ? "host-intel" : "host",
         mute_audio: true,
+        headless_automation: true,
         rectangular_display: true,
         refresh_rate_hz: 30,
         suspend_store_during_automation: true,
         host_memory_policy: true,
-        memory_high_mb: 6656,
-        memory_max_mb: 7168,
+        memory_high_mb: 5632,
+        memory_max_mb: 6656,
         memory_swap_max_mb: 1024,
       } : {}),
     }));
@@ -497,7 +494,7 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
               <Typography color="text.secondary">{profile.device_name || "Android device"}{profile.api_level ? ` · Android API ${profile.api_level}` : ""}</Typography>
               <Stack direction="row" gap={1} mt={1} flexWrap="wrap">
                 <Chip size="small" color={pending || phase ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending, phase)} />
-                <Chip size="small" variant="outlined" label={`${resolutionLabel(options.picture)} configured`} />
+                <Chip size="small" variant="outlined" label="720 × 1280 fixed" />
                 <Chip size="small" variant="outlined" label={options.adb_port ? `ADB ${options.adb_port}` : "ADB automatic"} />
                 {profile.running_serial && <Chip size="small" variant="outlined" label={profile.running_serial} />}
               </Stack>
@@ -524,10 +521,8 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
           </ToggleButtonGroup>
         </SettingRow>
         <Divider />
-        <SettingRow icon={<AspectRatioRounded />} title="Resolution" description="720 × 1280 is the default for Frostguard">
-          <ToggleButtonGroup exclusive value={draft.picture} size="small" onChange={(_, value: Picture | null) => value && setDraft({ ...draft, picture: value })}>
-            <ToggleButton value="Compact">540 × 960</ToggleButton><ToggleButton value="Phone">720 × 1280</ToggleButton><ToggleButton value="Sharp">1080 × 1920</ToggleButton>
-          </ToggleButtonGroup>
+        <SettingRow icon={<AspectRatioRounded />} title="Resolution" description="Fixed so Frostguard screenshots, OCR regions and taps stay aligned">
+          <Chip color="success" variant="outlined" label="720 × 1280" />
         </SettingRow>
         <Divider />
         <SettingRow icon={<MonitorHeartRounded />} title="Window size" description="Changes how large Android appears on your desktop">
@@ -653,11 +648,14 @@ function CloneDialog({ source, profiles, onClose, busy, perform, onCreated }: { 
 function MonitorPage({ state }: { state: AppState }) {
   const total = state.stats.memory_total_bytes;
   const used = state.stats.memory_used_bytes;
+  const available = state.stats.memory_available_bytes;
   const running = state.profiles.filter((profile) => profile.running_serial);
   return <Stack spacing={3}>
-    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(3, 1fr)" }, gap: 2 }}>
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(3, 1fr)", xl: "repeat(5, 1fr)" }, gap: 2 }}>
       <Metric title="Host CPU" value={`${Math.round(state.stats.cpu_percent)}%`} progress={state.stats.cpu_percent} icon={<MemoryRounded />} />
       <Metric title="Host memory" value={`${gib(used)} / ${gib(total)} GB`} progress={total ? used / total * 100 : 0} icon={<MonitorHeartRounded />} />
+      <Metric title="Available memory" value={`${gib(available)} GB`} progress={total ? available / total * 100 : 0} icon={<MemoryRounded />} />
+      <Metric title="CPU temperature" value={state.stats.cpu_temperature_c === null ? "Unavailable" : `${Math.round(state.stats.cpu_temperature_c)} °C`} progress={state.stats.cpu_temperature_c ?? 0} icon={<MonitorHeartRounded />} />
       <Metric title="Running now" value={`${running.length} Android${running.length === 1 ? "" : "s"}`} progress={state.profiles.length ? running.length / state.profiles.length * 100 : 0} icon={<PhoneAndroidRounded />} />
     </Box>
     <Card><CardContent><Typography variant="h6" mb={2}>Live Androids</Typography>{running.length ? <Stack spacing={2}>{running.map((profile) => {

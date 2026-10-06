@@ -3,6 +3,23 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.6] - 2026-10-06
+
+### Added
+
+- Host launch admission checks require at least 8 GB of available memory and a CPU temperature
+  below 90 C before another emulator starts.
+- Live available-memory and CPU-temperature readings on the Monitor page.
+
+### Changed
+
+- All emulator launches now use Frostguard's fixed 720 x 1280 automation canvas.
+- New and existing profiles default once to headless operation, muted audio, disabled front/back
+  cameras, no boot animation, two virtual CPUs and 4 GB of guest RAM.
+- Four-device scopes now use an 80% per-emulator CPU quota, lower CPU and I/O weights, a 5.5 GB
+  soft memory threshold, a 6.5 GB hard ceiling and a 1 GB swap ceiling.
+- Sequential starts wait at least 20 seconds after Android boots before admitting the next device.
+
 ## [0.2.5] - 2026-10-03
 
 ### Added
@@ -115,3 +132,4 @@ All notable changes to EmuMi are documented here. This project follows
 [0.2.0]: https://github.com/elroykanye/emumi/releases/tag/v0.2.0
 [0.2.1]: https://github.com/elroykanye/emumi/releases/tag/v0.2.1
 [0.2.2]: https://github.com/elroykanye/emumi/releases/tag/v0.2.2
+[0.2.6]: https://github.com/elroykanye/emumi/releases/tag/v0.2.6

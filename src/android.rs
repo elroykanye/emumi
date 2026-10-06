@@ -1,4 +1,4 @@
-use crate::model::{AndroidProfile, ProfileOptions};
+use crate::model::{AndroidProfile, LaunchAdmission, ProfileOptions};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -326,6 +326,7 @@ impl AndroidTools {
         profile: &AndroidProfile,
         args: &[String],
         options: &ProfileOptions,
+        _admission: LaunchAdmission,
     ) -> Result<(), String> {
         let emulator = self
             .emulator
@@ -753,10 +754,13 @@ fn systemd_scope_launch_spec(
             "--property=MemorySwapMax={}M",
             options.memory_swap_max_mb
         )),
+        // Four active emulators receive at most 3.2 host CPUs in aggregate,
+        // leaving capacity for Frostguard, the desktop and system services.
+        OsString::from("--property=CPUQuota=80%"),
         // Emulator work stays responsive, but competes below normal desktop
         // applications when several Androids are busy at once.
-        OsString::from("--property=CPUWeight=50"),
-        OsString::from("--property=IOWeight=50"),
+        OsString::from("--property=CPUWeight=25"),
+        OsString::from("--property=IOWeight=25"),
         OsString::from("--"),
         emulator.as_os_str().to_owned(),
     ];
@@ -1390,13 +1394,14 @@ mod tests {
 
         assert_eq!(spec.program, PathBuf::from("/usr/bin/systemd-run"));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2-12345")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=6656M")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=7168M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5632M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6656M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed(
             "--property=MemorySwapMax=1024M"
         )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=50")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=50")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=80%")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
     }
 

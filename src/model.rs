@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaunchAdmission {
+    _private: (),
+}
+
+impl LaunchAdmission {
+    pub(crate) fn granted() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AndroidProfile {
     pub name: String,
@@ -84,13 +95,13 @@ impl Default for ProfileOptions {
             rectangular_display: true,
             mute_audio: true,
             window_scale: Some(0.55),
-            headless_automation: false,
+            headless_automation: true,
             disable_vulkan: false,
             refresh_rate_hz: 30,
             suspend_store_during_automation: true,
             host_memory_policy: true,
-            memory_high_mb: 6656,
-            memory_max_mb: 7168,
+            memory_high_mb: 5632,
+            memory_max_mb: 6656,
             memory_swap_max_mb: 1024,
         }
     }
@@ -101,6 +112,8 @@ pub struct HostStats {
     pub cpu_percent: f32,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
+    pub memory_available_bytes: u64,
+    pub cpu_temperature_c: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -134,8 +147,9 @@ mod tests {
         assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
-        assert_eq!(options.memory_high_mb, 6656);
-        assert_eq!(options.memory_max_mb, 7168);
+        assert_eq!(options.memory_mb, 4096);
+        assert_eq!(options.memory_high_mb, 5632);
+        assert_eq!(options.memory_max_mb, 6656);
         assert_eq!(options.memory_swap_max_mb, 1024);
     }
 }
