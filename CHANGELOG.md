@@ -3,6 +3,15 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.5] - 2026-10-03
+
+### Added
+
+- Opt-in per-device Intel/Mesa hardware rendering for both OpenGL and Vulkan,
+  retained across EmuMi/FrostGuard starts and Lean Gaming preset selection.
+  Existing hardware defaults are unchanged. This is an alternative renderer,
+  not a claim that NVIDIA driver crashes have been permanently fixed.
+
 ## [0.2.4] - 2026-10-02
 
 ### Fixed

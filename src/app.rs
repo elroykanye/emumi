@@ -798,7 +798,11 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         "-memory".into(),
         options.memory_mb.to_string(),
         "-gpu".into(),
-        options.gpu_mode.clone(),
+        if options.gpu_mode == "host-intel" {
+            "host".into()
+        } else {
+            options.gpu_mode.clone()
+        },
         "-skin".into(),
         format!("{display_width}x{display_height}"),
         "-vsync-rate".into(),
@@ -902,6 +906,18 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 mod tests {
     use super::{launch_args, validate_profile_options};
     use crate::model::{ProfileOptions, SpeedPreset};
+
+    #[test]
+    fn intel_choice_uses_hardware_not_an_unknown_emulator_gpu_mode() {
+        let options = ProfileOptions {
+            gpu_mode: "host-intel".into(),
+            ..ProfileOptions::default()
+        };
+        let args = launch_args(&options);
+        assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(!args.iter().any(|arg| arg == "host-intel"));
+        assert!(args.contains(&"-no-snapshot-load".into()));
+    }
 
     #[test]
     fn disables_emulator_audio_when_profile_is_muted() {
