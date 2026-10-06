@@ -327,7 +327,7 @@ impl AndroidTools {
         args: &[String],
         options: &ProfileOptions,
         _admission: LaunchAdmission,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let emulator = self
             .emulator
             .as_ref()
@@ -346,6 +346,7 @@ impl AndroidTools {
         let log = fs::File::create(log_path).map_err(|err| err.to_string())?;
         let emulator_args = emulator_launch_args(&profile.name, args, runtime_image);
         let launch = launch_spec(emulator, &emulator_args, &profile.name, options)?;
+        let scope_unit = launch.scope_unit.clone();
         let mut command = Command::new(&launch.program);
         command
             .args(&launch.args)
@@ -362,7 +363,34 @@ impl AndroidTools {
                 .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
                 .env("__VK_LAYER_NV_optimus", "NVIDIA_only");
         }
-        command.spawn().map(|_| ()).map_err(|err| err.to_string())
+        command
+            .spawn()
+            .map(|_| scope_unit)
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn set_scope_cpu_quota(&self, scope_unit: &str, percent: u16) -> Result<(), String> {
+        if !scope_unit.starts_with("emumi-")
+            || !scope_unit.ends_with(".scope")
+            || !scope_unit
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+        {
+            return Err("Refusing to modify an invalid EmuMi scope name".into());
+        }
+        if !(1..=400).contains(&percent) {
+            return Err("CPU quota must be between 1% and 400%".into());
+        }
+        let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
+        let status = Command::new(systemctl)
+            .args(scope_cpu_quota_args(scope_unit, percent))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Could not update {scope_unit}: {error}"))?;
+        status.success().then_some(()).ok_or_else(|| {
+            format!("systemd rejected the settled CPU quota for {scope_unit}: {status}")
+        })
     }
 
     /// Android's Pixel hardware profiles can re-apply their device-shape overlay
@@ -690,6 +718,7 @@ impl AndroidTools {
 struct LaunchSpec {
     program: PathBuf,
     args: Vec<OsString>,
+    scope_unit: Option<String>,
 }
 
 fn launch_spec(
@@ -702,6 +731,7 @@ fn launch_spec(
         return Ok(LaunchSpec {
             program: emulator.to_owned(),
             args: emulator_args.to_vec(),
+            scope_unit: None,
         });
     }
     let systemd_run = path_command("systemd-run")
@@ -752,9 +782,9 @@ fn systemd_scope_launch_spec(
             "--property=MemorySwapMax={}M",
             options.memory_swap_max_mb
         )),
-        // Four active emulators receive at most 3.2 host CPUs in aggregate,
-        // leaving capacity for Frostguard, the desktop and system services.
-        OsString::from("--property=CPUQuota=80%"),
+        // Two Android vCPUs may use up to 1.8 host CPUs while Android and the
+        // game warm up. EmuMi reduces this scope after the post-ready window.
+        OsString::from("--property=CPUQuota=180%"),
         // Emulator work stays responsive, but competes below normal desktop
         // applications when several Androids are busy at once.
         OsString::from("--property=CPUWeight=25"),
@@ -766,7 +796,18 @@ fn systemd_scope_launch_spec(
     LaunchSpec {
         program: systemd_run,
         args,
+        scope_unit: Some(format!("{unit}.scope")),
     }
+}
+
+fn scope_cpu_quota_args(scope_unit: &str, percent: u16) -> Vec<OsString> {
+    vec![
+        OsString::from("--user"),
+        OsString::from("set-property"),
+        OsString::from("--runtime"),
+        OsString::from(scope_unit),
+        OsString::from(format!("CPUQuota={percent}%")),
+    ]
 }
 
 fn validate_memory_policy(options: &ProfileOptions) -> Result<(), String> {
@@ -1416,16 +1457,34 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(spec.program, PathBuf::from("/usr/bin/systemd-run"));
+        assert_eq!(
+            spec.scope_unit.as_deref(),
+            Some("emumi-Device_2-12345.scope")
+        );
         assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2-12345")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5632M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6656M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed(
             "--property=MemorySwapMax=1024M"
         )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=80%")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=180%")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
+    }
+
+    #[test]
+    fn settled_cpu_quota_targets_only_the_launched_scope() {
+        assert_eq!(
+            scope_cpu_quota_args("emumi-Device_2-12345.scope", 120),
+            vec![
+                OsString::from("--user"),
+                OsString::from("set-property"),
+                OsString::from("--runtime"),
+                OsString::from("emumi-Device_2-12345.scope"),
+                OsString::from("CPUQuota=120%"),
+            ]
+        );
     }
 
     #[test]

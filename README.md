@@ -20,7 +20,8 @@ stopping Android profiles without requiring Android Studio.
 - Adaptive sequential startup instead of simultaneous emulator boot storms
 - Automatic NVIDIA PRIME render offload on supported hybrid-GPU Linux systems
 - Quick Boot with one-shot cold recovery and stale-lock cleanup
-- Per-emulator Linux scopes with memory/swap ceilings and contention-friendly CPU/I/O priority
+- Per-emulator Linux scopes with memory/swap ceilings, a 180% startup CPU boost that settles to
+  120% after the game-launch window, and contention-friendly CPU/I/O priority
 - Windowless automation by default while preserving ADB screenshots and input
 - Up to four concurrently running Android devices
 - Live device state plus host CPU and memory monitoring

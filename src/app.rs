@@ -27,6 +27,8 @@ const MAX_RUNNING_PROFILES: usize = 4;
 const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
 const STARTUP_SETTLE_SECONDS: u64 = 20;
+const POST_READY_CPU_BOOST_SECONDS: u64 = 120;
+const SETTLED_CPU_QUOTA_PERCENT: u16 = 120;
 
 type Shared = Arc<Mutex<Runtime>>;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
@@ -444,11 +446,14 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
             }
         })
         .and_then(|_| tools.start(&profile, &launch_args(&options), &options, launch_admission));
-    if let Err(message) = start_result {
-        runtime.starting_profiles.remove(name);
-        runtime.startup_generations.remove(name);
-        return Err(error_tuple(StatusCode::BAD_REQUEST, message));
-    }
+    let scope_unit = match start_result {
+        Ok(scope_unit) => scope_unit,
+        Err(message) => {
+            runtime.starting_profiles.remove(name);
+            runtime.startup_generations.remove(name);
+            return Err(error_tuple(StatusCode::BAD_REQUEST, message));
+        }
+    };
     if options.rectangular_display {
         runtime.rectangular_watchers.insert(name.to_owned());
         tools.watch_rectangular_display_after_start(name);
@@ -470,11 +475,21 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     } else {
         runtime.log("success", format!("Starting {name}"));
     }
-    watch_profile_start(Arc::clone(shared), name.to_owned(), startup_generation);
+    watch_profile_start(
+        Arc::clone(shared),
+        name.to_owned(),
+        startup_generation,
+        scope_unit,
+    );
     Ok(message("Android is starting"))
 }
 
-fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
+fn watch_profile_start(
+    shared: Shared,
+    name: String,
+    startup_generation: u64,
+    scope_unit: Option<String>,
+) {
     tokio::spawn(async move {
         let mut booted = false;
         for _ in 0..240 {
@@ -524,6 +539,7 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
             }
         }
         start_next_queued_profile(&shared, completion);
+        schedule_settled_cpu_quota(shared, name, scope_unit);
     });
 }
 
@@ -547,6 +563,46 @@ where
 {
     sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
     StartupSettled
+}
+
+fn schedule_settled_cpu_quota(shared: Shared, name: String, scope_unit: Option<String>) {
+    let Some(scope_unit) = scope_unit else {
+        return;
+    };
+    tokio::spawn(async move {
+        let result = settle_cpu_quota_with(tokio::time::sleep, || {
+            let tools = shared
+                .lock()
+                .map_err(|_| "EmuMi state is unavailable".to_owned())?
+                .tools();
+            tools.set_scope_cpu_quota(&scope_unit, SETTLED_CPU_QUOTA_PERCENT)
+        })
+        .await;
+        if let Ok(mut runtime) = shared.lock() {
+            match result {
+                Ok(()) => runtime.log(
+                    "success",
+                    format!(
+                        "Reduced {name} CPU quota to {SETTLED_CPU_QUOTA_PERCENT}% after startup"
+                    ),
+                ),
+                Err(error) => runtime.log(
+                    "warning",
+                    format!("Could not reduce {name} CPU quota after startup: {error}"),
+                ),
+            }
+        }
+    });
+}
+
+async fn settle_cpu_quota_with<F, Fut, A>(sleep: F, apply: A) -> Result<(), String>
+where
+    F: FnOnce(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    A: FnOnce() -> Result<(), String>,
+{
+    sleep(std::time::Duration::from_secs(POST_READY_CPU_BOOST_SECONDS)).await;
+    apply()
 }
 
 fn start_next_queued_profile(shared: &Shared, completion: StartupCompletion) {
@@ -970,8 +1026,9 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 #[cfg(test)]
 mod tests {
     use super::{
-        STARTUP_SETTLE_SECONDS, enforce_launch_admission, launch_args, launch_block_reason,
-        settle_after_boot_with, validate_profile_options,
+        POST_READY_CPU_BOOST_SECONDS, SETTLED_CPU_QUOTA_PERCENT, STARTUP_SETTLE_SECONDS,
+        enforce_launch_admission, launch_args, launch_block_reason, settle_after_boot_with,
+        settle_cpu_quota_with, validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
     use crate::monitor::HostMonitor;
@@ -1072,6 +1129,30 @@ mod tests {
             std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)
         );
         assert_eq!(STARTUP_SETTLE_SECONDS, 20);
+    }
+
+    #[tokio::test]
+    async fn startup_cpu_boost_covers_the_post_ready_game_launch_window() {
+        let observed_delay = std::cell::Cell::new(std::time::Duration::ZERO);
+        let applied = std::cell::Cell::new(false);
+
+        settle_cpu_quota_with(
+            |duration| {
+                observed_delay.set(duration);
+                async {}
+            },
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(POST_READY_CPU_BOOST_SECONDS, 120);
+        assert_eq!(SETTLED_CPU_QUOTA_PERCENT, 120);
+        assert_eq!(observed_delay.get(), std::time::Duration::from_secs(120));
+        assert!(applied.get());
     }
 
     #[test]

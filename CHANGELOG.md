@@ -3,6 +3,15 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Emulator scopes may use up to 180% aggregate host CPU during Android boot and the first two
+  minutes after EmuMi reports readiness, covering Frostguard's game-launch window.
+- EmuMi then lowers the exact per-launch scope to a 120% CPU quota and records whether the
+  transition succeeded, without changing the two-vCPU Android configuration.
+
 ## [0.2.7] - 2026-10-07
 
 ### Changed
@@ -17,7 +26,6 @@ All notable changes to EmuMi are documented here. This project follows
 - Rectangular-display normalization now discovers and disables display-shape overlays from all
   Android overlay targets, including `com.android.systemui.emulation.*`, so Pixel-style notches do
   not reappear after boot.
-
 ## [0.2.6] - 2026-10-06
 
 ### Added
