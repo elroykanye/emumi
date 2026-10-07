@@ -143,7 +143,7 @@ const defaultOptions: ProfileOptions = {
   memory_mb: 4096,
   dpi: 240,
   adb_port: null,
-  gpu_mode: "host",
+  gpu_mode: "host-intel",
   cold_boot: false,
   host_keyboard: true,
   device_frame: false,
@@ -151,7 +151,7 @@ const defaultOptions: ProfileOptions = {
   mute_audio: true,
   window_scale: 0.55,
   headless_automation: true,
-  disable_vulkan: false,
+  disable_vulkan: true,
   refresh_rate_hz: 30,
   suspend_store_during_automation: true,
   host_memory_policy: true,
@@ -460,7 +460,6 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
       ...(speed === "LeanGaming" ? {
         picture: "Phone" as Picture,
         dpi: 240,
-        gpu_mode: value.gpu_mode === "host-intel" ? "host-intel" : "host",
         mute_audio: true,
         headless_automation: true,
         rectangular_display: true,
@@ -578,7 +577,7 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
               <FormControl><InputLabel>Graphics</InputLabel><Select label="Graphics" value={draft.gpu_mode} onChange={(event) => setDraft({ ...draft, gpu_mode: event.target.value })}><MenuItem value="auto">Automatic</MenuItem><MenuItem value="host">Hardware</MenuItem><MenuItem value="host-intel">Hardware · Intel (Mesa)</MenuItem><MenuItem value="swiftshader_indirect">Software</MenuItem></Select></FormControl>
               <TextField label="ADB slot" type="number" value={draft.adb_port ?? ""} placeholder="Assigned automatically" helperText="Stable slots use 5554, 5556, 5558…" onChange={(event) => setDraft({ ...draft, adb_port: event.target.value ? Number(event.target.value) : null })} slotProps={{ htmlInput: { min: 5554, max: 5682, step: 2 } }} />
               <FormControlLabel control={<Switch checked={draft.speed === "LeanGaming" || draft.cold_boot} disabled={draft.speed === "LeanGaming"} onChange={(event) => setDraft({ ...draft, cold_boot: event.target.checked })} />} label={draft.speed === "LeanGaming" ? "Clean boot always on" : "Cold boot next time"} />
-              <FormControlLabel control={<Switch checked={draft.disable_vulkan} onChange={(event) => setDraft({ ...draft, disable_vulkan: event.target.checked })} />} label="Experimental: disable Vulkan" />
+              <FormControlLabel control={<Switch checked={draft.disable_vulkan} onChange={(event) => setDraft({ ...draft, disable_vulkan: event.target.checked })} />} label="Disable Vulkan (recommended for Linux stability)" />
             </Box>
             <Divider sx={{ my: 2 }} />
             <FormControlLabel control={<Switch checked={draft.host_memory_policy} onChange={(event) => setDraft({ ...draft, host_memory_policy: event.target.checked })} />} label="Protect the Linux host with per-emulator resource controls" />

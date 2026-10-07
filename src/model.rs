@@ -88,7 +88,7 @@ impl Default for ProfileOptions {
             memory_mb: 4096,
             dpi: 240,
             adb_port: None,
-            gpu_mode: "host".into(),
+            gpu_mode: "host-intel".into(),
             cold_boot: false,
             host_keyboard: true,
             device_frame: false,
@@ -96,7 +96,7 @@ impl Default for ProfileOptions {
             mute_audio: true,
             window_scale: Some(0.55),
             headless_automation: true,
-            disable_vulkan: false,
+            disable_vulkan: true,
             refresh_rate_hz: 30,
             suspend_store_during_automation: true,
             host_memory_policy: true,
@@ -147,6 +147,8 @@ mod tests {
         assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
+        assert_eq!(options.gpu_mode, "host-intel");
+        assert!(options.disable_vulkan);
         assert_eq!(options.memory_mb, 4096);
         assert_eq!(options.memory_high_mb, 5632);
         assert_eq!(options.memory_max_mb, 6656);

@@ -3,6 +3,21 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.7] - 2026-10-07
+
+### Changed
+
+- New and previously unspecified profiles use Intel/Mesa hardware rendering with Vulkan disabled
+  by default, avoiding the NVIDIA gfxstream crash path observed on hybrid-GPU Linux systems.
+- Explicit per-profile renderer and Vulkan choices are preserved when applying Lean Gaming or
+  migrating older configuration.
+
+### Fixed
+
+- Rectangular-display normalization now discovers and disables display-shape overlays from all
+  Android overlay targets, including `com.android.systemui.emulation.*`, so Pixel-style notches do
+  not reappear after boot.
+
 ## [0.2.6] - 2026-10-06
 
 ### Added
@@ -132,4 +147,8 @@ All notable changes to EmuMi are documented here. This project follows
 [0.2.0]: https://github.com/elroykanye/emumi/releases/tag/v0.2.0
 [0.2.1]: https://github.com/elroykanye/emumi/releases/tag/v0.2.1
 [0.2.2]: https://github.com/elroykanye/emumi/releases/tag/v0.2.2
+[0.2.3]: https://github.com/elroykanye/emumi/releases/tag/v0.2.3
+[0.2.4]: https://github.com/elroykanye/emumi/releases/tag/v0.2.4
+[0.2.5]: https://github.com/elroykanye/emumi/releases/tag/v0.2.5
 [0.2.6]: https://github.com/elroykanye/emumi/releases/tag/v0.2.6
+[0.2.7]: https://github.com/elroykanye/emumi/releases/tag/v0.2.7

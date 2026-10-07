@@ -59,9 +59,6 @@ impl AppConfig {
             options.cores = 2;
             options.memory_mb = 4096;
             options.dpi = 240;
-            if options.gpu_mode != "host-intel" {
-                options.gpu_mode = "host".into();
-            }
             options.mute_audio = true;
             options.headless_automation = true;
             options.refresh_rate_hz = 30;
@@ -105,11 +102,12 @@ mod tests {
         assert_eq!(options.picture, PicturePreset::Phone);
         assert_eq!(options.cores, 2);
         assert_eq!(options.memory_mb, 4096);
-        assert_eq!(options.gpu_mode, "host");
+        assert_eq!(options.gpu_mode, "auto");
         assert_eq!(options.adb_port, Some(5554));
         assert!(options.cold_boot);
         assert!(options.headless_automation);
         assert!(options.mute_audio);
+        assert!(options.disable_vulkan);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.host_memory_policy);
         assert_eq!(options.memory_high_mb, 5632);

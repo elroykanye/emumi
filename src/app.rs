@@ -1103,13 +1103,15 @@ mod tests {
         assert_eq!(options.speed, SpeedPreset::LeanGaming);
         assert_eq!(options.cores, 2);
         assert_eq!(options.memory_mb, 4096);
-        assert_eq!(options.gpu_mode, "host");
+        assert_eq!(options.gpu_mode, "host-intel");
+        assert!(options.disable_vulkan);
         assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
         assert_eq!(options.memory_high_mb, 5632);
         assert_eq!(options.memory_max_mb, 6656);
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(args.windows(2).any(|pair| pair == ["-feature", "-Vulkan"]));
         assert!(args.windows(2).any(|pair| pair == ["-vsync-rate", "30"]));
         assert!(args.contains(&"-no-audio".to_owned()));
         assert!(args.contains(&"-no-snapshot-load".to_owned()));
@@ -1206,17 +1208,17 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_disable_is_explicit_and_off_by_default() {
-        assert!(!launch_args(&ProfileOptions::default()).contains(&"-Vulkan".to_owned()));
-        let options = ProfileOptions {
-            disable_vulkan: true,
-            ..ProfileOptions::default()
-        };
+    fn vulkan_is_disabled_by_default_but_can_be_enabled_explicitly() {
         assert!(
-            launch_args(&options)
+            launch_args(&ProfileOptions::default())
                 .windows(2)
                 .any(|pair| pair == ["-feature", "-Vulkan"])
         );
+        let options = ProfileOptions {
+            disable_vulkan: false,
+            ..ProfileOptions::default()
+        };
+        assert!(!launch_args(&options).contains(&"-Vulkan".to_owned()));
     }
 
     #[test]

@@ -420,9 +420,7 @@ impl AndroidTools {
                     return;
                 }
                 let overlays = Command::new(&adb)
-                    .args([
-                        "-s", &serial, "shell", "cmd", "overlay", "list", "--user", "0", "android",
-                    ])
+                    .args(overlay_list_args(&serial))
                     .output()
                     .ok()
                     .filter(|output| output.status.success())
@@ -869,9 +867,16 @@ fn enabled_display_shape_overlays(text: &str) -> Vec<String> {
         .filter(|package| {
             package.starts_with("com.android.internal.emulation.")
                 || package.starts_with("com.android.internal.display.cutout.emulation.")
+                || package.starts_with("com.android.systemui.emulation.")
         })
         .map(str::to_owned)
         .collect()
+}
+
+fn overlay_list_args(serial: &str) -> [&str; 8] {
+    [
+        "-s", serial, "shell", "cmd", "overlay", "list", "--user", "0",
+    ]
 }
 
 fn remove_clone_runtime_state(clone_dir: &Path) -> Result<(), String> {
@@ -1274,12 +1279,30 @@ mod tests {
 
     #[test]
     fn finds_only_enabled_display_shape_overlays() {
-        let overlays = "[x] com.android.internal.emulation.pixel_7\n[ ] com.android.internal.emulation.pixel_8\n[x] com.android.systemui:accent\n[x] com.android.internal.display.cutout.emulation.hole\n";
+        let overlays = "[x] com.android.internal.emulation.pixel_7\n[ ] com.android.internal.emulation.pixel_8\n[x] com.android.systemui.emulation.pixel_7\n[x] com.android.systemui:accent\n[x] com.android.internal.display.cutout.emulation.hole\n";
         assert_eq!(
             enabled_display_shape_overlays(overlays),
             vec![
                 "com.android.internal.emulation.pixel_7",
+                "com.android.systemui.emulation.pixel_7",
                 "com.android.internal.display.cutout.emulation.hole"
+            ]
+        );
+    }
+
+    #[test]
+    fn lists_all_overlay_targets_when_normalizing_display_shape() {
+        assert_eq!(
+            overlay_list_args("emulator-5560"),
+            [
+                "-s",
+                "emulator-5560",
+                "shell",
+                "cmd",
+                "overlay",
+                "list",
+                "--user",
+                "0"
             ]
         );
     }
