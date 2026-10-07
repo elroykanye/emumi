@@ -1,4 +1,4 @@
-use crate::model::{AndroidProfile, ProfileOptions};
+use crate::model::{AndroidProfile, LaunchAdmission, ProfileOptions};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -326,6 +326,7 @@ impl AndroidTools {
         profile: &AndroidProfile,
         args: &[String],
         options: &ProfileOptions,
+        _admission: LaunchAdmission,
     ) -> Result<(), String> {
         let emulator = self
             .emulator
@@ -343,16 +344,7 @@ impl AndroidTools {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
         let log = fs::File::create(log_path).map_err(|err| err.to_string())?;
-        let mut emulator_args = vec![OsString::from("-avd"), OsString::from(&profile.name)];
-        emulator_args.extend(args.iter().map(OsString::from));
-        if let Some(image) = runtime_image {
-            // Compatibility runtimes are immutable private EmuMi copies. Do not
-            // add -writable-system here: the emulator creates a large temporary
-            // system copy for that flag and disables reliable Quick Boot. Apps,
-            // accounts and game data live in the AVD's separate userdata image.
-            emulator_args.push(OsString::from("-system"));
-            emulator_args.push(image.into_os_string());
-        }
+        let emulator_args = emulator_launch_args(&profile.name, args, runtime_image);
         let launch = launch_spec(emulator, &emulator_args, &profile.name, options)?;
         let mut command = Command::new(&launch.program);
         command
@@ -361,7 +353,10 @@ impl AndroidTools {
             .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
             .stderr(Stdio::from(log))
             .process_group(0);
-        if options.gpu_mode == "host" && nvidia_gpu_available() {
+        if options.gpu_mode == "host-intel" {
+            let (device, manifest) = intel_renderer()?;
+            configure_intel_renderer(&mut command, &device, &manifest);
+        } else if options.gpu_mode == "host" && nvidia_gpu_available() {
             command
                 .env("__NV_PRIME_RENDER_OFFLOAD", "1")
                 .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
@@ -425,9 +420,7 @@ impl AndroidTools {
                     return;
                 }
                 let overlays = Command::new(&adb)
-                    .args([
-                        "-s", &serial, "shell", "cmd", "overlay", "list", "--user", "0", "android",
-                    ])
+                    .args(overlay_list_args(&serial))
                     .output()
                     .ok()
                     .filter(|output| output.status.success())
@@ -759,10 +752,13 @@ fn systemd_scope_launch_spec(
             "--property=MemorySwapMax={}M",
             options.memory_swap_max_mb
         )),
+        // Four active emulators receive at most 3.2 host CPUs in aggregate,
+        // leaving capacity for Frostguard, the desktop and system services.
+        OsString::from("--property=CPUQuota=80%"),
         // Emulator work stays responsive, but competes below normal desktop
         // applications when several Androids are busy at once.
-        OsString::from("--property=CPUWeight=50"),
-        OsString::from("--property=IOWeight=50"),
+        OsString::from("--property=CPUWeight=25"),
+        OsString::from("--property=IOWeight=25"),
         OsString::from("--"),
         emulator.as_os_str().to_owned(),
     ];
@@ -871,9 +867,16 @@ fn enabled_display_shape_overlays(text: &str) -> Vec<String> {
         .filter(|package| {
             package.starts_with("com.android.internal.emulation.")
                 || package.starts_with("com.android.internal.display.cutout.emulation.")
+                || package.starts_with("com.android.systemui.emulation.")
         })
         .map(str::to_owned)
         .collect()
+}
+
+fn overlay_list_args(serial: &str) -> [&str; 8] {
+    [
+        "-s", serial, "shell", "cmd", "overlay", "list", "--user", "0",
+    ]
 }
 
 fn remove_clone_runtime_state(clone_dir: &Path) -> Result<(), String> {
@@ -939,6 +942,47 @@ fn clear_stale_runtime_locks_in(
 
 fn nvidia_gpu_available() -> bool {
     Path::new("/proc/driver/nvidia/gpus").is_dir()
+}
+
+// Select both APIs: DRI_PRIME alone still lets gfxstream pick NVIDIA for Vulkan.
+// Fail closed rather than silently falling back to a different GPU or the CPU.
+fn intel_renderer() -> Result<(String, PathBuf), String> {
+    let devices = fs::read_dir("/sys/bus/pci/devices")
+        .map_err(|error| format!("Could not inspect Intel graphics: {error}"))?;
+    let mut candidates = devices
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let vendor = fs::read_to_string(path.join("vendor")).ok()?;
+            let class = fs::read_to_string(path.join("class")).ok()?;
+            (vendor.trim() == "0x8086" && class.trim().starts_with("0x03"))
+                .then(|| entry.file_name().to_string_lossy().replace([':', '.'], "_"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    let device = candidates
+        .first()
+        .ok_or("Intel hardware graphics requested, but no Intel display adapter was found")?;
+    let manifest = [
+        "/usr/share/vulkan/icd.d/intel_icd.json",
+        "/usr/share/vulkan/icd.d/intel_icd.x86_64.json",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .ok_or("Intel hardware graphics needs the Mesa Intel Vulkan driver manifest")?;
+    Ok((format!("pci-{device}"), manifest))
+}
+
+fn configure_intel_renderer(command: &mut Command, device: &str, manifest: &Path) {
+    command
+        .env_remove("__NV_PRIME_RENDER_OFFLOAD")
+        .env_remove("__NV_PRIME_RENDER_OFFLOAD_PROVIDER")
+        .env_remove("__VK_LAYER_NV_optimus")
+        .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+        .env("DRI_PRIME", device)
+        .env("VK_DRIVER_FILES", manifest)
+        .env("VK_ICD_FILENAMES", manifest);
 }
 
 fn read_lock_pid(path: &Path) -> Option<u32> {
@@ -1034,6 +1078,26 @@ fn runtime_system_image(profile_name: &str) -> Option<PathBuf> {
     let runtime_key = runtime_key_from_image_sysdir(image_sysdir)?;
     let image = data_path(&format!("emumi/runtime/{runtime_key}/system.img"))?;
     image.is_file().then_some(image)
+}
+
+fn emulator_launch_args(
+    profile_name: &str,
+    args: &[String],
+    runtime_image: Option<PathBuf>,
+) -> Vec<OsString> {
+    let mut emulator_args = vec![OsString::from("-avd"), OsString::from(profile_name)];
+    emulator_args.extend(args.iter().map(OsString::from));
+    if let Some(image) = runtime_image {
+        // Without -writable-system the emulator ignores -system and opens the
+        // SDK's stock system.img read-only, so the compatibility runtime (and
+        // its patched native bridge) never reaches the guest. With it, the
+        // emulator boots the profile's small system.img.qcow2 overlay backed
+        // by the private runtime.
+        emulator_args.push(OsString::from("-system"));
+        emulator_args.push(image.into_os_string());
+        emulator_args.push(OsString::from("-writable-system"));
+    }
+    emulator_args
 }
 
 fn runtime_key_from_image_sysdir(image_sysdir: &str) -> Option<String> {
@@ -1173,6 +1237,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn intel_renderer_selects_both_graphics_apis_without_nvidia_offload() {
+        let mut command = Command::new("emulator");
+        command.env("__NV_PRIME_RENDER_OFFLOAD", "1");
+        command.env("__VK_LAYER_NV_optimus", "NVIDIA_only");
+        configure_intel_renderer(
+            &mut command,
+            "pci-0000_00_02_0",
+            Path::new("/test/intel.json"),
+        );
+        let env: HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(env["__GLX_VENDOR_LIBRARY_NAME"].as_deref(), Some("mesa"));
+        assert_eq!(env["DRI_PRIME"].as_deref(), Some("pci-0000_00_02_0"));
+        assert_eq!(env["VK_DRIVER_FILES"].as_deref(), Some("/test/intel.json"));
+        assert_eq!(env["VK_ICD_FILENAMES"].as_deref(), Some("/test/intel.json"));
+        assert_eq!(env["__NV_PRIME_RENDER_OFFLOAD"], None);
+        assert_eq!(env["__VK_LAYER_NV_optimus"], None);
+    }
+
+    #[test]
     fn parses_avd_names() {
         assert_eq!(
             parse_avd_list("Pixel_7\nTablet\n\n"),
@@ -1188,12 +1279,30 @@ mod tests {
 
     #[test]
     fn finds_only_enabled_display_shape_overlays() {
-        let overlays = "[x] com.android.internal.emulation.pixel_7\n[ ] com.android.internal.emulation.pixel_8\n[x] com.android.systemui:accent\n[x] com.android.internal.display.cutout.emulation.hole\n";
+        let overlays = "[x] com.android.internal.emulation.pixel_7\n[ ] com.android.internal.emulation.pixel_8\n[x] com.android.systemui.emulation.pixel_7\n[x] com.android.systemui:accent\n[x] com.android.internal.display.cutout.emulation.hole\n";
         assert_eq!(
             enabled_display_shape_overlays(overlays),
             vec![
                 "com.android.internal.emulation.pixel_7",
+                "com.android.systemui.emulation.pixel_7",
                 "com.android.internal.display.cutout.emulation.hole"
+            ]
+        );
+    }
+
+    #[test]
+    fn lists_all_overlay_targets_when_normalizing_display_shape() {
+        assert_eq!(
+            overlay_list_args("emulator-5560"),
+            [
+                "-s",
+                "emulator-5560",
+                "shell",
+                "cmd",
+                "overlay",
+                "list",
+                "--user",
+                "0"
             ]
         );
     }
@@ -1218,6 +1327,57 @@ mod tests {
                 "system-images/android-36/google_apis_playstore/x86_64/extra"
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn launches_with_compatibility_runtime_boot_that_runtime() {
+        let image = PathBuf::from("/data/emumi/runtime/android-36/system.img");
+        let emulator_args = emulator_launch_args(
+            "Device_3",
+            &["-port".into(), "5558".into()],
+            Some(image.clone()),
+        );
+        let direct = launch_spec(
+            Path::new("/sdk/emulator"),
+            &emulator_args,
+            "Device_3",
+            &ProfileOptions {
+                host_memory_policy: false,
+                ..ProfileOptions::default()
+            },
+        )
+        .unwrap();
+        let scoped = systemd_scope_launch_spec(
+            PathBuf::from("/usr/bin/systemd-run"),
+            Path::new("/sdk/emulator"),
+            &emulator_args,
+            "Device_3",
+            12345,
+            &ProfileOptions::default(),
+        );
+
+        for spec in [direct, scoped] {
+            let system = spec
+                .args
+                .iter()
+                .position(|arg| arg == "-system")
+                .expect("compatibility runtime launch must pass -system");
+            assert_eq!(
+                spec.args.get(system + 1),
+                Some(&image.clone().into_os_string())
+            );
+            assert!(spec.args.iter().any(|arg| arg == "-writable-system"));
+        }
+    }
+
+    #[test]
+    fn launches_without_compatibility_runtime_use_the_sdk_image() {
+        let emulator_args = emulator_launch_args("Device_3", &[], None);
+        assert!(
+            !emulator_args
+                .iter()
+                .any(|arg| arg == "-system" || arg == "-writable-system")
         );
     }
 
@@ -1257,13 +1417,14 @@ mod tests {
 
         assert_eq!(spec.program, PathBuf::from("/usr/bin/systemd-run"));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2-12345")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=6656M")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=7168M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5632M")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6656M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed(
             "--property=MemorySwapMax=1024M"
         )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=50")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=50")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=80%")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
     }
 

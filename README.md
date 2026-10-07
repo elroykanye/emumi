@@ -15,13 +15,13 @@ stopping Android profiles without requiring Android Studio.
 - Create, clone and remove Android emulator profiles
 - Preserve apps, accounts and Android data when cloning a stopped profile
 - Stable sequential ADB ports (`5554`, `5556`, `5558`, ...)
-- Simple performance, resolution, window-size and audio controls
+- Simple performance, window-size and audio controls
 - Lean Gaming defaults: 2 CPU cores, 4 GB RAM, 720 × 1280 at 240 dpi, 30 Hz and host GPU
 - Adaptive sequential startup instead of simultaneous emulator boot storms
 - Automatic NVIDIA PRIME render offload on supported hybrid-GPU Linux systems
 - Quick Boot with one-shot cold recovery and stale-lock cleanup
 - Per-emulator Linux scopes with memory/swap ceilings and contention-friendly CPU/I/O priority
-- Optional windowless automation while preserving ADB screenshots and input
+- Windowless automation by default while preserving ADB screenshots and input
 - Up to four concurrently running Android devices
 - Live device state plus host CPU and memory monitoring
 - Automatic Android SDK, Java, ADB, emulator and KVM discovery
@@ -49,7 +49,7 @@ sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 Download the `.deb` from the latest GitHub release and install it with:
 
 ```bash
-sudo apt install ./emumi_0.2.1_amd64.deb
+sudo apt install ./emumi_0.2.7_amd64.deb
 ```
 
 EmuMi then appears in the desktop application menu.
@@ -96,14 +96,15 @@ EmuMi's local-only lifecycle API and stable ADB port assignments.
 ## Resource policy
 
 Lean Gaming profiles launch in an individual systemd user scope. Android receives two virtual
-CPU cores and 4 GB of guest RAM, while Linux begins reclaiming host memory above 6.5 GB and applies
-a 7 GB last-resort ceiling plus a 1 GB swap ceiling. Emulator CPU and disk work use a lower weight
-than normal desktop applications, helping Linux stay responsive when several devices are busy.
+CPU cores and 4 GB of guest RAM, while Linux limits each emulator to 80% of one host CPU, begins
+reclaiming host memory above 5.5 GB and applies a 6.5 GB last-resort ceiling plus a 1 GB swap
+ceiling. Emulator CPU and disk work use a lower weight than normal desktop applications, helping
+Linux stay responsive when several devices are busy.
 
 These controls do not pretend that a 4 GB Android guest consumes no memory. The Monitor page shows
 each emulator's resident/proportional memory, swap, scope limits and pressure events so limits can
-be tuned from evidence. Headless automation is optional because it removes the emulator window;
-visible profiles retain the same resource policy.
+be tuned from evidence. Headless automation is the default because Frostguard operates through ADB;
+users can still enable a visible window from the profile settings when interactive play is needed.
 
 ## Compatibility runtimes
 

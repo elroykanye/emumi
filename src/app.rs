@@ -1,7 +1,7 @@
 use crate::{
     android::AndroidTools,
     config::AppConfig,
-    model::{PicturePreset, ProfileOptions, SpeedPreset},
+    model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
 };
 use axum::{
@@ -24,6 +24,9 @@ use tokio::net::TcpListener;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const MAX_RUNNING_PROFILES: usize = 4;
+const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
+const STARTUP_SETTLE_SECONDS: u64 = 20;
 
 type Shared = Arc<Mutex<Runtime>>;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
@@ -36,6 +39,8 @@ struct Runtime {
     monitor: HostMonitor,
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
+    startup_generations: BTreeMap<String, u64>,
+    next_startup_generation: u64,
     queued_profiles: VecDeque<String>,
     memory_warnings: BTreeMap<String, String>,
 }
@@ -88,6 +93,13 @@ struct ApiMessage {
     message: String,
 }
 
+#[derive(Serialize)]
+struct PortReadiness {
+    ready: bool,
+    phase: &'static str,
+    message: String,
+}
+
 #[derive(Deserialize)]
 struct CreateRequest {
     name: String,
@@ -109,6 +121,8 @@ impl EmuMiApp {
             monitor: HostMonitor::default(),
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
+            startup_generations: BTreeMap::new(),
+            next_startup_generation: 1,
             queued_profiles: VecDeque::new(),
             memory_warnings: BTreeMap::new(),
         }));
@@ -125,6 +139,7 @@ impl EmuMiApp {
             .route("/api/profiles/{name}/settings", post(save_profile_settings))
             .route("/api/ports/{port}/start", post(start_port))
             .route("/api/ports/{port}/stop", post(stop_port))
+            .route("/api/ports/{port}/readiness", get(port_readiness))
             .route("/api/settings", post(save_settings))
             .with_state(runtime);
 
@@ -366,15 +381,14 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         .into_iter()
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
-    if profile.is_running() {
-        runtime.starting_profiles.remove(name);
-        return Ok(message("Android is already running"));
-    }
     if runtime.starting_profiles.contains(name) {
         return Ok(message("Android is already starting"));
     }
     if runtime.queued_profiles.iter().any(|queued| queued == name) {
         return Ok(message("Android is already queued"));
+    }
+    if profile.is_running() {
+        return Ok(message("Android is already running"));
     }
     let running = tools
         .discover_profiles()
@@ -397,6 +411,8 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         );
         return Ok(message("Android is queued for an adaptive start"));
     }
+    let launch_admission = enforce_launch_admission(&mut runtime.monitor)
+        .map_err(|reason| error_tuple(StatusCode::CONFLICT, reason))?;
     let options = runtime
         .config
         .profile_options
@@ -404,6 +420,11 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         .or_default()
         .clone();
     runtime.starting_profiles.insert(name.to_owned());
+    let startup_generation = runtime.next_startup_generation;
+    runtime.next_startup_generation = runtime.next_startup_generation.wrapping_add(1).max(1);
+    runtime
+        .startup_generations
+        .insert(name.to_owned(), startup_generation);
     let (display_width, display_height) = display_dimensions(options.picture);
     let start_result = tools
         .configure_input_and_window(
@@ -422,9 +443,10 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
                 Ok(())
             }
         })
-        .and_then(|_| tools.start(&profile, &launch_args(&options), &options));
+        .and_then(|_| tools.start(&profile, &launch_args(&options), &options, launch_admission));
     if let Err(message) = start_result {
         runtime.starting_profiles.remove(name);
+        runtime.startup_generations.remove(name);
         return Err(error_tuple(StatusCode::BAD_REQUEST, message));
     }
     if options.rectangular_display {
@@ -440,12 +462,19 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         saved.cold_boot = false;
         let _ = runtime.config.save();
     }
-    runtime.log("success", format!("Starting {name}"));
-    watch_profile_start(Arc::clone(shared), name.to_owned());
+    if options.speed == SpeedPreset::LeanGaming {
+        runtime.log(
+            "success",
+            format!("Starting {name} with a clean Lean Gaming boot"),
+        );
+    } else {
+        runtime.log("success", format!("Starting {name}"));
+    }
+    watch_profile_start(Arc::clone(shared), name.to_owned(), startup_generation);
     Ok(message("Android is starting"))
 }
 
-fn watch_profile_start(shared: Shared, name: String) {
+fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
     tokio::spawn(async move {
         let mut booted = false;
         for _ in 0..240 {
@@ -459,10 +488,10 @@ fn watch_profile_start(shared: Shared, name: String) {
             }
         }
 
-        if booted {
+        let completion = if booted {
             // Give login, Play services and the automation target time to warm up.
             // Then require three calm host samples before admitting the next AVD.
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let settled = settle_after_boot().await;
             let mut monitor = HostMonitor::default();
             let _ = monitor.sample();
             let mut calm_samples = 0;
@@ -477,30 +506,86 @@ fn watch_profile_start(shared: Shared, name: String) {
                     calm_samples = 0;
                 }
             }
-        }
+            StartupCompletion::Settled(settled)
+        } else {
+            StartupCompletion::TimedOut
+        };
 
-        let next = if let Ok(mut runtime) = shared.lock() {
+        if let Ok(mut runtime) = shared.lock() {
+            if runtime.startup_generations.get(&name) != Some(&startup_generation) {
+                return;
+            }
             runtime.starting_profiles.remove(&name);
+            runtime.startup_generations.remove(&name);
             if booted {
                 runtime.log("success", format!("{name} is ready"));
             } else {
                 runtime.log("warning", format!("{name} did not finish starting"));
             }
-            runtime.queued_profiles.pop_front()
-        } else {
-            None
-        };
-        if let Some(next) = next
-            && let Err((_, Json(error))) = start_named_profile(&shared, &next)
-            && let Ok(mut runtime) = shared.lock()
-        {
-            runtime.log(
-                "error",
-                format!("Could not start queued {next}: {}", error.message),
-            );
-            runtime.starting_profiles.remove(&next);
         }
+        start_next_queued_profile(&shared, completion);
     });
+}
+
+#[derive(Debug)]
+struct StartupSettled;
+
+#[derive(Debug)]
+enum StartupCompletion {
+    Settled(StartupSettled),
+    TimedOut,
+}
+
+async fn settle_after_boot() -> StartupSettled {
+    settle_after_boot_with(tokio::time::sleep).await
+}
+
+async fn settle_after_boot_with<F, Fut>(sleep: F) -> StartupSettled
+where
+    F: FnOnce(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
+    StartupSettled
+}
+
+fn start_next_queued_profile(shared: &Shared, completion: StartupCompletion) {
+    match completion {
+        StartupCompletion::Settled(_proof) => {}
+        StartupCompletion::TimedOut => {}
+    }
+    loop {
+        let next = match shared.lock() {
+            Ok(mut runtime) => runtime.queued_profiles.pop_front(),
+            Err(_) => return,
+        };
+        let Some(next) = next else {
+            return;
+        };
+        match start_named_profile(shared, &next) {
+            Ok(_) => {
+                let is_now_starting = shared
+                    .lock()
+                    .map(|runtime| runtime.starting_profiles.contains(&next))
+                    .unwrap_or(false);
+                if is_now_starting {
+                    return;
+                }
+                // The queued profile may have been started outside EmuMi while it waited.
+                // In that case no watcher will drain the rest of this queue, so keep going.
+            }
+            Err((_, Json(error))) => {
+                if let Ok(mut runtime) = shared.lock() {
+                    runtime.log(
+                        "error",
+                        format!("Could not start queued {next}: {}", error.message),
+                    );
+                    runtime.starting_profiles.remove(&next);
+                    runtime.startup_generations.remove(&next);
+                }
+            }
+        }
+    }
 }
 
 async fn stop_profile(
@@ -513,6 +598,7 @@ async fn stop_profile(
 fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let mut runtime = lock(shared)?;
     runtime.starting_profiles.remove(name);
+    runtime.startup_generations.remove(name);
     runtime.queued_profiles.retain(|queued| queued != name);
     let tools = runtime.tools();
     let profile = tools
@@ -538,6 +624,61 @@ async fn start_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiR
 async fn stop_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiResult<ApiMessage> {
     let name = profile_name_for_port(&shared, port)?;
     stop_named_profile(&shared, &name)
+}
+
+async fn port_readiness(
+    State(shared): State<Shared>,
+    Path(port): Path<u16>,
+) -> ApiResult<PortReadiness> {
+    let runtime = lock(&shared)?;
+    let name = runtime
+        .config
+        .profile_options
+        .iter()
+        .find_map(|(name, options)| (options.adb_port == Some(port)).then(|| name.clone()))
+        .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "No profile uses that ADB port"))?;
+
+    let readiness = if runtime.queued_profiles.iter().any(|queued| queued == &name) {
+        PortReadiness {
+            ready: false,
+            phase: "queued",
+            message: format!("{name} is queued for startup"),
+        }
+    } else if runtime.starting_profiles.contains(&name) {
+        PortReadiness {
+            ready: false,
+            phase: "starting",
+            message: format!("{name} is still completing its clean boot"),
+        }
+    } else {
+        let tools = runtime.tools();
+        let profile = tools
+            .discover_profiles()
+            .into_iter()
+            .find(|profile| profile.name == name)
+            .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
+        if !profile.is_running() {
+            PortReadiness {
+                ready: false,
+                phase: "stopped",
+                message: format!("{name} is stopped"),
+            }
+        } else if !tools.profile_boot_completed(&name) {
+            PortReadiness {
+                ready: false,
+                phase: "booting",
+                message: format!("{name} is visible to ADB but Android has not completed boot"),
+            }
+        } else {
+            PortReadiness {
+                ready: true,
+                phase: "ready",
+                message: format!("{name} is ready for app launch"),
+            }
+        }
+    };
+
+    Ok(Json(readiness))
 }
 
 fn profile_name_for_port(
@@ -691,7 +832,11 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         "-memory".into(),
         options.memory_mb.to_string(),
         "-gpu".into(),
-        options.gpu_mode.clone(),
+        if options.gpu_mode == "host-intel" {
+            "host".into()
+        } else {
+            options.gpu_mode.clone()
+        },
         "-skin".into(),
         format!("{display_width}x{display_height}"),
         "-vsync-rate".into(),
@@ -700,7 +845,9 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
     if let Some(port) = options.adb_port {
         args.extend(["-port".into(), port.to_string()]);
     }
-    if options.cold_boot {
+    // Lean Gaming profiles favor a deterministic guest boot over Quick Boot.
+    // This skips saved RAM state without touching userdata, installed apps, or accounts.
+    if options.cold_boot || options.speed == SpeedPreset::LeanGaming {
         args.push("-no-snapshot-load".into());
     }
     if options.mute_audio {
@@ -746,6 +893,38 @@ fn validate_profile_options(options: &ProfileOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn launch_block_reason(host: &HostStats) -> Option<String> {
+    if host.memory_available_bytes < MIN_AVAILABLE_MEMORY_BYTES {
+        return Some(
+            "EmuMi needs at least 8 GB of available host memory before starting another Android"
+                .into(),
+        );
+    }
+    match host.cpu_temperature_c {
+        Some(temperature) if temperature.is_finite() && temperature < MAX_LAUNCH_TEMPERATURE_C => {}
+        Some(temperature) if temperature.is_finite() => {
+            return Some("CPU temperature is at or above 90 C; let the computer cool before starting another Android".into());
+        }
+        _ => {
+            return Some(
+                "EmuMi could not verify CPU temperature; restore hardware monitoring before starting another Android"
+                    .into(),
+            );
+        }
+    }
+    None
+}
+
+fn enforce_launch_admission(monitor: &mut HostMonitor) -> Result<LaunchAdmission, String> {
+    enforce_launch_admission_with(|| monitor.sample())
+}
+
+fn enforce_launch_admission_with(
+    sample: impl FnOnce() -> HostStats,
+) -> Result<LaunchAdmission, String> {
+    launch_block_reason(&sample()).map_or_else(|| Ok(LaunchAdmission::granted()), Err)
+}
+
 fn write_api_endpoint(url: &str) -> std::io::Result<()> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -756,12 +935,11 @@ fn write_api_endpoint(url: &str) -> std::io::Result<()> {
     fs::write(directory.join("api-url"), format!("{url}\n"))
 }
 
-fn display_dimensions(picture: PicturePreset) -> (u16, u16) {
-    match picture {
-        PicturePreset::Compact => (540, 960),
-        PicturePreset::Phone => (720, 1280),
-        PicturePreset::Sharp => (1080, 1920),
-    }
+fn display_dimensions(_picture: PicturePreset) -> (u16, u16) {
+    // Frostguard's screenshots, OCR regions and tap coordinates use this exact canvas.
+    // Keep the serialized picture choice for backwards-compatible config parsing, but
+    // never let an older profile launch at a different automation resolution.
+    (720, 1280)
 }
 
 fn lock(
@@ -791,8 +969,122 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_args, validate_profile_options};
-    use crate::model::{ProfileOptions, SpeedPreset};
+    use super::{
+        STARTUP_SETTLE_SECONDS, enforce_launch_admission, launch_args, launch_block_reason,
+        settle_after_boot_with, validate_profile_options,
+    };
+    use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
+    use crate::monitor::HostMonitor;
+    use std::fs;
+
+    #[test]
+    fn launch_admission_protects_host_memory_and_temperature() {
+        let safe = HostStats {
+            memory_available_bytes: 9 * 1024 * 1024 * 1024,
+            cpu_temperature_c: Some(89.9),
+            ..HostStats::default()
+        };
+        assert_eq!(launch_block_reason(&safe), None);
+
+        let unavailable_or_exhausted = HostStats {
+            memory_available_bytes: 0,
+            ..safe.clone()
+        };
+        assert!(
+            launch_block_reason(&unavailable_or_exhausted)
+                .unwrap()
+                .contains("8 GB")
+        );
+
+        let exact_boundary = HostStats {
+            memory_available_bytes: 8 * 1024 * 1024 * 1024,
+            ..safe.clone()
+        };
+        assert_eq!(launch_block_reason(&exact_boundary), None);
+
+        let low_memory = HostStats {
+            memory_available_bytes: 7 * 1024 * 1024 * 1024,
+            ..safe.clone()
+        };
+        assert!(launch_block_reason(&low_memory).unwrap().contains("8 GB"));
+
+        let too_hot = HostStats {
+            memory_available_bytes: 12 * 1024 * 1024 * 1024,
+            cpu_temperature_c: Some(90.0),
+            ..safe
+        };
+        assert!(launch_block_reason(&too_hot).unwrap().contains("90"));
+
+        let missing_temperature = HostStats {
+            memory_available_bytes: 12 * 1024 * 1024 * 1024,
+            cpu_temperature_c: None,
+            ..HostStats::default()
+        };
+        assert!(
+            launch_block_reason(&missing_temperature)
+                .unwrap()
+                .contains("could not verify")
+        );
+
+        let invalid_temperature = HostStats {
+            cpu_temperature_c: Some(f32::NAN),
+            ..missing_temperature
+        };
+        assert!(
+            launch_block_reason(&invalid_temperature)
+                .unwrap()
+                .contains("could not verify")
+        );
+    }
+
+    #[test]
+    fn launch_entry_samples_and_enforces_admission() {
+        let root =
+            std::env::temp_dir().join(format!("emumi-admission-test-{}", std::process::id()));
+        let proc_root = root.join("proc");
+        let sys_root = root.join("sys");
+        fs::create_dir_all(&proc_root).unwrap();
+        fs::create_dir_all(&sys_root).unwrap();
+        fs::write(proc_root.join("stat"), "cpu 100 0 100 800 0 0 0 0\n").unwrap();
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 16777216 kB\nMemAvailable: 0 kB\n",
+        )
+        .unwrap();
+        let mut monitor = HostMonitor::for_roots(proc_root, sys_root);
+
+        let result = enforce_launch_admission(&mut monitor);
+
+        assert!(result.unwrap_err().contains("8 GB"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_start_waits_twenty_seconds_after_boot() {
+        let observed = std::cell::Cell::new(std::time::Duration::ZERO);
+        settle_after_boot_with(|duration| {
+            observed.set(duration);
+            async {}
+        })
+        .await;
+        assert_eq!(
+            observed.get(),
+            std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)
+        );
+        assert_eq!(STARTUP_SETTLE_SECONDS, 20);
+    }
+
+    #[test]
+    fn intel_choice_uses_hardware_not_an_unknown_emulator_gpu_mode() {
+        let options = ProfileOptions {
+            gpu_mode: "host-intel".into(),
+            ..ProfileOptions::default()
+        };
+        let args = launch_args(&options);
+        assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(!args.iter().any(|arg| arg == "host-intel"));
+        assert!(args.contains(&"-no-snapshot-load".into()));
+    }
 
     #[test]
     fn disables_emulator_audio_when_profile_is_muted() {
@@ -811,15 +1103,34 @@ mod tests {
         assert_eq!(options.speed, SpeedPreset::LeanGaming);
         assert_eq!(options.cores, 2);
         assert_eq!(options.memory_mb, 4096);
-        assert_eq!(options.gpu_mode, "host");
+        assert_eq!(options.gpu_mode, "host-intel");
+        assert!(options.disable_vulkan);
         assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
-        assert_eq!(options.memory_high_mb, 6656);
-        assert_eq!(options.memory_max_mb, 7168);
+        assert_eq!(options.memory_high_mb, 5632);
+        assert_eq!(options.memory_max_mb, 6656);
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(args.windows(2).any(|pair| pair == ["-feature", "-Vulkan"]));
         assert!(args.windows(2).any(|pair| pair == ["-vsync-rate", "30"]));
         assert!(args.contains(&"-no-audio".to_owned()));
+        assert!(args.contains(&"-no-snapshot-load".to_owned()));
+    }
+
+    #[test]
+    fn non_lean_profiles_only_clean_boot_when_requested() {
+        let normal = ProfileOptions {
+            speed: SpeedPreset::Efficient,
+            cold_boot: false,
+            ..ProfileOptions::default()
+        };
+        assert!(!launch_args(&normal).contains(&"-no-snapshot-load".to_owned()));
+
+        let recovery = ProfileOptions {
+            cold_boot: true,
+            ..normal
+        };
+        assert!(launch_args(&recovery).contains(&"-no-snapshot-load".to_owned()));
     }
 
     #[test]
@@ -828,6 +1139,41 @@ mod tests {
         let skin = args.iter().position(|arg| arg == "-skin").unwrap();
 
         assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+    }
+
+    #[test]
+    fn enforces_frostguard_resolution_for_every_profile() {
+        for picture in [
+            PicturePreset::Compact,
+            PicturePreset::Phone,
+            PicturePreset::Sharp,
+        ] {
+            let options = ProfileOptions {
+                picture,
+                ..ProfileOptions::default()
+            };
+            let args = launch_args(&options);
+            let skin = args.iter().position(|arg| arg == "-skin").unwrap();
+
+            assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+        }
+    }
+
+    #[test]
+    fn automation_safe_peripherals_are_disabled_by_default() {
+        let options = ProfileOptions::default();
+        let args = launch_args(&options);
+
+        assert!(options.headless_automation);
+        assert!(options.mute_audio);
+        assert!(args.contains(&"-no-window".to_owned()));
+        assert!(args.contains(&"-no-audio".to_owned()));
+        assert!(args.contains(&"-no-boot-anim".to_owned()));
+        assert!(args.windows(2).any(|pair| pair == ["-camera-back", "none"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-camera-front", "none"])
+        );
     }
 
     #[test]
@@ -862,17 +1208,17 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_disable_is_explicit_and_off_by_default() {
-        assert!(!launch_args(&ProfileOptions::default()).contains(&"-Vulkan".to_owned()));
-        let options = ProfileOptions {
-            disable_vulkan: true,
-            ..ProfileOptions::default()
-        };
+    fn vulkan_is_disabled_by_default_but_can_be_enabled_explicitly() {
         assert!(
-            launch_args(&options)
+            launch_args(&ProfileOptions::default())
                 .windows(2)
                 .any(|pair| pair == ["-feature", "-Vulkan"])
         );
+        let options = ProfileOptions {
+            disable_vulkan: false,
+            ..ProfileOptions::default()
+        };
+        assert!(!launch_args(&options).contains(&"-Vulkan".to_owned()));
     }
 
     #[test]

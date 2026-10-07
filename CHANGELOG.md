@@ -3,6 +3,80 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.7] - 2026-10-07
+
+### Changed
+
+- New and previously unspecified profiles use Intel/Mesa hardware rendering with Vulkan disabled
+  by default, avoiding the NVIDIA gfxstream crash path observed on hybrid-GPU Linux systems.
+- Explicit per-profile renderer and Vulkan choices are preserved when applying Lean Gaming or
+  migrating older configuration.
+
+### Fixed
+
+- Rectangular-display normalization now discovers and disables display-shape overlays from all
+  Android overlay targets, including `com.android.systemui.emulation.*`, so Pixel-style notches do
+  not reappear after boot.
+
+## [0.2.6] - 2026-10-06
+
+### Added
+
+- Host launch admission checks require at least 8 GB of available memory and a CPU temperature
+  below 90 C before another emulator starts.
+- Live available-memory and CPU-temperature readings on the Monitor page.
+
+### Changed
+
+- All emulator launches now use Frostguard's fixed 720 x 1280 automation canvas.
+- New and existing profiles default once to headless operation, muted audio, disabled front/back
+  cameras, no boot animation, two virtual CPUs and 4 GB of guest RAM.
+- Four-device scopes now use an 80% per-emulator CPU quota, lower CPU and I/O weights, a 5.5 GB
+  soft memory threshold, a 6.5 GB hard ceiling and a 1 GB swap ceiling.
+- Sequential starts wait at least 20 seconds after Android boots before admitting the next device.
+
+## [0.2.5] - 2026-10-03
+
+### Added
+
+- Opt-in per-device Intel/Mesa hardware rendering for both OpenGL and Vulkan,
+  retained across EmuMi/FrostGuard starts and Lean Gaming preset selection.
+  Existing hardware defaults are unchanged. This is an alternative renderer,
+  not a claim that NVIDIA driver crashes have been permanently fixed.
+
+## [0.2.4] - 2026-10-02
+
+### Fixed
+
+- Profiles with a compatibility runtime boot that runtime again. Since 0.2.1 the emulator was
+  ignoring it and opening the stock SDK system image instead, so the patched native bridge never loaded
+  and Whiteout Survival crashed on Android 36 (`Unknown x86_64 sa_restorer in host sigaction`).
+
+## [0.2.3] - 2026-10-02
+
+### Added
+
+- A per-port readiness endpoint so automation clients can distinguish an ADB-visible emulator from
+  an Android instance that has completed EmuMi's clean-boot warm-up.
+
+### Fixed
+
+- Repeated start requests no longer erase a profile's in-progress startup state.
+- A stale watcher from an older boot can no longer mark a newer restart ready.
+- Frostguard can now defer Whiteout launch until the emulator is explicitly launch-ready.
+
+## [0.2.2] - 2026-10-02
+
+### Changed
+
+- Lean Gaming profiles always perform a clean Android boot without deleting userdata, installed
+  apps or accounts, preventing native games from inheriting an invalid saved-memory state.
+
+### Fixed
+
+- Continue through the sequential startup queue when one profile fails before launch instead of
+  leaving every later profile stranded.
+
 ## [0.2.1] - 2026-09-29
 
 ### Added
@@ -72,3 +146,9 @@ All notable changes to EmuMi are documented here. This project follows
 [0.1.1]: https://github.com/elroykanye/emumi/releases/tag/v0.1.1
 [0.2.0]: https://github.com/elroykanye/emumi/releases/tag/v0.2.0
 [0.2.1]: https://github.com/elroykanye/emumi/releases/tag/v0.2.1
+[0.2.2]: https://github.com/elroykanye/emumi/releases/tag/v0.2.2
+[0.2.3]: https://github.com/elroykanye/emumi/releases/tag/v0.2.3
+[0.2.4]: https://github.com/elroykanye/emumi/releases/tag/v0.2.4
+[0.2.5]: https://github.com/elroykanye/emumi/releases/tag/v0.2.5
+[0.2.6]: https://github.com/elroykanye/emumi/releases/tag/v0.2.6
+[0.2.7]: https://github.com/elroykanye/emumi/releases/tag/v0.2.7
