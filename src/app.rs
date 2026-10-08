@@ -977,7 +977,7 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         "-memory".into(),
         options.memory_mb.to_string(),
         "-gpu".into(),
-        if options.gpu_mode == "host-intel" {
+        if matches!(options.gpu_mode.as_str(), "host-intel" | "host-nvidia") {
             "host".into()
         } else {
             options.gpu_mode.clone()
@@ -1266,6 +1266,18 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
         assert!(!args.iter().any(|arg| arg == "host-intel"));
         assert!(args.contains(&"-no-snapshot-load".into()));
+    }
+
+    #[test]
+    fn explicit_nvidia_choice_uses_the_emulator_host_backend() {
+        let options = ProfileOptions {
+            gpu_mode: "host-nvidia".into(),
+            ..ProfileOptions::default()
+        };
+        let args = launch_args(&options);
+
+        assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(!args.iter().any(|arg| arg == "host-nvidia"));
     }
 
     #[test]

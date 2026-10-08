@@ -3,10 +3,13 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.8] - 2026-10-08
 
 ### Fixed
 
+- Generic hardware rendering now prefers Intel/Mesa on Intel+NVIDIA hybrid systems instead of
+  automatically forcing the confirmed NVIDIA GLX/gfxstream crash path. NVIDIA remains available
+  as an explicit experimental profile choice and stays automatic on NVIDIA-only systems.
 - Replace the fixed post-start CPU ceiling with adaptive per-scope control. Repeated cgroup
   throttling raises a busy emulator in 60% steps up to 300%, while calm periods lower it slowly.
 - Share six logical CPUs across active emulators on an eight-CPU host, preserving two logical CPUs
@@ -167,3 +170,4 @@ All notable changes to EmuMi are documented here. This project follows
 [0.2.5]: https://github.com/elroykanye/emumi/releases/tag/v0.2.5
 [0.2.6]: https://github.com/elroykanye/emumi/releases/tag/v0.2.6
 [0.2.7]: https://github.com/elroykanye/emumi/releases/tag/v0.2.7
+[0.2.8]: https://github.com/elroykanye/emumi/releases/tag/v0.2.8

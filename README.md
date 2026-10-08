@@ -18,7 +18,8 @@ stopping Android profiles without requiring Android Studio.
 - Simple performance, window-size and audio controls
 - Lean Gaming defaults: 2 CPU cores, 4 GB RAM, 720 × 1280 at 240 dpi, 30 Hz and host GPU
 - Adaptive sequential startup instead of simultaneous emulator boot storms
-- Automatic NVIDIA PRIME render offload on supported hybrid-GPU Linux systems
+- Stable Intel/Mesa rendering on hybrid-GPU Linux systems, with explicit experimental NVIDIA
+  offload available per profile
 - Quick Boot with one-shot cold recovery and stale-lock cleanup
 - Per-emulator Linux scopes with memory/swap ceilings, a 180% startup allowance, and adaptive CPU
   quotas that respond to measured cgroup throttling while preserving desktop headroom
@@ -50,7 +51,7 @@ sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 Download the `.deb` from the latest GitHub release and install it with:
 
 ```bash
-sudo apt install ./emumi_0.2.7_amd64.deb
+sudo apt install ./emumi_0.2.8_amd64.deb
 ```
 
 EmuMi then appears in the desktop application menu.

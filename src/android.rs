@@ -357,14 +357,27 @@ impl AndroidTools {
             .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
             .stderr(Stdio::from(log))
             .process_group(0);
-        if options.gpu_mode == "host-intel" {
-            let (device, manifest) = intel_renderer()?;
-            configure_intel_renderer(&mut command, &device, &manifest);
-        } else if options.gpu_mode == "host" && nvidia_gpu_available() {
-            command
-                .env("__NV_PRIME_RENDER_OFFLOAD", "1")
-                .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-                .env("__VK_LAYER_NV_optimus", "NVIDIA_only");
+        let intel = matches!(options.gpu_mode.as_str(), "host" | "host-intel").then(intel_renderer);
+        let nvidia_available = nvidia_gpu_available();
+        match renderer_preference(
+            &options.gpu_mode,
+            intel.as_ref().is_some_and(Result::is_ok),
+            nvidia_available,
+        ) {
+            RendererPreference::Intel => {
+                let (device, manifest) =
+                    intel.expect("Intel lookup must run for Intel preference")?;
+                configure_intel_renderer(&mut command, &device, &manifest);
+            }
+            RendererPreference::Nvidia if nvidia_available => {
+                configure_nvidia_renderer(&mut command);
+            }
+            RendererPreference::Nvidia => {
+                return Err(
+                    "NVIDIA hardware graphics requested, but no NVIDIA adapter was found".into(),
+                );
+            }
+            RendererPreference::Default => {}
         }
         command
             .spawn()
@@ -1063,6 +1076,34 @@ fn nvidia_gpu_available() -> bool {
     Path::new("/proc/driver/nvidia/gpus").is_dir()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererPreference {
+    Intel,
+    Nvidia,
+    Default,
+}
+
+fn renderer_preference(
+    gpu_mode: &str,
+    intel_available: bool,
+    nvidia_available: bool,
+) -> RendererPreference {
+    match gpu_mode {
+        "host-intel" => RendererPreference::Intel,
+        "host-nvidia" => RendererPreference::Nvidia,
+        "host" if intel_available => RendererPreference::Intel,
+        "host" if nvidia_available => RendererPreference::Nvidia,
+        _ => RendererPreference::Default,
+    }
+}
+
+fn configure_nvidia_renderer(command: &mut Command) {
+    command
+        .env("__NV_PRIME_RENDER_OFFLOAD", "1")
+        .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+        .env("__VK_LAYER_NV_optimus", "NVIDIA_only");
+}
+
 // Select both APIs: DRI_PRIME alone still lets gfxstream pick NVIDIA for Vulkan.
 // Fail closed rather than silently falling back to a different GPU or the CPU.
 fn intel_renderer() -> Result<(String, PathBuf), String> {
@@ -1354,6 +1395,26 @@ fn remove_ini_value(text: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_hardware_prefers_intel_on_a_hybrid_host() {
+        assert_eq!(
+            renderer_preference("host", true, true),
+            RendererPreference::Intel
+        );
+        assert_eq!(
+            renderer_preference("host-nvidia", true, true),
+            RendererPreference::Nvidia
+        );
+        assert_eq!(
+            renderer_preference("host", false, true),
+            RendererPreference::Nvidia
+        );
+        assert_eq!(
+            renderer_preference("host", false, false),
+            RendererPreference::Default
+        );
+    }
 
     #[test]
     fn intel_renderer_selects_both_graphics_apis_without_nvidia_offload() {
