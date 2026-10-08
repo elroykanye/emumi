@@ -1,4 +1,7 @@
-use crate::model::{AndroidProfile, LaunchAdmission, ProfileOptions};
+use crate::{
+    cpu_policy::CpuStat,
+    model::{AndroidProfile, LaunchAdmission, ProfileOptions},
+};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -369,28 +372,60 @@ impl AndroidTools {
             .map_err(|err| err.to_string())
     }
 
-    pub fn set_scope_cpu_quota(&self, scope_unit: &str, percent: u16) -> Result<(), String> {
-        if !scope_unit.starts_with("emumi-")
-            || !scope_unit.ends_with(".scope")
-            || !scope_unit
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-        {
+    pub fn set_scope_cpu_policy(
+        &self,
+        scope_unit: &str,
+        percent: u16,
+        weight: u16,
+    ) -> Result<(), String> {
+        if !valid_scope_unit(scope_unit) {
             return Err("Refusing to modify an invalid EmuMi scope name".into());
         }
         if !(1..=400).contains(&percent) {
             return Err("CPU quota must be between 1% and 400%".into());
         }
+        if !(1..=10_000).contains(&weight) {
+            return Err("CPU weight must be between 1 and 10000".into());
+        }
         let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
         let status = Command::new(systemctl)
-            .args(scope_cpu_quota_args(scope_unit, percent))
+            .args(scope_cpu_policy_args(scope_unit, percent, weight))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map_err(|error| format!("Could not update {scope_unit}: {error}"))?;
-        status.success().then_some(()).ok_or_else(|| {
-            format!("systemd rejected the settled CPU quota for {scope_unit}: {status}")
-        })
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("systemd rejected the CPU quota for {scope_unit}: {status}"))
+    }
+
+    pub fn scope_cpu_stat(&self, scope_unit: &str) -> Result<CpuStat, String> {
+        if !valid_scope_unit(scope_unit) {
+            return Err("Refusing to inspect an invalid EmuMi scope name".into());
+        }
+        let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
+        let output = Command::new(systemctl)
+            .args(scope_control_group_args(scope_unit))
+            .output()
+            .map_err(|error| format!("Could not inspect {scope_unit}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("systemd could not inspect {scope_unit}"));
+        }
+        let relative = String::from_utf8_lossy(&output.stdout);
+        let relative = relative.trim().trim_start_matches('/');
+        if relative.is_empty() {
+            return Err(format!("{scope_unit} has no control group"));
+        }
+        let cgroup = Path::new("/sys/fs/cgroup").join(relative);
+        let text = fs::read_to_string(cgroup.join("cpu.stat"))
+            .map_err(|error| format!("Could not read CPU counters for {scope_unit}: {error}"))?;
+        let cpu_max = fs::read_to_string(cgroup.join("cpu.max"))
+            .map_err(|error| format!("Could not read CPU quota for {scope_unit}: {error}"))?;
+        let quota_percent = parse_cpu_max(&cpu_max)
+            .ok_or_else(|| format!("{scope_unit} returned an invalid CPU quota"))?;
+        parse_cpu_stat(&text, quota_percent)
+            .ok_or_else(|| format!("{scope_unit} returned incomplete CPU counters"))
     }
 
     /// Android's Pixel hardware profiles can re-apply their device-shape overlay
@@ -800,14 +835,57 @@ fn systemd_scope_launch_spec(
     }
 }
 
-fn scope_cpu_quota_args(scope_unit: &str, percent: u16) -> Vec<OsString> {
+fn scope_cpu_policy_args(scope_unit: &str, percent: u16, weight: u16) -> Vec<OsString> {
     vec![
         OsString::from("--user"),
         OsString::from("set-property"),
         OsString::from("--runtime"),
         OsString::from(scope_unit),
         OsString::from(format!("CPUQuota={percent}%")),
+        OsString::from(format!("CPUWeight={weight}")),
     ]
+}
+
+fn scope_control_group_args(scope_unit: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("--user"),
+        OsString::from("show"),
+        OsString::from(scope_unit),
+        OsString::from("--property=ControlGroup"),
+        OsString::from("--value"),
+    ]
+}
+
+fn valid_scope_unit(scope_unit: &str) -> bool {
+    scope_unit.starts_with("emumi-")
+        && scope_unit.ends_with(".scope")
+        && scope_unit
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+}
+
+fn parse_cpu_max(text: &str) -> Option<u16> {
+    let mut values = text.split_whitespace();
+    let quota = values.next()?.parse::<u64>().ok()?;
+    let period = values.next()?.parse::<u64>().ok()?;
+    if period == 0 {
+        return None;
+    }
+    u16::try_from(quota.saturating_mul(100).div_ceil(period)).ok()
+}
+
+fn parse_cpu_stat(text: &str, quota_percent: u16) -> Option<CpuStat> {
+    let values = text
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter_map(|(key, value)| Some((key, value.parse::<u64>().ok()?)))
+        .collect::<HashMap<_, _>>();
+    Some(CpuStat {
+        periods: *values.get("nr_periods")?,
+        throttled_periods: *values.get("nr_throttled")?,
+        throttled_usec: *values.get("throttled_usec")?,
+        quota_percent,
+    })
 }
 
 fn validate_memory_policy(options: &ProfileOptions) -> Result<(), String> {
@@ -1474,17 +1552,49 @@ mod tests {
     }
 
     #[test]
-    fn settled_cpu_quota_targets_only_the_launched_scope() {
+    fn adaptive_cpu_policy_targets_only_the_launched_scope() {
         assert_eq!(
-            scope_cpu_quota_args("emumi-Device_2-12345.scope", 120),
+            scope_cpu_policy_args("emumi-Device_2-12345.scope", 240, 100),
             vec![
                 OsString::from("--user"),
                 OsString::from("set-property"),
                 OsString::from("--runtime"),
                 OsString::from("emumi-Device_2-12345.scope"),
-                OsString::from("CPUQuota=120%"),
+                OsString::from("CPUQuota=240%"),
+                OsString::from("CPUWeight=100"),
             ]
         );
+    }
+
+    #[test]
+    fn reads_cpu_counters_from_only_the_launched_scope() {
+        assert_eq!(
+            scope_control_group_args("emumi-Device_2-12345.scope"),
+            vec![
+                OsString::from("--user"),
+                OsString::from("show"),
+                OsString::from("emumi-Device_2-12345.scope"),
+                OsString::from("--property=ControlGroup"),
+                OsString::from("--value"),
+            ]
+        );
+        assert_eq!(
+            parse_cpu_stat(
+                "usage_usec 800000\nnr_periods 120\nnr_throttled 90\nthrottled_usec 450000\n",
+                240,
+            ),
+            Some(CpuStat {
+                periods: 120,
+                throttled_periods: 90,
+                throttled_usec: 450_000,
+                quota_percent: 240,
+            })
+        );
+        assert_eq!(parse_cpu_max("300000 100000\n"), Some(300));
+        assert_eq!(parse_cpu_max("180000 100000\n"), Some(180));
+        assert!(parse_cpu_max("max 100000\n").is_none());
+        assert!(parse_cpu_stat("nr_periods 120\n", 180).is_none());
+        assert!(!valid_scope_unit("other.service"));
     }
 
     #[test]

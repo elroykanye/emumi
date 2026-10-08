@@ -5,12 +5,19 @@ All notable changes to EmuMi are documented here. This project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Replace the fixed post-start CPU ceiling with adaptive per-scope control. Repeated cgroup
+  throttling raises a busy emulator in 60% steps up to 300%, while calm periods lower it slowly.
+- Share six logical CPUs across active emulators on an eight-CPU host, preserving two logical CPUs
+  for Frostguard and the desktop. Thermal or host saturation prevents quota increases.
+- Re-adopt surviving emulator scopes after an EmuMi manager restart and continue from each
+  scope's real quota instead of replaying the startup default.
+
 ### Changed
 
-- Emulator scopes may use up to 180% aggregate host CPU during Android boot and the first two
-  minutes after EmuMi reports readiness, covering Frostguard's game-launch window.
-- EmuMi then lowers the exact per-launch scope to a 120% CPU quota and records whether the
-  transition succeeded, without changing the two-vCPU Android configuration.
+- Emulator scopes start conservatively, then adapt to measured throttling, host load and CPU
+  temperature instead of following a fixed post-start quota timer.
 
 ## [0.2.7] - 2026-10-07
 

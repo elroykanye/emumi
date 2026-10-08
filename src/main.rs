@@ -1,6 +1,7 @@
 mod android;
 mod app;
 mod config;
+mod cpu_policy;
 mod model;
 mod monitor;
 
