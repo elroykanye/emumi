@@ -1,6 +1,7 @@
 use crate::{
     android::AndroidTools,
     config::AppConfig,
+    cpu_policy::CpuQuotaPolicy,
     model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
 };
@@ -27,6 +28,8 @@ const MAX_RUNNING_PROFILES: usize = 4;
 const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
 const STARTUP_SETTLE_SECONDS: u64 = 20;
+const STARTUP_CPU_QUOTA_PERCENT: u16 = 180;
+const CPU_CONTROL_SAMPLE_SECONDS: u64 = 5;
 
 type Shared = Arc<Mutex<Runtime>>;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
@@ -43,6 +46,7 @@ struct Runtime {
     next_startup_generation: u64,
     queued_profiles: VecDeque<String>,
     memory_warnings: BTreeMap<String, String>,
+    cpu_controller_scopes: BTreeSet<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -125,6 +129,7 @@ impl EmuMiApp {
             next_startup_generation: 1,
             queued_profiles: VecDeque::new(),
             memory_warnings: BTreeMap::new(),
+            cpu_controller_scopes: BTreeSet::new(),
         }));
 
         let app = Router::new()
@@ -278,6 +283,19 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
         })
         .collect();
     let device_stats = sample_devices(&profiles);
+    let active_scopes = device_stats
+        .iter()
+        .filter_map(|sample| sample.scope_name.clone())
+        .collect::<BTreeSet<_>>();
+    runtime
+        .cpu_controller_scopes
+        .retain(|scope| active_scopes.contains(scope));
+    let starting_profiles = runtime.starting_profiles.clone();
+    let new_cpu_controllers = new_cpu_controller_candidates(
+        &device_stats,
+        &starting_profiles,
+        &mut runtime.cpu_controller_scopes,
+    );
     let running_profile_names = device_stats
         .iter()
         .map(|sample| sample.profile_name.clone())
@@ -321,6 +339,10 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
         device_stats,
         logs: runtime.logs.clone(),
     };
+    drop(runtime);
+    for (profile_name, scope_unit) in new_cpu_controllers {
+        schedule_adaptive_cpu_quota(Arc::clone(&shared), profile_name, Some(scope_unit));
+    }
     Ok(Json(state))
 }
 
@@ -444,11 +466,14 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
             }
         })
         .and_then(|_| tools.start(&profile, &launch_args(&options), &options, launch_admission));
-    if let Err(message) = start_result {
-        runtime.starting_profiles.remove(name);
-        runtime.startup_generations.remove(name);
-        return Err(error_tuple(StatusCode::BAD_REQUEST, message));
-    }
+    let scope_unit = match start_result {
+        Ok(scope_unit) => scope_unit,
+        Err(message) => {
+            runtime.starting_profiles.remove(name);
+            runtime.startup_generations.remove(name);
+            return Err(error_tuple(StatusCode::BAD_REQUEST, message));
+        }
+    };
     if options.rectangular_display {
         runtime.rectangular_watchers.insert(name.to_owned());
         tools.watch_rectangular_display_after_start(name);
@@ -470,11 +495,21 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     } else {
         runtime.log("success", format!("Starting {name}"));
     }
-    watch_profile_start(Arc::clone(shared), name.to_owned(), startup_generation);
+    watch_profile_start(
+        Arc::clone(shared),
+        name.to_owned(),
+        startup_generation,
+        scope_unit,
+    );
     Ok(message("Android is starting"))
 }
 
-fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
+fn watch_profile_start(
+    shared: Shared,
+    name: String,
+    startup_generation: u64,
+    scope_unit: Option<String>,
+) {
     tokio::spawn(async move {
         let mut booted = false;
         for _ in 0..240 {
@@ -524,6 +559,7 @@ fn watch_profile_start(shared: Shared, name: String, startup_generation: u64) {
             }
         }
         start_next_queued_profile(&shared, completion);
+        register_adaptive_cpu_controller(&shared, name, scope_unit);
     });
 }
 
@@ -547,6 +583,115 @@ where
 {
     sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
     StartupSettled
+}
+
+fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<String>) {
+    let Some(scope_unit) = scope_unit else {
+        return;
+    };
+    tokio::spawn(async move {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let mut policy = CpuQuotaPolicy::new(STARTUP_CPU_QUOTA_PERCENT);
+        let mut host_monitor = HostMonitor::default();
+        loop {
+            let (tools, running_emulators, profile_is_running) = {
+                let Ok(runtime) = shared.lock() else {
+                    return;
+                };
+                let tools = runtime.tools();
+                let profiles = tools.discover_profiles();
+                let profile_is_running = profiles
+                    .iter()
+                    .any(|profile| profile.name == name && profile.is_running());
+                let running_emulators = profiles
+                    .iter()
+                    .filter(|profile| profile.is_running())
+                    .count();
+                (tools, running_emulators, profile_is_running)
+            };
+            let sample = match tools.scope_cpu_stat(&scope_unit) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    if !profile_is_running {
+                        break;
+                    }
+                    if let Ok(mut runtime) = shared.lock() {
+                        runtime.log(
+                            "warning",
+                            format!("Stopped adaptive CPU control for {name}: {error}"),
+                        );
+                    }
+                    break;
+                }
+            };
+            let host_stats = host_monitor.sample();
+            if let Some(percent) = policy.observe(
+                sample,
+                running_emulators,
+                logical_cpus,
+                host_stats.cpu_percent,
+                host_stats.cpu_temperature_c,
+            ) {
+                let weight = if percent > 120 { 100 } else { 25 };
+                match tools.set_scope_cpu_policy(&scope_unit, percent, weight) {
+                    Ok(()) => {
+                        if let Ok(mut runtime) = shared.lock() {
+                            runtime.log(
+                                "success",
+                                format!(
+                                    "Adjusted {name} CPU quota to {percent}% with weight {weight}"
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut runtime) = shared.lock() {
+                            runtime.log(
+                                "warning",
+                                format!("Could not adjust {name} CPU quota: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(CPU_CONTROL_SAMPLE_SECONDS)).await;
+        }
+        if let Ok(mut runtime) = shared.lock() {
+            runtime.cpu_controller_scopes.remove(&scope_unit);
+        }
+    });
+}
+
+fn register_adaptive_cpu_controller(shared: &Shared, name: String, scope_unit: Option<String>) {
+    let Some(scope_unit) = scope_unit else {
+        return;
+    };
+    let should_start = shared
+        .lock()
+        .map(|mut runtime| runtime.cpu_controller_scopes.insert(scope_unit.clone()))
+        .unwrap_or(false);
+    if should_start {
+        schedule_adaptive_cpu_quota(Arc::clone(shared), name, Some(scope_unit));
+    }
+}
+
+fn new_cpu_controller_candidates(
+    samples: &[crate::model::DeviceHostStats],
+    starting_profiles: &BTreeSet<String>,
+    registered_scopes: &mut BTreeSet<String>,
+) -> Vec<(String, String)> {
+    samples
+        .iter()
+        .filter(|sample| !starting_profiles.contains(&sample.profile_name))
+        .filter_map(|sample| {
+            let scope = sample.scope_name.clone()?;
+            registered_scopes
+                .insert(scope.clone())
+                .then(|| (sample.profile_name.clone(), scope))
+        })
+        .collect()
 }
 
 fn start_next_queued_profile(shared: &Shared, completion: StartupCompletion) {
@@ -832,7 +977,7 @@ fn launch_args(options: &ProfileOptions) -> Vec<String> {
         "-memory".into(),
         options.memory_mb.to_string(),
         "-gpu".into(),
-        if options.gpu_mode == "host-intel" {
+        if matches!(options.gpu_mode.as_str(), "host-intel" | "host-nvidia") {
             "host".into()
         } else {
             options.gpu_mode.clone()
@@ -970,12 +1115,13 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 #[cfg(test)]
 mod tests {
     use super::{
-        STARTUP_SETTLE_SECONDS, enforce_launch_admission, launch_args, launch_block_reason,
+        CPU_CONTROL_SAMPLE_SECONDS, STARTUP_CPU_QUOTA_PERCENT, STARTUP_SETTLE_SECONDS,
+        enforce_launch_admission, launch_args, launch_block_reason, new_cpu_controller_candidates,
         settle_after_boot_with, validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
     use crate::monitor::HostMonitor;
-    use std::fs;
+    use std::{collections::BTreeSet, fs};
 
     #[test]
     fn launch_admission_protects_host_memory_and_temperature() {
@@ -1075,6 +1221,42 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_cpu_control_starts_conservatively_and_reacts_quickly() {
+        assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 180);
+        assert_eq!(CPU_CONTROL_SAMPLE_SECONDS, 5);
+    }
+
+    #[test]
+    fn running_scopes_are_adopted_once_after_manager_restart() {
+        let samples = vec![
+            crate::model::DeviceHostStats {
+                profile_name: "Device_1".into(),
+                scope_name: Some("emumi-Device_1-100.scope".into()),
+                ..Default::default()
+            },
+            crate::model::DeviceHostStats {
+                profile_name: "Device_3".into(),
+                scope_name: Some("emumi-Device_3-300.scope".into()),
+                ..Default::default()
+            },
+        ];
+        let starting = BTreeSet::from(["Device_3".to_owned()]);
+        let mut registered = BTreeSet::new();
+
+        assert_eq!(
+            new_cpu_controller_candidates(&samples, &starting, &mut registered),
+            vec![("Device_1".to_owned(), "emumi-Device_1-100.scope".to_owned())]
+        );
+        assert!(new_cpu_controller_candidates(&samples, &starting, &mut registered).is_empty());
+
+        let no_starting = BTreeSet::new();
+        assert_eq!(
+            new_cpu_controller_candidates(&samples, &no_starting, &mut registered),
+            vec![("Device_3".to_owned(), "emumi-Device_3-300.scope".to_owned())]
+        );
+    }
+
+    #[test]
     fn intel_choice_uses_hardware_not_an_unknown_emulator_gpu_mode() {
         let options = ProfileOptions {
             gpu_mode: "host-intel".into(),
@@ -1084,6 +1266,18 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
         assert!(!args.iter().any(|arg| arg == "host-intel"));
         assert!(args.contains(&"-no-snapshot-load".into()));
+    }
+
+    #[test]
+    fn explicit_nvidia_choice_uses_the_emulator_host_backend() {
+        let options = ProfileOptions {
+            gpu_mode: "host-nvidia".into(),
+            ..ProfileOptions::default()
+        };
+        let args = launch_args(&options);
+
+        assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
+        assert!(!args.iter().any(|arg| arg == "host-nvidia"));
     }
 
     #[test]

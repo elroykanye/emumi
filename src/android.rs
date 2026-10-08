@@ -1,4 +1,7 @@
-use crate::model::{AndroidProfile, LaunchAdmission, ProfileOptions};
+use crate::{
+    cpu_policy::CpuStat,
+    model::{AndroidProfile, LaunchAdmission, ProfileOptions},
+};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -327,7 +330,7 @@ impl AndroidTools {
         args: &[String],
         options: &ProfileOptions,
         _admission: LaunchAdmission,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let emulator = self
             .emulator
             .as_ref()
@@ -346,6 +349,7 @@ impl AndroidTools {
         let log = fs::File::create(log_path).map_err(|err| err.to_string())?;
         let emulator_args = emulator_launch_args(&profile.name, args, runtime_image);
         let launch = launch_spec(emulator, &emulator_args, &profile.name, options)?;
+        let scope_unit = launch.scope_unit.clone();
         let mut command = Command::new(&launch.program);
         command
             .args(&launch.args)
@@ -353,16 +357,88 @@ impl AndroidTools {
             .stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
             .stderr(Stdio::from(log))
             .process_group(0);
-        if options.gpu_mode == "host-intel" {
-            let (device, manifest) = intel_renderer()?;
-            configure_intel_renderer(&mut command, &device, &manifest);
-        } else if options.gpu_mode == "host" && nvidia_gpu_available() {
-            command
-                .env("__NV_PRIME_RENDER_OFFLOAD", "1")
-                .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-                .env("__VK_LAYER_NV_optimus", "NVIDIA_only");
+        let intel = matches!(options.gpu_mode.as_str(), "host" | "host-intel").then(intel_renderer);
+        let nvidia_available = nvidia_gpu_available();
+        match renderer_preference(
+            &options.gpu_mode,
+            intel.as_ref().is_some_and(Result::is_ok),
+            nvidia_available,
+        ) {
+            RendererPreference::Intel => {
+                let (device, manifest) =
+                    intel.expect("Intel lookup must run for Intel preference")?;
+                configure_intel_renderer(&mut command, &device, &manifest);
+            }
+            RendererPreference::Nvidia if nvidia_available => {
+                configure_nvidia_renderer(&mut command);
+            }
+            RendererPreference::Nvidia => {
+                return Err(
+                    "NVIDIA hardware graphics requested, but no NVIDIA adapter was found".into(),
+                );
+            }
+            RendererPreference::Default => {}
         }
-        command.spawn().map(|_| ()).map_err(|err| err.to_string())
+        command
+            .spawn()
+            .map(|_| scope_unit)
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn set_scope_cpu_policy(
+        &self,
+        scope_unit: &str,
+        percent: u16,
+        weight: u16,
+    ) -> Result<(), String> {
+        if !valid_scope_unit(scope_unit) {
+            return Err("Refusing to modify an invalid EmuMi scope name".into());
+        }
+        if !(1..=400).contains(&percent) {
+            return Err("CPU quota must be between 1% and 400%".into());
+        }
+        if !(1..=10_000).contains(&weight) {
+            return Err("CPU weight must be between 1 and 10000".into());
+        }
+        let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
+        let status = Command::new(systemctl)
+            .args(scope_cpu_policy_args(scope_unit, percent, weight))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Could not update {scope_unit}: {error}"))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("systemd rejected the CPU quota for {scope_unit}: {status}"))
+    }
+
+    pub fn scope_cpu_stat(&self, scope_unit: &str) -> Result<CpuStat, String> {
+        if !valid_scope_unit(scope_unit) {
+            return Err("Refusing to inspect an invalid EmuMi scope name".into());
+        }
+        let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
+        let output = Command::new(systemctl)
+            .args(scope_control_group_args(scope_unit))
+            .output()
+            .map_err(|error| format!("Could not inspect {scope_unit}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("systemd could not inspect {scope_unit}"));
+        }
+        let relative = String::from_utf8_lossy(&output.stdout);
+        let relative = relative.trim().trim_start_matches('/');
+        if relative.is_empty() {
+            return Err(format!("{scope_unit} has no control group"));
+        }
+        let cgroup = Path::new("/sys/fs/cgroup").join(relative);
+        let text = fs::read_to_string(cgroup.join("cpu.stat"))
+            .map_err(|error| format!("Could not read CPU counters for {scope_unit}: {error}"))?;
+        let cpu_max = fs::read_to_string(cgroup.join("cpu.max"))
+            .map_err(|error| format!("Could not read CPU quota for {scope_unit}: {error}"))?;
+        let quota_percent = parse_cpu_max(&cpu_max)
+            .ok_or_else(|| format!("{scope_unit} returned an invalid CPU quota"))?;
+        parse_cpu_stat(&text, quota_percent)
+            .ok_or_else(|| format!("{scope_unit} returned incomplete CPU counters"))
     }
 
     /// Android's Pixel hardware profiles can re-apply their device-shape overlay
@@ -690,6 +766,7 @@ impl AndroidTools {
 struct LaunchSpec {
     program: PathBuf,
     args: Vec<OsString>,
+    scope_unit: Option<String>,
 }
 
 fn launch_spec(
@@ -702,6 +779,7 @@ fn launch_spec(
         return Ok(LaunchSpec {
             program: emulator.to_owned(),
             args: emulator_args.to_vec(),
+            scope_unit: None,
         });
     }
     let systemd_run = path_command("systemd-run")
@@ -752,9 +830,9 @@ fn systemd_scope_launch_spec(
             "--property=MemorySwapMax={}M",
             options.memory_swap_max_mb
         )),
-        // Four active emulators receive at most 3.2 host CPUs in aggregate,
-        // leaving capacity for Frostguard, the desktop and system services.
-        OsString::from("--property=CPUQuota=80%"),
+        // Two Android vCPUs may use up to 1.8 host CPUs while Android and the
+        // game warm up. EmuMi reduces this scope after the post-ready window.
+        OsString::from("--property=CPUQuota=180%"),
         // Emulator work stays responsive, but competes below normal desktop
         // applications when several Androids are busy at once.
         OsString::from("--property=CPUWeight=25"),
@@ -766,7 +844,61 @@ fn systemd_scope_launch_spec(
     LaunchSpec {
         program: systemd_run,
         args,
+        scope_unit: Some(format!("{unit}.scope")),
     }
+}
+
+fn scope_cpu_policy_args(scope_unit: &str, percent: u16, weight: u16) -> Vec<OsString> {
+    vec![
+        OsString::from("--user"),
+        OsString::from("set-property"),
+        OsString::from("--runtime"),
+        OsString::from(scope_unit),
+        OsString::from(format!("CPUQuota={percent}%")),
+        OsString::from(format!("CPUWeight={weight}")),
+    ]
+}
+
+fn scope_control_group_args(scope_unit: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("--user"),
+        OsString::from("show"),
+        OsString::from(scope_unit),
+        OsString::from("--property=ControlGroup"),
+        OsString::from("--value"),
+    ]
+}
+
+fn valid_scope_unit(scope_unit: &str) -> bool {
+    scope_unit.starts_with("emumi-")
+        && scope_unit.ends_with(".scope")
+        && scope_unit
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+}
+
+fn parse_cpu_max(text: &str) -> Option<u16> {
+    let mut values = text.split_whitespace();
+    let quota = values.next()?.parse::<u64>().ok()?;
+    let period = values.next()?.parse::<u64>().ok()?;
+    if period == 0 {
+        return None;
+    }
+    u16::try_from(quota.saturating_mul(100).div_ceil(period)).ok()
+}
+
+fn parse_cpu_stat(text: &str, quota_percent: u16) -> Option<CpuStat> {
+    let values = text
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter_map(|(key, value)| Some((key, value.parse::<u64>().ok()?)))
+        .collect::<HashMap<_, _>>();
+    Some(CpuStat {
+        periods: *values.get("nr_periods")?,
+        throttled_periods: *values.get("nr_throttled")?,
+        throttled_usec: *values.get("throttled_usec")?,
+        quota_percent,
+    })
 }
 
 fn validate_memory_policy(options: &ProfileOptions) -> Result<(), String> {
@@ -942,6 +1074,34 @@ fn clear_stale_runtime_locks_in(
 
 fn nvidia_gpu_available() -> bool {
     Path::new("/proc/driver/nvidia/gpus").is_dir()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererPreference {
+    Intel,
+    Nvidia,
+    Default,
+}
+
+fn renderer_preference(
+    gpu_mode: &str,
+    intel_available: bool,
+    nvidia_available: bool,
+) -> RendererPreference {
+    match gpu_mode {
+        "host-intel" => RendererPreference::Intel,
+        "host-nvidia" => RendererPreference::Nvidia,
+        "host" if intel_available => RendererPreference::Intel,
+        "host" if nvidia_available => RendererPreference::Nvidia,
+        _ => RendererPreference::Default,
+    }
+}
+
+fn configure_nvidia_renderer(command: &mut Command) {
+    command
+        .env("__NV_PRIME_RENDER_OFFLOAD", "1")
+        .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+        .env("__VK_LAYER_NV_optimus", "NVIDIA_only");
 }
 
 // Select both APIs: DRI_PRIME alone still lets gfxstream pick NVIDIA for Vulkan.
@@ -1237,6 +1397,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generic_hardware_prefers_intel_on_a_hybrid_host() {
+        assert_eq!(
+            renderer_preference("host", true, true),
+            RendererPreference::Intel
+        );
+        assert_eq!(
+            renderer_preference("host-nvidia", true, true),
+            RendererPreference::Nvidia
+        );
+        assert_eq!(
+            renderer_preference("host", false, true),
+            RendererPreference::Nvidia
+        );
+        assert_eq!(
+            renderer_preference("host", false, false),
+            RendererPreference::Default
+        );
+    }
+
+    #[test]
     fn intel_renderer_selects_both_graphics_apis_without_nvidia_offload() {
         let mut command = Command::new("emulator");
         command.env("__NV_PRIME_RENDER_OFFLOAD", "1");
@@ -1416,16 +1596,66 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(spec.program, PathBuf::from("/usr/bin/systemd-run"));
+        assert_eq!(
+            spec.scope_unit.as_deref(),
+            Some("emumi-Device_2-12345.scope")
+        );
         assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2-12345")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5632M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6656M")));
         assert!(args.contains(&std::borrow::Cow::Borrowed(
             "--property=MemorySwapMax=1024M"
         )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=80%")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=180%")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
+    }
+
+    #[test]
+    fn adaptive_cpu_policy_targets_only_the_launched_scope() {
+        assert_eq!(
+            scope_cpu_policy_args("emumi-Device_2-12345.scope", 240, 100),
+            vec![
+                OsString::from("--user"),
+                OsString::from("set-property"),
+                OsString::from("--runtime"),
+                OsString::from("emumi-Device_2-12345.scope"),
+                OsString::from("CPUQuota=240%"),
+                OsString::from("CPUWeight=100"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_cpu_counters_from_only_the_launched_scope() {
+        assert_eq!(
+            scope_control_group_args("emumi-Device_2-12345.scope"),
+            vec![
+                OsString::from("--user"),
+                OsString::from("show"),
+                OsString::from("emumi-Device_2-12345.scope"),
+                OsString::from("--property=ControlGroup"),
+                OsString::from("--value"),
+            ]
+        );
+        assert_eq!(
+            parse_cpu_stat(
+                "usage_usec 800000\nnr_periods 120\nnr_throttled 90\nthrottled_usec 450000\n",
+                240,
+            ),
+            Some(CpuStat {
+                periods: 120,
+                throttled_periods: 90,
+                throttled_usec: 450_000,
+                quota_percent: 240,
+            })
+        );
+        assert_eq!(parse_cpu_max("300000 100000\n"), Some(300));
+        assert_eq!(parse_cpu_max("180000 100000\n"), Some(180));
+        assert!(parse_cpu_max("max 100000\n").is_none());
+        assert!(parse_cpu_stat("nr_periods 120\n", 180).is_none());
+        assert!(!valid_scope_unit("other.service"));
     }
 
     #[test]

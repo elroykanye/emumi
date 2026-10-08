@@ -3,6 +3,25 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.8] - 2026-10-08
+
+### Fixed
+
+- Generic hardware rendering now prefers Intel/Mesa on Intel+NVIDIA hybrid systems instead of
+  automatically forcing the confirmed NVIDIA GLX/gfxstream crash path. NVIDIA remains available
+  as an explicit experimental profile choice and stays automatic on NVIDIA-only systems.
+- Replace the fixed post-start CPU ceiling with adaptive per-scope control. Repeated cgroup
+  throttling raises a busy emulator in 60% steps up to 300%, while calm periods lower it slowly.
+- Share six logical CPUs across active emulators on an eight-CPU host, preserving two logical CPUs
+  for Frostguard and the desktop. Thermal or host saturation prevents quota increases.
+- Re-adopt surviving emulator scopes after an EmuMi manager restart and continue from each
+  scope's real quota instead of replaying the startup default.
+
+### Changed
+
+- Emulator scopes start conservatively, then adapt to measured throttling, host load and CPU
+  temperature instead of following a fixed post-start quota timer.
+
 ## [0.2.7] - 2026-10-07
 
 ### Changed
@@ -17,7 +36,6 @@ All notable changes to EmuMi are documented here. This project follows
 - Rectangular-display normalization now discovers and disables display-shape overlays from all
   Android overlay targets, including `com.android.systemui.emulation.*`, so Pixel-style notches do
   not reappear after boot.
-
 ## [0.2.6] - 2026-10-06
 
 ### Added
@@ -152,3 +170,4 @@ All notable changes to EmuMi are documented here. This project follows
 [0.2.5]: https://github.com/elroykanye/emumi/releases/tag/v0.2.5
 [0.2.6]: https://github.com/elroykanye/emumi/releases/tag/v0.2.6
 [0.2.7]: https://github.com/elroykanye/emumi/releases/tag/v0.2.7
+[0.2.8]: https://github.com/elroykanye/emumi/releases/tag/v0.2.8
