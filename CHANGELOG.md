@@ -3,6 +3,14 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.8+diskguard.1] - 2026-10-16
+
+### Fixed
+
+- Protect the host disk from a runaway Android `netsimd` stderr log by checking the exact
+  per-user temp path every five seconds and truncating it above 100 MiB. Unsafe file types are
+  refused, and interventions or failures appear in EmuMi's bounded application log.
+
 ## [0.2.8] - 2026-10-08
 
 ### Fixed

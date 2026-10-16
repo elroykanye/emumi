@@ -4,6 +4,7 @@ use crate::{
     cpu_policy::CpuQuotaPolicy,
     model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
+    netsimd_log::{self, GuardOutcome},
 };
 use axum::{
     Json, Router,
@@ -30,6 +31,8 @@ const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
 const STARTUP_SETTLE_SECONDS: u64 = 20;
 const STARTUP_CPU_QUOTA_PERCENT: u16 = 180;
 const CPU_CONTROL_SAMPLE_SECONDS: u64 = 5;
+const NETSIMD_LOG_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+const NETSIMD_LOG_CHECK_SECONDS: u64 = 5;
 
 type Shared = Arc<Mutex<Runtime>>;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
@@ -131,6 +134,7 @@ impl EmuMiApp {
             memory_warnings: BTreeMap::new(),
             cpu_controller_scopes: BTreeSet::new(),
         }));
+        spawn_netsimd_log_guard(Arc::clone(&runtime));
 
         let app = Router::new()
             .route("/", get(index))
@@ -159,6 +163,52 @@ impl EmuMiApp {
         });
         Ok(url)
     }
+}
+
+fn spawn_netsimd_log_guard(runtime: Shared) {
+    let Some(log_path) = netsimd_log::default_log_path() else {
+        runtime.lock().unwrap().log(
+            "warning",
+            "Disk guard could not determine the per-user netsimd log path",
+        );
+        return;
+    };
+    tokio::spawn(async move {
+        let mut last_error = None;
+        loop {
+            match netsimd_log::enforce_log_limit(&log_path, NETSIMD_LOG_LIMIT_BYTES) {
+                Ok(GuardOutcome::Truncated { previous_bytes }) => {
+                    last_error = None;
+                    runtime.lock().unwrap().log(
+                        "warning",
+                        format!(
+                            "Disk guard truncated runaway netsimd log at {} MiB",
+                            previous_bytes / (1024 * 1024)
+                        ),
+                    );
+                }
+                Ok(GuardOutcome::Refused(reason)) => {
+                    let message = format!("Disk guard refused {}: {reason}", log_path.display());
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        runtime.lock().unwrap().log("warning", message.clone());
+                        last_error = Some(message);
+                    }
+                }
+                Ok(GuardOutcome::Absent | GuardOutcome::Unchanged) => {
+                    last_error = None;
+                }
+                Err(error) => {
+                    let message =
+                        format!("Disk guard could not limit {}: {error}", log_path.display());
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        runtime.lock().unwrap().log("warning", message.clone());
+                        last_error = Some(message);
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(NETSIMD_LOG_CHECK_SECONDS)).await;
+        }
+    });
 }
 
 impl ApiLog {

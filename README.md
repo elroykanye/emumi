@@ -26,6 +26,7 @@ stopping Android profiles without requiring Android Studio.
 - Windowless automation by default while preserving ADB screenshots and input
 - Up to four concurrently running Android devices
 - Live device state plus host CPU and memory monitoring
+- Automatic protection against runaway Android `netsimd` temp logs filling the host disk
 - Automatic Android SDK, Java, ADB, emulator and KVM discovery
 - Local lifecycle API for tools such as Frostguard
 - Native Tauri window with a bundled React and Material UI interface

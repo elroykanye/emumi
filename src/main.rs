@@ -4,6 +4,7 @@ mod config;
 mod cpu_policy;
 mod model;
 mod monitor;
+mod netsimd_log;
 
 use app::EmuMiApp;
 use tauri::{WebviewUrl, WebviewWindowBuilder};
