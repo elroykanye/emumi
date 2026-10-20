@@ -11,7 +11,11 @@ pub struct CpuQuotaPolicy {
     previous: Option<CpuStat>,
     busy_samples: u8,
     calm_samples: u8,
+    thermal_limited: bool,
 }
+
+const THERMAL_LIMIT_ENTER_C: f32 = 85.0;
+const THERMAL_LIMIT_EXIT_C: f32 = 80.0;
 
 impl CpuQuotaPolicy {
     pub fn new(current_percent: u16) -> Self {
@@ -20,6 +24,7 @@ impl CpuQuotaPolicy {
             previous: None,
             busy_samples: 0,
             calm_samples: 0,
+            thermal_limited: false,
         }
     }
 
@@ -44,6 +49,29 @@ impl CpuQuotaPolicy {
             self.busy_samples = 0;
             self.calm_samples = 0;
             return Some(ceiling);
+        }
+
+        // A hot host must shed emulator load immediately. Merely blocking a
+        // later increase lets an already-raised quota keep the package at its
+        // thermal limit, which is exactly when the desktop and ADB become
+        // unreliable. Keep this below one full host CPU so other recovery
+        // work still gets scheduled.
+        if temperature_c.is_some_and(|value| value.is_finite() && value >= THERMAL_LIMIT_ENTER_C) {
+            self.thermal_limited = true;
+        } else if self.thermal_limited
+            && temperature_c.is_some_and(|value| value.is_finite() && value <= THERMAL_LIMIT_EXIT_C)
+        {
+            self.thermal_limited = false;
+        }
+        if self.thermal_limited {
+            self.previous = Some(sample);
+            self.busy_samples = 0;
+            self.calm_samples = 0;
+            if self.current_percent > 80 {
+                self.current_percent = 80;
+                return Some(80);
+            }
+            return None;
         }
 
         let previous = self.previous.replace(sample)?;
@@ -213,11 +241,11 @@ mod tests {
     }
 
     #[test]
-    fn heat_or_saturated_host_blocks_quota_increase() {
+    fn heat_forces_a_cap_and_saturated_host_blocks_quota_increase() {
         let mut hot = CpuQuotaPolicy::new(180);
         assert_eq!(
             hot.observe(stat(100, 90, 1_000_000), 2, 8, 45.0, Some(89.0)),
-            None
+            Some(80)
         );
         assert_eq!(
             hot.observe(stat(150, 135, 1_800_000), 2, 8, 45.0, Some(89.0)),
@@ -240,6 +268,43 @@ mod tests {
         assert_eq!(
             saturated.observe(stat(200, 180, 2_600_000), 2, 8, 92.0, Some(70.0)),
             None
+        );
+    }
+
+    #[test]
+    fn emergency_heat_immediately_forces_one_core_or_less() {
+        let mut policy = CpuQuotaPolicy::new(240);
+
+        assert_eq!(
+            policy.observe(stat_at(240, 100, 90, 1_000_000), 2, 8, 45.0, Some(99.0)),
+            Some(80)
+        );
+        assert_eq!(
+            policy.observe(stat_at(80, 150, 145, 1_800_000), 2, 8, 45.0, Some(99.0)),
+            None
+        );
+        for (periods, throttled_periods) in [(200, 195), (250, 245), (300, 295)] {
+            assert_eq!(
+                policy.observe(
+                    stat_at(80, periods, throttled_periods, periods * 20_000),
+                    2,
+                    8,
+                    45.0,
+                    Some(87.0),
+                ),
+                None,
+                "emergency cap must remain latched until the host is cool"
+            );
+        }
+    }
+
+    #[test]
+    fn manager_restart_while_still_hot_keeps_the_scope_capped() {
+        let mut policy = CpuQuotaPolicy::new(180);
+
+        assert_eq!(
+            policy.observe(stat_at(240, 100, 90, 1_000_000), 2, 8, 45.0, Some(87.0)),
+            Some(80)
         );
     }
 

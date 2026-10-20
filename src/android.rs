@@ -14,6 +14,28 @@ use std::{
     time::Duration,
 };
 
+const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn valid_owned_scope(scope: &str) -> bool {
     scope.starts_with("emumi-")
         && scope.ends_with(".scope")
@@ -145,7 +167,14 @@ impl AndroidTools {
         let mut profiles = self
             .emulator
             .as_ref()
-            .and_then(|emulator| Command::new(emulator).arg("-list-avds").output().ok())
+            .and_then(|emulator| {
+                command_output_with_timeout(
+                    Command::new(emulator).arg("-list-avds"),
+                    HEALTH_COMMAND_TIMEOUT,
+                )
+                .ok()
+                .flatten()
+            })
             .filter(|output| output.status.success())
             .map(|output| parse_avd_list(&String::from_utf8_lossy(&output.stdout)))
             .unwrap_or_default()
@@ -732,12 +761,20 @@ impl AndroidTools {
         };
         self.running_avds().into_iter().any(|(serial, name)| {
             name == profile_name
-                && Command::new(adb)
-                    .args(["-s", &serial, "shell", "getprop", "sys.boot_completed"])
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1")
+                && command_output_with_timeout(
+                    Command::new(adb).args([
+                        "-s",
+                        &serial,
+                        "shell",
+                        "getprop",
+                        "sys.boot_completed",
+                    ]),
+                    HEALTH_COMMAND_TIMEOUT,
+                )
+                .ok()
+                .flatten()
+                .filter(|output| output.status.success())
+                .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1")
         })
     }
 
@@ -877,13 +914,15 @@ impl AndroidTools {
         let Some(adb) = &self.adb else {
             return HashMap::new();
         };
-        let devices = Command::new(adb)
-            .args(["devices"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| parse_adb_devices(&String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or_default();
+        let devices = command_output_with_timeout(
+            Command::new(adb).args(["devices"]),
+            HEALTH_COMMAND_TIMEOUT,
+        )
+        .ok()
+        .flatten()
+        .filter(|output| output.status.success())
+        .map(|output| parse_adb_devices(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default();
         devices
             .into_iter()
             .filter_map(|serial| {
@@ -1095,10 +1134,11 @@ pub fn parse_adb_devices(text: &str) -> Vec<String> {
 }
 
 fn running_avd_name(adb: &Path, serial: &str) -> Option<String> {
-    let output = Command::new(adb)
-        .args(["-s", serial, "emu", "avd", "name"])
-        .output()
-        .ok()?;
+    let output = command_output_with_timeout(
+        Command::new(adb).args(["-s", serial, "emu", "avd", "name"]),
+        HEALTH_COMMAND_TIMEOUT,
+    )
+    .ok()??;
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find(|line| !line.trim().is_empty() && line.trim() != "OK")
@@ -1107,23 +1147,27 @@ fn running_avd_name(adb: &Path, serial: &str) -> Option<String> {
 
 fn wait_for_booted_profile(adb: &Path, profile_name: &str) -> Option<String> {
     for _ in 0..120 {
-        let devices = Command::new(adb)
-            .args(["devices"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| parse_adb_devices(&String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or_default();
+        let devices = command_output_with_timeout(
+            Command::new(adb).args(["devices"]),
+            HEALTH_COMMAND_TIMEOUT,
+        )
+        .ok()
+        .flatten()
+        .filter(|output| output.status.success())
+        .map(|output| parse_adb_devices(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default();
         for serial in devices {
             if running_avd_name(adb, &serial).as_deref() != Some(profile_name) {
                 continue;
             }
-            let booted = Command::new(adb)
-                .args(["-s", &serial, "shell", "getprop", "sys.boot_completed"])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1");
+            let booted = command_output_with_timeout(
+                Command::new(adb).args(["-s", &serial, "shell", "getprop", "sys.boot_completed"]),
+                HEALTH_COMMAND_TIMEOUT,
+            )
+            .ok()
+            .flatten()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1");
             if booted {
                 return Some(serial);
             }
@@ -1535,6 +1579,19 @@ fn remove_ini_value(text: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_output_kills_a_hung_health_probe() {
+        let started = std::time::Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("5");
+
+        let output = command_output_with_timeout(&mut command, Duration::from_millis(100))
+            .expect("probe process should start");
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn generic_hardware_prefers_intel_on_a_hybrid_host() {

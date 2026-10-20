@@ -249,21 +249,15 @@ fn spawn_device_supervisor(runtime: Shared) {
                         .cloned()
                 });
                 let phase = phases.get(&name).map(|status| status.phase);
-                let observation = if running.is_some() && tools.profile_boot_completed(&name) {
-                    Observation::Healthy
-                } else if running.is_some() || starting.contains(&name) {
-                    Observation::Booting {
-                        scope: scope.clone(),
-                    }
-                } else if scope.is_some() {
-                    Observation::Unresponsive {
-                        scope: scope.clone(),
-                    }
-                } else if matches!(phase, Some(DevicePhase::Running)) {
-                    Observation::Absent { scope: None }
-                } else if matches!(phase, Some(DevicePhase::Starting)) {
-                    Observation::Exited { scope: None }
-                } else {
+                let running = running.is_some();
+                let boot_completed = running && tools.profile_boot_completed(&name);
+                let Some(observation) = classify_supervisor_observation(
+                    running,
+                    boot_completed,
+                    starting.contains(&name),
+                    phase,
+                    scope.clone(),
+                ) else {
                     continue;
                 };
                 observations.push((name, scope, observation));
@@ -315,6 +309,34 @@ fn spawn_device_supervisor(runtime: Shared) {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
+}
+
+fn classify_supervisor_observation(
+    running: bool,
+    boot_completed: bool,
+    starting: bool,
+    previous_phase: Option<DevicePhase>,
+    scope: Option<String>,
+) -> Option<Observation> {
+    if running && boot_completed {
+        return Some(Observation::Healthy);
+    }
+    if running && matches!(previous_phase, Some(DevicePhase::Running)) {
+        return Some(Observation::Unresponsive { scope });
+    }
+    if running || starting {
+        return Some(Observation::Booting { scope });
+    }
+    if scope.is_some() {
+        return Some(Observation::Unresponsive { scope });
+    }
+    if matches!(previous_phase, Some(DevicePhase::Running)) {
+        return Some(Observation::Absent { scope: None });
+    }
+    if matches!(previous_phase, Some(DevicePhase::Starting)) {
+        return Some(Observation::Exited { scope: None });
+    }
+    None
 }
 
 fn now_seconds() -> u64 {
@@ -413,9 +435,29 @@ async fn script() -> impl IntoResponse {
 }
 
 async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
+    let tools = lock(&shared)?.tools();
+    let discovery_tools = tools.clone();
+    let (profiles, system_images, device_stats) = tokio::task::spawn_blocking(move || {
+        let profiles = discovery_tools.discover_profiles();
+        let system_images = discovery_tools
+            .installed_system_images()
+            .into_iter()
+            .map(|image| ImageDto {
+                label: image.label(),
+                package_id: image.package_id,
+            })
+            .collect();
+        let device_stats = sample_devices(&profiles);
+        (profiles, system_images, device_stats)
+    })
+    .await
+    .map_err(|error| {
+        error_tuple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Device discovery worker failed: {error}"),
+        )
+    })?;
     let mut runtime = lock(&shared)?;
-    let tools = runtime.tools();
-    let profiles = tools.discover_profiles();
     runtime.ensure_profile_ports(
         &profiles
             .iter()
@@ -445,15 +487,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             tools.watch_rectangular_display_after_start(&profile.name);
         }
     }
-    let system_images = tools
-        .installed_system_images()
-        .into_iter()
-        .map(|image| ImageDto {
-            label: image.label(),
-            package_id: image.package_id,
-        })
-        .collect();
-    let device_stats = sample_devices(&profiles);
     let active_scopes = device_stats
         .iter()
         .filter_map(|sample| sample.scope_name.clone())
@@ -1068,47 +1101,79 @@ async fn port_readiness(
         .find_map(|(name, options)| (options.adb_port == Some(port)).then(|| name.clone()))
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "No profile uses that ADB port"))?;
 
-    let readiness = if runtime.queued_profiles.iter().any(|queued| queued == &name) {
-        PortReadiness {
+    let readiness = port_readiness_from_state(
+        &name,
+        runtime.queued_profiles.iter().any(|queued| queued == &name),
+        runtime.starting_profiles.contains(&name),
+        runtime.supervisor.statuses().remove(&name),
+    );
+
+    Ok(Json(readiness))
+}
+
+fn port_readiness_from_state(
+    name: &str,
+    queued: bool,
+    starting: bool,
+    status: Option<DeviceStatus>,
+) -> PortReadiness {
+    if queued {
+        return PortReadiness {
             ready: false,
             phase: "queued",
             message: format!("{name} is queued for startup"),
-        }
-    } else if runtime.starting_profiles.contains(&name) {
-        PortReadiness {
+        };
+    }
+    if starting {
+        return PortReadiness {
             ready: false,
             phase: "starting",
             message: format!("{name} is still completing its clean boot"),
-        }
-    } else {
-        let tools = runtime.tools();
-        let profile = tools
-            .discover_profiles()
-            .into_iter()
-            .find(|profile| profile.name == name)
-            .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
-        if !profile.is_running() {
-            PortReadiness {
-                ready: false,
-                phase: "stopped",
-                message: format!("{name} is stopped"),
-            }
-        } else if !tools.profile_boot_completed(&name) {
-            PortReadiness {
-                ready: false,
-                phase: "booting",
-                message: format!("{name} is visible to ADB but Android has not completed boot"),
-            }
-        } else {
-            PortReadiness {
-                ready: true,
-                phase: "ready",
-                message: format!("{name} is ready for app launch"),
-            }
-        }
+        };
+    }
+    let Some(status) = status else {
+        return PortReadiness {
+            ready: false,
+            phase: "stopped",
+            message: format!("{name} is stopped"),
+        };
     };
-
-    Ok(Json(readiness))
+    match status.phase {
+        DevicePhase::Running => PortReadiness {
+            ready: true,
+            phase: "ready",
+            message: format!("{name} is ready for app launch"),
+        },
+        DevicePhase::Queued => PortReadiness {
+            ready: false,
+            phase: "queued",
+            message: format!("{name} is queued for startup"),
+        },
+        DevicePhase::Starting => PortReadiness {
+            ready: false,
+            phase: "starting",
+            message: format!("{name} is still completing its clean boot"),
+        },
+        DevicePhase::Recovering => PortReadiness {
+            ready: false,
+            phase: "recovering",
+            message: status
+                .last_failure
+                .unwrap_or_else(|| format!("{name} is recovering")),
+        },
+        DevicePhase::Degraded => PortReadiness {
+            ready: false,
+            phase: "degraded",
+            message: status
+                .last_failure
+                .unwrap_or_else(|| format!("{name} needs attention")),
+        },
+        DevicePhase::Stopped => PortReadiness {
+            ready: false,
+            phase: "stopped",
+            message: format!("{name} is stopped"),
+        },
+    }
 }
 
 fn profile_name_for_port(
@@ -1405,7 +1470,8 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 mod tests {
     use super::{
         CPU_CONTROL_SAMPLE_SECONDS, STARTUP_CPU_QUOTA_PERCENT, STARTUP_SETTLE_SECONDS,
-        enforce_launch_admission, launch_args, launch_block_reason, new_cpu_controller_candidates,
+        classify_supervisor_observation, enforce_launch_admission, launch_args,
+        launch_block_reason, new_cpu_controller_candidates, port_readiness_from_state,
         settle_after_boot_with, validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
@@ -1513,6 +1579,44 @@ mod tests {
     fn adaptive_cpu_control_starts_conservatively_and_reacts_quickly() {
         assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 180);
         assert_eq!(CPU_CONTROL_SAMPLE_SECONDS, 5);
+    }
+
+    #[test]
+    fn a_running_device_whose_boot_probe_stalls_is_unresponsive_not_booting() {
+        assert_eq!(
+            classify_supervisor_observation(
+                true,
+                false,
+                false,
+                Some(crate::supervisor::DevicePhase::Running),
+                Some("emumi-Device_3-123.scope".into()),
+            ),
+            Some(crate::supervisor::Observation::Unresponsive {
+                scope: Some("emumi-Device_3-123.scope".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_uses_cached_supervision_without_waiting_for_adb() {
+        let running = crate::supervisor::DeviceStatus {
+            phase: crate::supervisor::DevicePhase::Running,
+            desired_running: true,
+            ..Default::default()
+        };
+        let ready = port_readiness_from_state("Device_3", false, false, Some(running));
+        assert!(ready.ready);
+        assert_eq!(ready.phase, "ready");
+
+        let recovering = crate::supervisor::DeviceStatus {
+            phase: crate::supervisor::DevicePhase::Recovering,
+            desired_running: true,
+            last_failure: Some("health probe timed out".into()),
+            ..Default::default()
+        };
+        let not_ready = port_readiness_from_state("Device_3", false, false, Some(recovering));
+        assert!(!not_ready.ready);
+        assert_eq!(not_ready.phase, "recovering");
     }
 
     #[test]
