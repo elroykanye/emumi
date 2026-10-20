@@ -5,6 +5,7 @@ use crate::{
     model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
     netsimd_log::{self, GuardOutcome},
+    supervisor::{DevicePhase, DeviceStatus, DeviceSupervisor, Observation, SupervisorAction},
 };
 use axum::{
     Json, Router,
@@ -50,6 +51,8 @@ struct Runtime {
     queued_profiles: VecDeque<String>,
     memory_warnings: BTreeMap<String, String>,
     cpu_controller_scopes: BTreeSet<String>,
+    profile_scopes: BTreeMap<String, String>,
+    supervisor: DeviceSupervisor,
 }
 
 #[derive(Clone, Serialize)]
@@ -65,6 +68,7 @@ struct AppState {
     profile_options: BTreeMap<String, ProfileOptions>,
     starting_profiles: BTreeSet<String>,
     queued_profiles: Vec<String>,
+    device_supervision: BTreeMap<String, DeviceStatus>,
     system_images: Vec<ImageDto>,
     config: SettingsDto,
     health: HealthDto,
@@ -122,6 +126,7 @@ struct CloneRequest {
 impl EmuMiApp {
     pub async fn start_server() -> Result<String, Box<dyn std::error::Error>> {
         let config = AppConfig::load();
+        let supervisor = DeviceSupervisor::new(config.desired_running_profiles.clone());
         let runtime = Arc::new(Mutex::new(Runtime {
             config,
             logs: vec![ApiLog::new("success", "EmuMi is ready")],
@@ -133,8 +138,11 @@ impl EmuMiApp {
             queued_profiles: VecDeque::new(),
             memory_warnings: BTreeMap::new(),
             cpu_controller_scopes: BTreeSet::new(),
+            profile_scopes: BTreeMap::new(),
+            supervisor,
         }));
         spawn_netsimd_log_guard(Arc::clone(&runtime));
+        spawn_device_supervisor(Arc::clone(&runtime));
 
         let app = Router::new()
             .route("/", get(index))
@@ -211,6 +219,111 @@ fn spawn_netsimd_log_guard(runtime: Shared) {
     });
 }
 
+fn spawn_device_supervisor(runtime: Shared) {
+    tokio::spawn(async move {
+        loop {
+            let (tools, desired, phases, known_scopes, starting) = match runtime.lock() {
+                Ok(runtime) => (
+                    runtime.tools(),
+                    runtime.supervisor.desired_profiles(),
+                    runtime.supervisor.statuses(),
+                    runtime.profile_scopes.clone(),
+                    runtime.starting_profiles.clone(),
+                ),
+                Err(_) => return,
+            };
+            let profiles = tools.discover_profiles();
+            let owned_scopes = tools.owned_scopes();
+            let now = now_seconds();
+            let mut observations = Vec::new();
+            for name in desired {
+                let running = profiles
+                    .iter()
+                    .find(|profile| profile.name == name && profile.is_running());
+                let scope = known_scopes.get(&name).cloned().or_else(|| {
+                    let prefix = format!("emumi-{name}-");
+                    owned_scopes
+                        .iter()
+                        .filter(|unit| unit.starts_with(&prefix))
+                        .max()
+                        .cloned()
+                });
+                let phase = phases.get(&name).map(|status| status.phase);
+                let observation = if running.is_some() && tools.profile_boot_completed(&name) {
+                    Observation::Healthy
+                } else if running.is_some() || starting.contains(&name) {
+                    Observation::Booting {
+                        scope: scope.clone(),
+                    }
+                } else if scope.is_some() {
+                    Observation::Unresponsive {
+                        scope: scope.clone(),
+                    }
+                } else if matches!(phase, Some(DevicePhase::Running)) {
+                    Observation::Absent { scope: None }
+                } else if matches!(phase, Some(DevicePhase::Starting)) {
+                    Observation::Exited { scope: None }
+                } else {
+                    continue;
+                };
+                observations.push((name, scope, observation));
+            }
+
+            let actions = match runtime.lock() {
+                Ok(mut runtime) => {
+                    for (name, scope, observation) in observations {
+                        if let Some(scope) = scope {
+                            runtime.profile_scopes.insert(name.clone(), scope);
+                        }
+                        runtime.supervisor.observe(&name, observation, now);
+                    }
+                    runtime.supervisor.due_actions(now)
+                }
+                Err(_) => return,
+            };
+
+            for action in actions {
+                let SupervisorAction::Recover { profile, scope } = action;
+                let (tools, port) = match runtime.lock() {
+                    Ok(runtime) => (
+                        runtime.tools(),
+                        runtime
+                            .config
+                            .profile_options
+                            .get(&profile)
+                            .and_then(|options| options.adb_port),
+                    ),
+                    Err(_) => return,
+                };
+                if let Some(scope) = scope.or_else(|| tools.owned_scope_for_profile(&profile)) {
+                    let _ = tools.stop_scope_and_wait(&scope);
+                }
+                if let Some(port) = port {
+                    tools.disconnect_port(port);
+                }
+                let _ = tools.cleanup_profile_runtime(&profile);
+                if let Err((_, Json(error))) =
+                    start_named_profile_internal(&runtime, &profile, false)
+                    && let Ok(mut runtime) = runtime.lock()
+                {
+                    runtime.log(
+                        "warning",
+                        format!("Recovery for {profile} is delayed: {}", error.message),
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl ApiLog {
     fn new(level: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -234,6 +347,14 @@ impl Runtime {
         if self.logs.len() > 200 {
             self.logs.drain(..self.logs.len() - 200);
         }
+    }
+
+    fn persist_desired_profiles(&mut self) -> Result<(), String> {
+        self.config.desired_running_profiles = self.supervisor.desired_profiles();
+        self.config
+            .save()
+            .map(|_| ())
+            .map_err(|error| format!("Could not save device lifecycle state: {error}"))
     }
 
     fn ensure_profile_ports(&mut self, profile_names: &[String]) {
@@ -337,6 +458,13 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
         .iter()
         .filter_map(|sample| sample.scope_name.clone())
         .collect::<BTreeSet<_>>();
+    for sample in &device_stats {
+        if let Some(scope) = &sample.scope_name {
+            runtime
+                .profile_scopes
+                .insert(sample.profile_name.clone(), scope.clone());
+        }
+    }
     runtime
         .cpu_controller_scopes
         .retain(|scope| active_scopes.contains(scope));
@@ -372,6 +500,7 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
         profile_options: runtime.config.profile_options.clone(),
         starting_profiles: runtime.starting_profiles.clone(),
         queued_profiles: runtime.queued_profiles.iter().cloned().collect(),
+        device_supervision: runtime.supervisor.statuses(),
         system_images,
         config: SettingsDto {
             android_sdk_path: runtime.config.android_sdk_path.clone(),
@@ -446,7 +575,18 @@ async fn start_profile(
 }
 
 fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
+    start_named_profile_internal(shared, name, true)
+}
+
+fn start_named_profile_internal(
+    shared: &Shared,
+    name: &str,
+    user_requested: bool,
+) -> ApiResult<ApiMessage> {
     let mut runtime = lock(shared)?;
+    if !user_requested && !runtime.supervisor.is_desired(name) {
+        return Ok(message("Recovery was cancelled by an intentional stop"));
+    }
     let tools = runtime.tools();
     let profile = tools
         .discover_profiles()
@@ -454,12 +594,31 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
     if runtime.starting_profiles.contains(name) {
+        if user_requested {
+            runtime.supervisor.request_start(name, now_seconds());
+            runtime
+                .persist_desired_profiles()
+                .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+        }
         return Ok(message("Android is already starting"));
     }
     if runtime.queued_profiles.iter().any(|queued| queued == name) {
+        if user_requested {
+            runtime.supervisor.mark_queued(name);
+            runtime
+                .persist_desired_profiles()
+                .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+        }
         return Ok(message("Android is already queued"));
     }
     if profile.is_running() {
+        if user_requested {
+            runtime.supervisor.request_start(name, now_seconds());
+            runtime.supervisor.mark_running(name);
+            runtime
+                .persist_desired_profiles()
+                .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+        }
         return Ok(message("Android is already running"));
     }
     let running = tools
@@ -475,16 +634,30 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
             "This computer is limited to four running Androids. Stop an idle one first.",
         );
     }
+    if user_requested {
+        runtime.supervisor.request_start(name, now_seconds());
+        runtime
+            .persist_desired_profiles()
+            .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+    }
     if !runtime.starting_profiles.is_empty() {
         runtime.queued_profiles.push_back(name.to_owned());
+        runtime.supervisor.mark_queued(name);
         runtime.log(
             "info",
             format!("Queued {name} until the current Android settles"),
         );
         return Ok(message("Android is queued for an adaptive start"));
     }
-    let launch_admission = enforce_launch_admission(&mut runtime.monitor)
-        .map_err(|reason| error_tuple(StatusCode::CONFLICT, reason))?;
+    let launch_admission = match enforce_launch_admission(&mut runtime.monitor) {
+        Ok(admission) => admission,
+        Err(reason) => {
+            runtime
+                .supervisor
+                .record_failure(name, reason.clone(), None, now_seconds());
+            return Err(error_tuple(StatusCode::CONFLICT, reason));
+        }
+    };
     let options = runtime
         .config
         .profile_options
@@ -521,9 +694,17 @@ fn start_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         Err(message) => {
             runtime.starting_profiles.remove(name);
             runtime.startup_generations.remove(name);
+            runtime
+                .supervisor
+                .record_failure(name, message.clone(), None, now_seconds());
             return Err(error_tuple(StatusCode::BAD_REQUEST, message));
         }
     };
+    if let Some(scope) = &scope_unit {
+        runtime
+            .profile_scopes
+            .insert(name.to_owned(), scope.clone());
+    }
     if options.rectangular_display {
         runtime.rectangular_watchers.insert(name.to_owned());
         tools.watch_rectangular_display_after_start(name);
@@ -596,6 +777,7 @@ fn watch_profile_start(
             StartupCompletion::TimedOut
         };
 
+        let mut timed_out_cleanup = None;
         if let Ok(mut runtime) = shared.lock() {
             if runtime.startup_generations.get(&name) != Some(&startup_generation) {
                 return;
@@ -603,13 +785,43 @@ fn watch_profile_start(
             runtime.starting_profiles.remove(&name);
             runtime.startup_generations.remove(&name);
             if booted {
+                runtime.supervisor.mark_running(&name);
                 runtime.log("success", format!("{name} is ready"));
             } else {
+                let cleanup_scope = scope_unit
+                    .clone()
+                    .or_else(|| runtime.profile_scopes.get(&name).cloned());
+                runtime.supervisor.record_failure(
+                    &name,
+                    "Emulator exceeded its 120 second boot deadline",
+                    cleanup_scope.clone(),
+                    now_seconds(),
+                );
+                timed_out_cleanup = Some((
+                    runtime.tools(),
+                    cleanup_scope,
+                    runtime
+                        .config
+                        .profile_options
+                        .get(&name)
+                        .and_then(|options| options.adb_port),
+                ));
                 runtime.log("warning", format!("{name} did not finish starting"));
             }
         }
+        if let Some((tools, scope, port)) = timed_out_cleanup {
+            if let Some(scope) = scope {
+                let _ = tools.stop_scope_and_wait(&scope);
+            }
+            if let Some(port) = port {
+                tools.disconnect_port(port);
+            }
+            let _ = tools.cleanup_profile_runtime(&name);
+        }
         start_next_queued_profile(&shared, completion);
-        register_adaptive_cpu_controller(&shared, name, scope_unit);
+        if booted {
+            register_adaptive_cpu_controller(&shared, name, scope_unit);
+        }
     });
 }
 
@@ -757,7 +969,7 @@ fn start_next_queued_profile(shared: &Shared, completion: StartupCompletion) {
         let Some(next) = next else {
             return;
         };
-        match start_named_profile(shared, &next) {
+        match start_named_profile_internal(shared, &next, false) {
             Ok(_) => {
                 let is_now_starting = shared
                     .lock()
@@ -801,13 +1013,36 @@ fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
         .into_iter()
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
-    let Some(serial) = profile.running_serial else {
-        return Ok(message("Android is already stopped"));
-    };
-    tools
-        .stop(&serial)
-        .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
-    runtime.log("info", format!("Stopped {name}"));
+    runtime.supervisor.request_stop(name);
+    runtime
+        .persist_desired_profiles()
+        .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+    let scope = runtime
+        .profile_scopes
+        .remove(name)
+        .or_else(|| tools.owned_scope_for_profile(name));
+    let port = runtime
+        .config
+        .profile_options
+        .get(name)
+        .and_then(|options| options.adb_port);
+    let serial = profile.running_serial;
+    drop(runtime);
+
+    if let Some(serial) = &serial {
+        let _ = tools.stop(serial);
+        std::thread::sleep(std::time::Duration::from_millis(750));
+    }
+    if let Some(scope) = &scope {
+        let _ = tools.stop_scope_and_wait(scope);
+    }
+    if let Some(port) = port {
+        tools.disconnect_port(port);
+    }
+    let _ = tools.cleanup_profile_runtime(name);
+    if let Ok(mut runtime) = shared.lock() {
+        runtime.log("info", format!("Stopped and cleaned up {name}"));
+    }
     Ok(message("Android stopped"))
 }
 
@@ -975,8 +1210,12 @@ async fn delete_profile(
     tools
         .delete_profile(&name)
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
+    runtime.supervisor.request_stop(&name);
+    runtime.profile_scopes.remove(&name);
     runtime.config.profile_options.remove(&name);
-    let _ = runtime.config.save();
+    runtime
+        .persist_desired_profiles()
+        .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
     runtime.log("info", format!("Deleted {name}"));
     Ok(message("Android deleted"))
 }

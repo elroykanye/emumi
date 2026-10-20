@@ -21,6 +21,8 @@ stopping Android profiles without requiring Android Studio.
 - Stable Intel/Mesa rendering on hybrid-GPU Linux systems, with explicit experimental NVIDIA
   offload available per profile
 - Quick Boot with one-shot cold recovery and stale-lock cleanup
+- Persistent desired-device supervision with crash, boot-timeout and sustained ADB-loss recovery
+- Bounded retry backoff and visible recovering/degraded states instead of silent restart storms
 - Per-emulator Linux scopes with memory/swap ceilings, a 180% startup allowance, and adaptive CPU
   quotas that respond to measured cgroup throttling while preserving desktop headroom
 - Windowless automation by default while preserving ADB screenshots and input
@@ -35,6 +37,7 @@ stopping Android profiles without requiring Android Studio.
 ## Requirements
 
 - A Linux desktop with KVM virtualization available
+- A working per-user systemd manager and `prlimit` from util-linux
 - Android SDK command-line tools, Emulator and an x86_64 system image
 - Java 17 or newer
 - WebKitGTK 4.1 and GTK 3 runtime libraries
@@ -98,7 +101,8 @@ EmuMi's local-only lifecycle API and stable ADB port assignments.
 
 ## Resource policy
 
-Lean Gaming profiles launch in an individual systemd user scope. Android receives two virtual
+Every managed emulator launches in an individual systemd user scope so EmuMi can terminate only
+the process group it owns. Lean Gaming resource protection gives Android two virtual
 CPU cores and 4 GB of guest RAM, while Linux limits each emulator to 80% of one host CPU, begins
 reclaiming host memory above 5.5 GB and applies a 6.5 GB last-resort ceiling plus a 1 GB swap
 ceiling. Emulator CPU and disk work use a lower weight than normal desktop applications, helping
@@ -108,6 +112,9 @@ These controls do not pretend that a 4 GB Android guest consumes no memory. The 
 each emulator's resident/proportional memory, swap, scope limits and pressure events so limits can
 be tuned from evidence. Headless automation is the default because Frostguard operates through ADB;
 users can still enable a visible window from the profile settings when interactive play is needed.
+Native emulator processes inherit a zero-byte core-dump limit through `prlimit`; a crash therefore
+cannot create another multi-gigabyte systemd coredump. EmuMi retains the bounded per-device log,
+cleans the exact failed scope and ADB transport, and retries with increasing delays.
 
 ## Compatibility runtimes
 

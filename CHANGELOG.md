@@ -3,6 +3,22 @@
 All notable changes to EmuMi are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Persist the set of devices the user asked to keep running and supervise each launch through
+  queued, starting, running, recovering, degraded, and intentionally stopped states.
+- Recover native crashes, boot timeouts, and sustained ADB loss with exact per-launch scope cleanup,
+  bounded exponential backoff, and a cooldown that prevents restart storms.
+
+### Fixed
+
+- Stop now clears desired-running intent before terminating the exact ADB transport and owned
+  systemd scope, so stale startup watchers cannot restart an intentionally stopped device.
+- Disable multi-gigabyte native emulator core dumps with an inherited `prlimit` core limit; emulator
+  logs remain available and the existing `netsimd` log guard remains active.
+
 ## [0.2.8+diskguard.1] - 2026-10-16
 
 ### Fixed

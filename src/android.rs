@@ -14,6 +14,47 @@ use std::{
     time::Duration,
 };
 
+fn valid_owned_scope(scope: &str) -> bool {
+    scope.starts_with("emumi-")
+        && scope.ends_with(".scope")
+        && scope
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn scope_stop_args(scope: &str) -> Vec<OsString> {
+    if !valid_owned_scope(scope) {
+        return Vec::new();
+    }
+    ["--user", "stop", scope]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+}
+
+fn scope_active_args(scope: &str) -> Vec<OsString> {
+    if !valid_owned_scope(scope) {
+        return Vec::new();
+    }
+    ["--user", "is-active", "--quiet", scope]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+}
+
+fn adb_disconnect_args(port: u16) -> Vec<String> {
+    vec!["disconnect".into(), format!("127.0.0.1:{port}")]
+}
+
+fn parse_owned_scope_units(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|scope| valid_owned_scope(scope))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemImage {
     pub package_id: String,
@@ -741,6 +782,97 @@ impl AndroidTools {
             .ok_or_else(|| format!("ADB exited with {status}"))
     }
 
+    pub fn stop_scope(&self, scope: &str) -> Result<(), String> {
+        let args = scope_stop_args(scope);
+        if args.is_empty() {
+            return Err("Refusing to stop an invalid or non-EmuMi scope".into());
+        }
+        let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
+        let status = Command::new(systemctl)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Could not stop {scope}: {error}"))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("systemd could not stop {scope}: {status}"))
+    }
+
+    pub fn scope_is_active(&self, scope: &str) -> bool {
+        let args = scope_active_args(scope);
+        if args.is_empty() {
+            return false;
+        }
+        let Some(systemctl) = path_command("systemctl") else {
+            return false;
+        };
+        Command::new(systemctl)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    pub fn stop_scope_and_wait(&self, scope: &str) -> Result<(), String> {
+        self.stop_scope(scope)?;
+        for _ in 0..20 {
+            if !self.scope_is_active(scope) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!("{scope} did not stop within two seconds"))
+    }
+
+    pub fn owned_scopes(&self) -> Vec<String> {
+        let Some(systemctl) = path_command("systemctl") else {
+            return Vec::new();
+        };
+        Command::new(systemctl)
+            .args([
+                "--user",
+                "list-units",
+                "--type=scope",
+                "--state=active",
+                "--no-legend",
+                "--plain",
+                "emumi-*.scope",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| parse_owned_scope_units(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_default()
+    }
+
+    pub fn owned_scope_for_profile(&self, profile_name: &str) -> Option<String> {
+        validate_profile_name(profile_name).ok()?;
+        let prefix = format!("emumi-{profile_name}-");
+        self.owned_scopes()
+            .into_iter()
+            .filter(|scope| scope.starts_with(&prefix))
+            .max()
+    }
+
+    pub fn disconnect_port(&self, port: u16) {
+        let Some(adb) = &self.adb else {
+            return;
+        };
+        let _ = Command::new(adb)
+            .args(adb_disconnect_args(port))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    pub fn cleanup_profile_runtime(&self, profile_name: &str) -> Result<(), String> {
+        validate_profile_name(profile_name)?;
+        clear_stale_runtime_locks(profile_name)
+    }
+
     fn running_avds(&self) -> HashMap<String, String> {
         let Some(adb) = &self.adb else {
             return HashMap::new();
@@ -775,17 +907,12 @@ fn launch_spec(
     profile_name: &str,
     options: &ProfileOptions,
 ) -> Result<LaunchSpec, String> {
-    if !options.host_memory_policy {
-        return Ok(LaunchSpec {
-            program: emulator.to_owned(),
-            args: emulator_args.to_vec(),
-            scope_unit: None,
-        });
-    }
+    let prlimit = path_command("prlimit")
+        .ok_or("Safe emulator launch needs prlimit, but it was not found in PATH")?;
     let systemd_run = path_command("systemd-run")
-        .ok_or("Per-emulator memory policy needs systemd-run, but it was not found in PATH")?;
+        .ok_or("Safe emulator lifecycle management needs systemd-run in PATH")?;
     let systemctl = path_command("systemctl")
-        .ok_or("Per-emulator memory policy needs systemctl, but it was not found in PATH")?;
+        .ok_or("Safe emulator lifecycle management needs systemctl in PATH")?;
     let user_manager = Command::new(systemctl)
         .args(["--user", "show-environment"])
         .stdout(Stdio::null())
@@ -793,10 +920,11 @@ fn launch_spec(
         .status()
         .map_err(|error| format!("Could not contact the user systemd manager: {error}"))?;
     if !user_manager.success() {
-        return Err("Per-emulator memory policy needs an available user systemd manager".into());
+        return Err("Safe emulator lifecycle management needs the user systemd manager".into());
     }
     Ok(systemd_scope_launch_spec(
         systemd_run,
+        prlimit,
         emulator,
         emulator_args,
         profile_name,
@@ -807,6 +935,7 @@ fn launch_spec(
 
 fn systemd_scope_launch_spec(
     systemd_run: PathBuf,
+    prlimit: PathBuf,
     emulator: &Path,
     emulator_args: &[OsString],
     profile_name: &str,
@@ -824,22 +953,33 @@ fn systemd_scope_launch_spec(
         OsString::from("--quiet"),
         OsString::from("--collect"),
         OsString::from(format!("--unit={unit}")),
-        OsString::from(format!("--property=MemoryHigh={}M", options.memory_high_mb)),
-        OsString::from(format!("--property=MemoryMax={}M", options.memory_max_mb)),
-        OsString::from(format!(
-            "--property=MemorySwapMax={}M",
-            options.memory_swap_max_mb
-        )),
-        // Two Android vCPUs may use up to 1.8 host CPUs while Android and the
-        // game warm up. EmuMi reduces this scope after the post-ready window.
-        OsString::from("--property=CPUQuota=180%"),
-        // Emulator work stays responsive, but competes below normal desktop
-        // applications when several Androids are busy at once.
-        OsString::from("--property=CPUWeight=25"),
-        OsString::from("--property=IOWeight=25"),
+    ];
+    if options.host_memory_policy {
+        args.extend([
+            OsString::from(format!("--property=MemoryHigh={}M", options.memory_high_mb)),
+            OsString::from(format!("--property=MemoryMax={}M", options.memory_max_mb)),
+            OsString::from(format!(
+                "--property=MemorySwapMax={}M",
+                options.memory_swap_max_mb
+            )),
+            // Two Android vCPUs may use up to 1.8 host CPUs while Android and the
+            // game warm up. EmuMi reduces this scope after the post-ready window.
+            OsString::from("--property=CPUQuota=180%"),
+            // Emulator work stays responsive, but competes below normal desktop
+            // applications when several Androids are busy at once.
+            OsString::from("--property=CPUWeight=25"),
+            OsString::from("--property=IOWeight=25"),
+        ]);
+    }
+    args.extend([
+        OsString::from("--"),
+        // Scope units have no ExecContext, so systemd rejects LimitCORE here.
+        // prlimit sets RLIMIT_CORE on the emulator and every child instead.
+        prlimit.into_os_string(),
+        OsString::from("--core=0"),
         OsString::from("--"),
         emulator.as_os_str().to_owned(),
-    ];
+    ]);
     args.extend_from_slice(emulator_args);
     LaunchSpec {
         program: systemd_run,
@@ -1518,18 +1658,21 @@ mod tests {
             &["-port".into(), "5558".into()],
             Some(image.clone()),
         );
-        let direct = launch_spec(
+        let lifecycle_only = systemd_scope_launch_spec(
+            PathBuf::from("/usr/bin/systemd-run"),
+            PathBuf::from("/usr/bin/prlimit"),
             Path::new("/sdk/emulator"),
             &emulator_args,
             "Device_3",
+            12344,
             &ProfileOptions {
                 host_memory_policy: false,
                 ..ProfileOptions::default()
             },
-        )
-        .unwrap();
+        );
         let scoped = systemd_scope_launch_spec(
             PathBuf::from("/usr/bin/systemd-run"),
+            PathBuf::from("/usr/bin/prlimit"),
             Path::new("/sdk/emulator"),
             &emulator_args,
             "Device_3",
@@ -1537,7 +1680,18 @@ mod tests {
             &ProfileOptions::default(),
         );
 
-        for spec in [direct, scoped] {
+        assert_eq!(
+            lifecycle_only.scope_unit.as_deref(),
+            Some("emumi-Device_3-12344.scope")
+        );
+        assert!(
+            lifecycle_only
+                .args
+                .iter()
+                .all(|arg| !arg.to_string_lossy().starts_with("--property=Memory"))
+        );
+
+        for spec in [lifecycle_only, scoped] {
             let system = spec
                 .args
                 .iter()
@@ -1583,6 +1737,7 @@ mod tests {
         };
         let spec = systemd_scope_launch_spec(
             PathBuf::from("/usr/bin/systemd-run"),
+            PathBuf::from("/usr/bin/prlimit"),
             Path::new("/sdk/emulator"),
             &[OsString::from("-avd"), OsString::from("Device_2")],
             "Device_2",
@@ -1609,6 +1764,9 @@ mod tests {
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=180%")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
+        assert!(!args.contains(&std::borrow::Cow::Borrowed("--property=LimitCORE=0")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("/usr/bin/prlimit")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--core=0")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
     }
 
@@ -1656,6 +1814,44 @@ mod tests {
         assert!(parse_cpu_max("max 100000\n").is_none());
         assert!(parse_cpu_stat("nr_periods 120\n", 180).is_none());
         assert!(!valid_scope_unit("other.service"));
+    }
+
+    #[test]
+    fn lifecycle_cleanup_targets_only_valid_owned_scopes_and_exact_tcp_transport() {
+        assert_eq!(
+            scope_stop_args("emumi-Device_3-12345.scope"),
+            vec![
+                OsString::from("--user"),
+                OsString::from("stop"),
+                OsString::from("emumi-Device_3-12345.scope"),
+            ]
+        );
+        assert_eq!(
+            adb_disconnect_args(5558),
+            ["disconnect".to_owned(), "127.0.0.1:5558".to_owned()]
+        );
+        assert_eq!(
+            parse_owned_scope_units(
+                "emumi-Device_1-100.scope loaded active running x\n\
+                 other.scope loaded active running y\n\
+                 emumi-Device_3-300.scope loaded active running z\n"
+            ),
+            vec![
+                "emumi-Device_1-100.scope".to_owned(),
+                "emumi-Device_3-300.scope".to_owned(),
+            ]
+        );
+        assert!(scope_stop_args("other.scope").is_empty());
+        assert_eq!(
+            scope_active_args("emumi-Device_3-12345.scope"),
+            vec![
+                OsString::from("--user"),
+                OsString::from("is-active"),
+                OsString::from("--quiet"),
+                OsString::from("emumi-Device_3-12345.scope"),
+            ]
+        );
+        assert!(scope_active_args("other.scope").is_empty());
     }
 
     #[test]

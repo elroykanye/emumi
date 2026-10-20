@@ -69,6 +69,15 @@ type Page = "androids" | "monitor" | "logs" | "settings";
 type PendingAction = "starting" | "stopping";
 type Speed = "Efficient" | "LeanGaming" | "Balanced" | "Fast";
 type Picture = "Compact" | "Phone" | "Sharp";
+type LifecyclePhase = "stopped" | "queued" | "starting" | "running" | "recovering" | "degraded";
+
+type DeviceSupervision = {
+  phase: LifecyclePhase;
+  desired_running: boolean;
+  consecutive_failures: number;
+  next_retry_at: number | null;
+  last_failure: string | null;
+};
 
 type AndroidProfile = {
   name: string;
@@ -126,6 +135,7 @@ type AppState = {
   profile_options: Record<string, ProfileOptions>;
   starting_profiles: string[];
   queued_profiles: string[];
+  device_supervision: Record<string, DeviceSupervision>;
   system_images: { package_id: string; label: string }[];
   config: { android_sdk_path: string; jdk_path: string };
   health: { emulator: boolean; adb: boolean; avd_manager: boolean; kvm: boolean; java: boolean; systemd_run: boolean };
@@ -170,20 +180,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-function statusLabel(profile: AndroidProfile, pending?: PendingAction, phase?: "starting" | "queued") {
-  if (phase === "queued") return "Queued";
-  if (phase === "starting") return "Starting…";
+function statusLabel(profile: AndroidProfile, pending?: PendingAction, lifecycle?: DeviceSupervision) {
   if (pending === "starting") return "Starting…";
   if (pending === "stopping") return "Stopping…";
+  if (lifecycle?.phase === "queued") return "Queued";
+  if (lifecycle?.phase === "starting") return "Starting…";
+  if (lifecycle?.phase === "recovering") return "Recovering…";
+  if (lifecycle?.phase === "degraded") return "Recovery paused";
+  if (lifecycle?.phase === "running") return "Running";
   return profile.running_serial ? "Running" : "Stopped";
 }
 
-function runActionLabel(profile: AndroidProfile, pending?: PendingAction, phase?: "starting" | "queued") {
-  if (phase === "queued") return "Cancel";
-  if (phase === "starting") return "Starting…";
+function runActionLabel(profile: AndroidProfile, pending?: PendingAction, lifecycle?: DeviceSupervision) {
   if (pending === "starting") return "Starting…";
   if (pending === "stopping") return "Stopping…";
+  if (lifecycle?.desired_running) return lifecycle.phase === "queued" ? "Cancel" : "Stop";
   return profile.running_serial ? "Stop" : "Start";
+}
+
+function lifecycleColor(profile: AndroidProfile, pending?: PendingAction, lifecycle?: DeviceSupervision): "default" | "success" | "warning" | "error" {
+  if (lifecycle?.phase === "degraded") return "error";
+  if (pending || lifecycle && ["queued", "starting", "recovering"].includes(lifecycle.phase)) return "warning";
+  return profile.running_serial || lifecycle?.phase === "running" ? "success" : "default";
 }
 
 function displayProfileName(name: string) {
@@ -400,21 +418,21 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
           <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="No Androids yet" detail="Use New Android to create your first profile." />
         ) : state.profiles.map((profile) => {
           const running = Boolean(profile.running_serial);
-          const phase = state.queued_profiles.includes(profile.name) ? "queued" : state.starting_profiles.includes(profile.name) ? "starting" : undefined;
+          const lifecycle = state.device_supervision[profile.name];
           const adbSlot = state.profile_options[profile.name]?.adb_port;
           return (
             <Card key={profile.name} variant="outlined" sx={{ borderColor: selectedName === profile.name ? "primary.main" : undefined, bgcolor: selectedName === profile.name ? "rgba(22, 117, 75, 0.045)" : "background.paper" }}>
               <ListItemButton selected={selectedName === profile.name} onClick={() => setSelectedName(profile.name)} sx={{ py: 1.5 }}>
                 <ListItemIcon><PhoneAndroidRounded color={running ? "success" : "action"} /></ListItemIcon>
                 <ListItemText primary={displayProfileName(profile.name)} secondary={`${profile.device_name || "Android device"}${profile.api_level ? ` · API ${profile.api_level}` : ""}${adbSlot ? ` · ADB ${adbSlot}` : ""}`} primaryTypographyProps={{ fontWeight: 700 }} />
-                <Chip size="small" color={pending[profile.name] || phase ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending[profile.name], phase)} />
+                <Chip size="small" color={lifecycleColor(profile, pending[profile.name], lifecycle)} label={statusLabel(profile, pending[profile.name], lifecycle)} />
               </ListItemButton>
             </Card>
           );
         })}
       </Stack>
       {selected ? (
-        <Fade in key={selected.name} timeout={160}><Box sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}><ProfileDetail profile={selected} options={state.profile_options[selected.name] ?? defaultOptions} pending={pending[selected.name]} phase={state.queued_profiles.includes(selected.name) ? "queued" : state.starting_profiles.includes(selected.name) ? "starting" : undefined} setPending={setPending} perform={perform} setDeleteName={setDeleteName} setCloneSource={setCloneSource} busy={busy} /></Box></Fade>
+        <Fade in key={selected.name} timeout={160}><Box sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}><ProfileDetail profile={selected} options={state.profile_options[selected.name] ?? defaultOptions} pending={pending[selected.name]} lifecycle={state.device_supervision[selected.name]} setPending={setPending} perform={perform} setDeleteName={setDeleteName} setCloneSource={setCloneSource} busy={busy} /></Box></Fade>
       ) : (
         <EmptyState icon={<AndroidRounded fontSize="large" />} title="Choose an Android" detail="Its controls and settings will appear here." />
       )}
@@ -422,11 +440,11 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
   );
 }
 
-function ProfileDetail({ profile, options, pending, phase, setPending, perform, setDeleteName, setCloneSource, busy }: {
+function ProfileDetail({ profile, options, pending, lifecycle, setPending, perform, setDeleteName, setCloneSource, busy }: {
   profile: AndroidProfile;
   options: ProfileOptions;
   pending?: PendingAction;
-  phase?: "starting" | "queued";
+  lifecycle?: DeviceSupervision;
   setPending: React.Dispatch<React.SetStateAction<Record<string, PendingAction>>>;
   perform: Perform;
   setDeleteName: (name: string) => void;
@@ -440,7 +458,7 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(options), [draft, options]);
 
   const toggleRun = async () => {
-    const shouldStop = running || phase === "queued";
+    const shouldStop = running || Boolean(lifecycle?.desired_running);
     const action: PendingAction = shouldStop ? "stopping" : "starting";
     setPending((value) => ({ ...value, [profile.name]: action }));
     try {
@@ -492,7 +510,7 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
               <Typography variant="h5" noWrap>{displayProfileName(profile.name)}</Typography>
               <Typography color="text.secondary">{profile.device_name || "Android device"}{profile.api_level ? ` · Android API ${profile.api_level}` : ""}</Typography>
               <Stack direction="row" gap={1} mt={1} flexWrap="wrap">
-                <Chip size="small" color={pending || phase ? "warning" : running ? "success" : "default"} label={statusLabel(profile, pending, phase)} />
+                <Chip size="small" color={lifecycleColor(profile, pending, lifecycle)} label={statusLabel(profile, pending, lifecycle)} />
                 <Chip size="small" variant="outlined" label="720 × 1280 fixed" />
                 <Chip size="small" variant="outlined" label={options.adb_port ? `ADB ${options.adb_port}` : "ADB automatic"} />
                 {profile.running_serial && <Chip size="small" variant="outlined" label={profile.running_serial} />}
@@ -503,8 +521,9 @@ function ProfileDetail({ profile, options, pending, phase, setPending, perform, 
           <Stack direction="row" gap={1} justifyContent="flex-end">
             <Tooltip title={running ? "Stop this Android before cloning it" : "Copy apps, accounts and data"}><span><Button sx={{ minWidth: 104 }} variant="outlined" startIcon={<ContentCopyRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setCloneSource(profile.name)}>Clone</Button></span></Tooltip>
             <Tooltip title={running ? "Stop this Android before deleting it" : "Delete this Android"}><span><Button sx={{ minWidth: 104 }} variant="outlined" color="error" startIcon={<DeleteOutlineRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setDeleteName(profile.name)}>Delete</Button></span></Tooltip>
-            <Button sx={{ minWidth: 112 }} variant="contained" color={running || phase === "queued" ? "error" : "primary"} startIcon={pending || phase === "starting" ? <CircularProgress size={18} color="inherit" /> : running || phase === "queued" ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending) || phase === "starting" || busy} onClick={() => void toggleRun()}>{runActionLabel(profile, pending, phase)}</Button>
+            <Button sx={{ minWidth: 112 }} variant="contained" color={running || lifecycle?.desired_running ? "error" : "primary"} startIcon={pending ? <CircularProgress size={18} color="inherit" /> : running || lifecycle?.desired_running ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending) || busy} onClick={() => void toggleRun()}>{runActionLabel(profile, pending, lifecycle)}</Button>
           </Stack>
+          {lifecycle?.last_failure && <Alert severity={lifecycle.phase === "degraded" ? "error" : "warning"}>{lifecycle.last_failure}{lifecycle.next_retry_at ? ` · retry scheduled automatically` : ""}</Alert>}
         </Stack>
       </CardContent></Card>
 

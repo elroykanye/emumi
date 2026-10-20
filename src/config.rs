@@ -1,6 +1,10 @@
 use crate::model::{PicturePreset, ProfileOptions};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::PathBuf,
+};
 
 const CURRENT_POLICY_VERSION: u32 = 1;
 
@@ -10,6 +14,7 @@ pub struct AppConfig {
     pub android_sdk_path: String,
     pub jdk_path: String,
     pub profile_options: BTreeMap<String, ProfileOptions>,
+    pub desired_running_profiles: BTreeSet<String>,
     #[serde(default = "legacy_policy_version")]
     pub policy_version: u32,
 }
@@ -20,6 +25,7 @@ impl Default for AppConfig {
             android_sdk_path: String::new(),
             jdk_path: String::new(),
             profile_options: BTreeMap::new(),
+            desired_running_profiles: BTreeSet::new(),
             policy_version: CURRENT_POLICY_VERSION,
         }
     }
@@ -87,6 +93,7 @@ pub fn config_path() -> Option<PathBuf> {
 mod tests {
     use super::{AppConfig, CURRENT_POLICY_VERSION};
     use crate::model::PicturePreset;
+    use std::collections::BTreeSet;
 
     #[test]
     fn migrates_existing_profiles_to_the_four_emulator_defaults_once() {
@@ -118,5 +125,25 @@ mod tests {
         assert_eq!(intel.gpu_mode, "host-intel");
         assert_eq!(intel.adb_port, Some(5556));
         assert!(!config.migrate_policy());
+    }
+
+    #[test]
+    fn desired_running_profiles_round_trip_and_default_safely() {
+        let legacy: AppConfig = serde_json::from_str(r#"{"profile_options":{}}"#).unwrap();
+        assert!(legacy.desired_running_profiles.is_empty());
+
+        let configured: AppConfig =
+            serde_json::from_str(r#"{"desired_running_profiles":["Device_1","Device_3"]}"#)
+                .unwrap();
+        assert_eq!(
+            configured.desired_running_profiles,
+            BTreeSet::from(["Device_1".to_owned(), "Device_3".to_owned()])
+        );
+        let encoded = serde_json::to_string(&configured).unwrap();
+        let decoded: AppConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.desired_running_profiles,
+            configured.desired_running_profiles
+        );
     }
 }
