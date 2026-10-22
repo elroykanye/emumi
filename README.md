@@ -20,11 +20,13 @@ stopping Android profiles without requiring Android Studio.
 - Adaptive sequential startup instead of simultaneous emulator boot storms
 - Stable Intel/Mesa rendering on hybrid-GPU Linux systems, with explicit experimental NVIDIA
   offload available per profile
-- Quick Boot with one-shot cold recovery and stale-lock cleanup
-- Persistent desired-device supervision with crash, boot-timeout and sustained ADB-loss recovery
-- Bounded retry backoff and visible recovering/degraded states instead of silent restart storms
-- Per-emulator Linux scopes with memory/swap ceilings, a 180% startup allowance, and adaptive CPU
-  quotas that respond to measured cgroup throttling while preserving desktop headroom
+- Quick Boot with exact-profile snapshot quarantine, one cold retry and stale-lock cleanup
+- Persistent desired-device supervision with generation-safe cancellation, crash, boot-timeout and
+  sustained ADB-loss recovery
+- 30-second, 2-minute and 10-minute retry backoff followed by a 30-minute single-probe circuit
+- Per-emulator Linux scopes with memory/swap ceilings, an 80% boot quota, and immediate thermal
+  control that caps at 80/50% at 80/85 °C and stops only the owned scope at 90 °C
+- A single kernel-locked manager, atomic API endpoint publication and a non-blocking stop path
 - Windowless automation by default while preserving ADB screenshots and input
 - Up to four concurrently running Android devices
 - Live device state plus host CPU and memory monitoring
@@ -90,6 +92,8 @@ Create the Debian package with:
 - `src/app.rs` — private loopback API and application state
 - `src/android.rs` — Android SDK, emulator and ADB integration
 - `src/config.rs` — XDG user configuration persistence
+- `src/supervisor.rs` — persisted lifecycle generations, backoff, circuits and thermal holds
+- `src/snapshot_recovery.rs` — exact-profile failed-snapshot quarantine
 - `src/monitor.rs` — Linux host monitoring
 - `src/model.rs` — shared application models
 - `frontend/` — React, TypeScript and Material UI source
@@ -103,10 +107,16 @@ EmuMi's local-only lifecycle API and stable ADB port assignments.
 
 Every managed emulator launches in an individual systemd user scope so EmuMi can terminate only
 the process group it owns. Lean Gaming resource protection gives Android two virtual
-CPU cores and 4 GB of guest RAM, while Linux limits each emulator to 80% of one host CPU, begins
+CPU cores and 4 GB of guest RAM, while Linux starts each emulator at 80% of one host CPU, begins
 reclaiming host memory above 5.5 GB and applies a 6.5 GB last-resort ceiling plus a 1 GB swap
 ceiling. Emulator CPU and disk work use a lower weight than normal desktop applications, helping
 Linux stay responsive when several devices are busy.
+
+During boot, EmuMi samples temperature every second. Sustained readings below 75 °C permit a
+gradual increase up to 120%; 80 °C and 85 °C force 80% and 50% caps. At 90 °C EmuMi stops only that
+emulator's recorded systemd scope and enters a persisted thermal hold. Three consecutive readings
+below 75 °C are required before a single recovery attempt. After the device is ready, fair-share
+CPU allocation always reserves two logical CPUs for the desktop.
 
 These controls do not pretend that a 4 GB Android guest consumes no memory. The Monitor page shows
 each emulator's resident/proportional memory, swap, scope limits and pressure events so limits can
@@ -114,7 +124,9 @@ be tuned from evidence. Headless automation is the default because Frostguard op
 users can still enable a visible window from the profile settings when interactive play is needed.
 Native emulator processes inherit a zero-byte core-dump limit through `prlimit`; a crash therefore
 cannot create another multi-gigabyte systemd coredump. EmuMi retains the bounded per-device log,
-cleans the exact failed scope and ADB transport, and retries with increasing delays.
+cleans the exact failed scope and ADB transport, and retries through a persisted circuit breaker.
+An intentional stop is recorded before any ADB or systemd cleanup starts, so a hung probe cannot
+resurrect an older launch generation.
 
 ## Compatibility runtimes
 

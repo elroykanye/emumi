@@ -1066,6 +1066,10 @@ where
     StartupSettled
 }
 
+fn cpu_control_requires_device_discovery(phase: DevicePhase) -> bool {
+    phase == DevicePhase::Ready
+}
+
 fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<String>) {
     let Some(scope_unit) = scope_unit else {
         return;
@@ -1077,6 +1081,7 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
         let mut policy = CpuQuotaPolicy::new(STARTUP_CPU_QUOTA_PERCENT);
         let mut host_monitor = HostMonitor::default();
         let mut cool_startup_samples = 0_u8;
+        let mut scope_stat_failures = 0_u8;
         loop {
             let (tools, status, port) = {
                 let Ok(runtime) = shared.lock() else {
@@ -1096,30 +1101,6 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                 break;
             };
             let generation = status.generation;
-            let profiles = tools.discover_profiles();
-            let profile_is_running = profiles
-                .iter()
-                .any(|profile| profile.name == name && profile.is_running());
-            let running_emulators = profiles
-                .iter()
-                .filter(|profile| profile.is_running())
-                .count();
-            let sample = match tools.scope_cpu_stat(&scope_unit) {
-                Ok(sample) => sample,
-                Err(error) => {
-                    if !profile_is_running {
-                        break;
-                    }
-                    if let Ok(mut runtime) = shared.lock() {
-                        runtime.log(
-                            "warning",
-                            format!("Stopped adaptive CPU control for {name}: {error}"),
-                        );
-                    }
-                    break;
-                }
-            };
-            let host_stats = host_monitor.sample();
             let starting = matches!(
                 status.phase,
                 DevicePhase::Admitting
@@ -1127,12 +1108,15 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                     | DevicePhase::Booting
                     | DevicePhase::Settling
             );
-            let startup_decision =
-                startup_thermal_decision(sample.quota_percent, host_stats.cpu_temperature_c);
-            if startup_decision == ThermalDecision::Stop
-                || host_stats
-                    .cpu_temperature_c
-                    .is_some_and(|temperature| temperature.is_finite() && temperature >= 90.0)
+            if !starting && !cpu_control_requires_device_discovery(status.phase) {
+                break;
+            }
+            // Thermal safety is sampled before ADB discovery or cgroup accounting.
+            // A hung emulator probe therefore cannot delay the 90 C stop boundary.
+            let host_stats = host_monitor.sample();
+            if host_stats
+                .cpu_temperature_c
+                .is_some_and(|temperature| temperature.is_finite() && temperature >= 90.0)
             {
                 let _ = tools.stop_scope_and_wait(&scope_unit);
                 if let Some(port) = port {
@@ -1159,6 +1143,50 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                 }
                 break;
             }
+
+            let (profile_is_running, running_emulators) =
+                if cpu_control_requires_device_discovery(status.phase) {
+                    let profiles = tools.discover_profiles();
+                    (
+                        profiles
+                            .iter()
+                            .any(|profile| profile.name == name && profile.is_running()),
+                        profiles
+                            .iter()
+                            .filter(|profile| profile.is_running())
+                            .count(),
+                    )
+                } else {
+                    (true, 1)
+                };
+            let sample = match tools.scope_cpu_stat(&scope_unit) {
+                Ok(sample) => {
+                    scope_stat_failures = 0;
+                    sample
+                }
+                Err(error) => {
+                    scope_stat_failures = scope_stat_failures.saturating_add(1);
+                    if starting && scope_stat_failures < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            CPU_CONTROL_SAMPLE_SECONDS,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    if !profile_is_running {
+                        break;
+                    }
+                    if let Ok(mut runtime) = shared.lock() {
+                        runtime.log(
+                            "warning",
+                            format!("Stopped adaptive CPU control for {name}: {error}"),
+                        );
+                    }
+                    break;
+                }
+            };
+            let startup_decision =
+                startup_thermal_decision(sample.quota_percent, host_stats.cpu_temperature_c);
 
             let desired_quota = if starting {
                 if host_stats
@@ -1763,9 +1791,9 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 mod tests {
     use super::{
         CPU_CONTROL_SAMPLE_SECONDS, STARTUP_CPU_QUOTA_PERCENT, STARTUP_SETTLE_SECONDS,
-        classify_supervisor_observation, enforce_launch_admission, launch_args,
-        launch_block_reason, new_cpu_controller_candidates, port_readiness_from_state,
-        settle_after_boot_with, validate_profile_options,
+        classify_supervisor_observation, cpu_control_requires_device_discovery,
+        enforce_launch_admission, launch_args, launch_block_reason, new_cpu_controller_candidates,
+        port_readiness_from_state, settle_after_boot_with, validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
     use crate::monitor::HostMonitor;
@@ -1872,6 +1900,21 @@ mod tests {
     fn adaptive_cpu_control_starts_conservatively_and_reacts_quickly() {
         assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 80);
         assert_eq!(CPU_CONTROL_SAMPLE_SECONDS, 1);
+    }
+
+    #[test]
+    fn startup_thermal_sampling_never_waits_for_adb_discovery() {
+        for phase in [
+            crate::supervisor::DevicePhase::Admitting,
+            crate::supervisor::DevicePhase::Launching,
+            crate::supervisor::DevicePhase::Booting,
+            crate::supervisor::DevicePhase::Settling,
+        ] {
+            assert!(!cpu_control_requires_device_discovery(phase));
+        }
+        assert!(cpu_control_requires_device_discovery(
+            crate::supervisor::DevicePhase::Ready
+        ));
     }
 
     #[test]
