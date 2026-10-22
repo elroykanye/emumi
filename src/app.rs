@@ -2,6 +2,7 @@ use crate::{
     android::AndroidTools,
     config::AppConfig,
     cpu_policy::CpuQuotaPolicy,
+    manager_guard::ManagerGuard,
     model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
     netsimd_log::{self, GuardOutcome},
@@ -17,8 +18,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -41,6 +40,7 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiMessage>)>;
 pub struct EmuMiApp;
 
 struct Runtime {
+    _manager_guard: ManagerGuard,
     config: AppConfig,
     logs: Vec<ApiLog>,
     monitor: HostMonitor,
@@ -125,9 +125,11 @@ struct CloneRequest {
 
 impl EmuMiApp {
     pub async fn start_server() -> Result<String, Box<dyn std::error::Error>> {
+        let manager_guard = ManagerGuard::acquire()?;
         let config = AppConfig::load();
         let supervisor = DeviceSupervisor::new(config.desired_running_profiles.clone());
         let runtime = Arc::new(Mutex::new(Runtime {
+            _manager_guard: manager_guard,
             config,
             logs: vec![ApiLog::new("success", "EmuMi is ready")],
             monitor: HostMonitor::default(),
@@ -158,12 +160,12 @@ impl EmuMiApp {
             .route("/api/ports/{port}/stop", post(stop_port))
             .route("/api/ports/{port}/readiness", get(port_readiness))
             .route("/api/settings", post(save_settings))
-            .with_state(runtime);
+            .with_state(Arc::clone(&runtime));
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let url = format!("http://{address}");
-        write_api_endpoint(&url)?;
+        runtime.lock().unwrap()._manager_guard.publish_endpoint(&url)?;
         tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("EmuMi server stopped: {error}");
@@ -1422,16 +1424,6 @@ fn enforce_launch_admission_with(
     sample: impl FnOnce() -> HostStats,
 ) -> Result<LaunchAdmission, String> {
     launch_block_reason(&sample()).map_or_else(|| Ok(LaunchAdmission::granted()), Err)
-}
-
-fn write_api_endpoint(url: &str) -> std::io::Result<()> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .ok_or_else(|| std::io::Error::other("HOME is not set"))?;
-    let directory = base.join("emumi");
-    fs::create_dir_all(&directory)?;
-    fs::write(directory.join("api-url"), format!("{url}\n"))
 }
 
 fn display_dimensions(_picture: PicturePreset) -> (u16, u16) {
