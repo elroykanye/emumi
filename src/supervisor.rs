@@ -157,6 +157,9 @@ impl DeviceSupervisor {
         manual: bool,
     ) -> Result<u64, String> {
         let entry = self.entries.entry(profile.to_owned()).or_default();
+        if entry.status.phase == DevicePhase::ThermalHold {
+            return Err("Android is in Thermal Hold until three readings are below 75 C".into());
+        }
         if entry.status.desired_running
             && matches!(
                 entry.status.phase,
@@ -317,6 +320,23 @@ impl DeviceSupervisor {
         true
     }
 
+    pub fn adopt_scope(&mut self, profile: &str, scope: String) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if !entry.status.desired_running {
+            return false;
+        }
+        match entry.status.scope.as_deref() {
+            Some(existing) => existing == scope,
+            None => {
+                entry.status.scope = Some(scope.clone());
+                entry.recovery_scope = Some(scope);
+                true
+            }
+        }
+    }
+
     pub fn mark_launching(
         &mut self,
         profile: &str,
@@ -421,8 +441,7 @@ impl DeviceSupervisor {
         entry.status.snapshot_state = Some("cold_retry_used".into());
         entry.status.last_failure = Some("Failed default_boot snapshot quarantined".into());
         entry.status.next_retry_at = Some(now);
-        entry.recovery_scope = entry.status.scope.take();
-        entry.status.pid = None;
+        entry.recovery_scope = entry.status.scope.clone();
         true
     }
 
@@ -514,6 +533,7 @@ impl DeviceSupervisor {
                             | DevicePhase::Booting
                             | DevicePhase::Settling
                             | DevicePhase::HalfOpen
+                            | DevicePhase::ThermalHold
                     )
                 });
                 if !startup_phase {
@@ -881,5 +901,49 @@ mod tests {
         supervisor.mark_settling("Device_4", generation);
         supervisor.observe("Device_4", Observation::Healthy, 2);
         assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Settling);
+    }
+
+    #[test]
+    fn thermal_hold_rejects_health_and_manual_start_until_cooldown() {
+        let mut supervisor = DeviceSupervisor::default();
+        let generation = supervisor.begin_admission("Device_4", 0, true).unwrap();
+        supervisor.mark_launching(
+            "Device_4",
+            generation,
+            "emumi-Device_4-123.scope".into(),
+            12345,
+        );
+        supervisor.enter_thermal_hold("Device_4", generation, 95.0, 1);
+
+        supervisor.observe("Device_4", Observation::Healthy, 2);
+        assert_eq!(
+            supervisor.status("Device_4").phase,
+            DevicePhase::ThermalHold
+        );
+        assert!(supervisor.begin_admission("Device_4", 2, true).is_err());
+        assert!(!supervisor.observe_cool_sample("Device_4", 74.0, 3));
+        assert!(!supervisor.observe_cool_sample("Device_4", 74.0, 4));
+        assert!(supervisor.observe_cool_sample("Device_4", 74.0, 5));
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Backoff);
+    }
+
+    #[test]
+    fn snapshot_recovery_retains_scope_and_pid_until_cleanup_proof() {
+        let mut supervisor = DeviceSupervisor::default();
+        let generation = supervisor.begin_admission("Device_4", 0, true).unwrap();
+        supervisor.mark_launching(
+            "Device_4",
+            generation,
+            "emumi-Device_4-123.scope".into(),
+            12345,
+        );
+        supervisor.mark_booting("Device_4", generation);
+
+        assert!(supervisor.schedule_snapshot_recovery("Device_4", generation, 1));
+        assert_eq!(
+            supervisor.status("Device_4").scope.as_deref(),
+            Some("emumi-Device_4-123.scope")
+        );
+        assert_eq!(supervisor.status("Device_4").pid, Some(12345));
     }
 }

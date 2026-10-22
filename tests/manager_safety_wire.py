@@ -34,7 +34,18 @@ def run_case(mode: str) -> dict:
     ):
         path.mkdir(parents=True, exist_ok=True)
     executable(sdk / "emulator/emulator", 'printf "Device_4\\n"\n')
-    executable(sdk / "platform-tools/adb", "exit 0\n")
+    if mode in {"thermal", "adopt", "restart"}:
+        executable(
+            sdk / "platform-tools/adb",
+            '''case "$*" in
+devices) printf 'List of devices attached\\nemulator-5554\\tdevice\\n';;
+*'emu avd name'*) printf 'Device_4\\nOK\\n';;
+*sys.boot_completed*) printf '1\\n';;
+esac
+''',
+        )
+    else:
+        executable(sdk / "platform-tools/adb", "exit 0\n")
     executable(sdk / "cmdline-tools/latest/bin/avdmanager", "exit 0\n")
     executable(bindir / "systemd-run", "exit 0\n")
     executable(bindir / "prlimit", "exit 0\n")
@@ -48,6 +59,7 @@ case "$*" in
 esac
 ''',
     )
+    phase = {"thermal": "thermal_hold", "restart": "booting"}.get(mode, "ready")
     config = {
         "android_sdk_path": str(sdk),
         "policy_version": 2,
@@ -56,17 +68,17 @@ esac
         "lifecycle_states": {
             "Device_4": {
                 "status": {
-                    "phase": "ready",
+                    "phase": phase,
                     "desired_running": True,
                     "generation": 1,
                     "stop_requested": False,
                     "consecutive_failures": 0,
-                    "next_retry_at": None,
-                    "last_failure": None,
-                    "scope": "emumi-Device_4-123.scope",
-                    "pid": 999999,
+                    "next_retry_at": int(time.time()) + 30 if mode == "thermal" else None,
+                    "last_failure": "Thermal stop at 95 C" if mode == "thermal" else None,
+                    "scope": None if mode == "adopt" else "emumi-Device_4-123.scope",
+                    "pid": None if mode == "adopt" else 999999,
                     "cpu_quota_percent": 80,
-                    "cpu_temperature_c": 60.0,
+                    "cpu_temperature_c": 95.0 if mode == "thermal" else 60.0,
                     "snapshot_state": None,
                 }
             }
@@ -121,6 +133,30 @@ esac
             assert saved["next_retry_at"] == current["next_retry_at"]
             return {"phase": saved["phase"], "retry": saved["next_retry_at"]}
 
+        if mode == "thermal":
+            time.sleep(0.5)
+            status = request("/api/state")["device_supervision"]["Device_4"]
+            assert status["phase"] == "thermal_hold"
+            return {"phase": status["phase"]}
+
+        if mode == "restart":
+            time.sleep(32)
+            status = request("/api/state")["device_supervision"]["Device_4"]
+            readiness = request("/api/ports/5554/readiness")
+            assert status["phase"] == "ready"
+            assert readiness["ready"] is True
+            return {"phase": status["phase"], "ready": readiness["ready"]}
+
+        if mode == "adopt":
+            time.sleep(0.5)
+            request("/api/profiles/Device_4/stop", True)
+            time.sleep(0.5)
+            status = request("/api/state")["device_supervision"]["Device_4"]
+            calls = (root / "calls").read_text()
+            assert "--user stop emumi-Device_4-123.scope" in calls
+            assert status["scope"] == "emumi-Device_4-123.scope"
+            return {"phase": status["phase"], "ownership_retained": True}
+
         request("/api/profiles/Device_4/stop", True)
         time.sleep(0.7)
         status = request("/api/state")["device_supervision"]["Device_4"]
@@ -136,5 +172,8 @@ esac
         process.wait(timeout=5)
 
 
-results = {mode: run_case(mode) for mode in ("cleanup", "persistence", "mutex")}
+results = {
+    mode: run_case(mode)
+    for mode in ("cleanup", "persistence", "mutex", "thermal", "adopt", "restart")
+}
 print("PASS manager safety wire " + json.dumps(results, sort_keys=True))

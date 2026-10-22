@@ -256,6 +256,7 @@ fn spawn_device_supervisor(runtime: Shared) {
             let host_temperature = HostMonitor::default().sample().cpu_temperature_c;
             let now = now_seconds();
             let mut observations = Vec::new();
+            let mut restored_startups = Vec::new();
             for name in desired {
                 let running = profiles
                     .iter()
@@ -270,6 +271,20 @@ fn spawn_device_supervisor(runtime: Shared) {
                 let phase = phases.get(&name).map(|status| status.phase);
                 let running = running.is_some();
                 let boot_completed = running && tools.profile_boot_completed(&name);
+                if boot_completed
+                    && !starting.contains(&name)
+                    && matches!(
+                        phase,
+                        Some(DevicePhase::Admitting)
+                            | Some(DevicePhase::Launching)
+                            | Some(DevicePhase::Booting)
+                            | Some(DevicePhase::Settling)
+                            | Some(DevicePhase::HalfOpen)
+                    )
+                    && let Some(status) = phases.get(&name)
+                {
+                    restored_startups.push((name.clone(), status.generation, scope.clone()));
+                }
                 let Some(observation) = classify_supervisor_observation(
                     running,
                     boot_completed,
@@ -283,13 +298,29 @@ fn spawn_device_supervisor(runtime: Shared) {
             }
 
             let had_observations = !observations.is_empty();
-            let (actions, config_to_save) = match runtime.lock() {
+            let (actions, config_to_save, resumed) = match runtime.lock() {
                 Ok(mut runtime) => {
                     for (name, scope, observation) in observations {
                         if let Some(scope) = scope {
                             runtime.profile_scopes.insert(name.clone(), scope);
+                            if let Some(owned_scope) = runtime.profile_scopes.get(&name).cloned() {
+                                runtime.supervisor.adopt_scope(&name, owned_scope);
+                            }
                         }
                         runtime.supervisor.observe(&name, observation, now);
+                    }
+                    let mut resumed = Vec::new();
+                    for (name, generation, scope) in restored_startups {
+                        if runtime.starting_profiles.contains(&name)
+                            || runtime.supervisor.generation(&name) != Some(generation)
+                            || !runtime.supervisor.is_desired(&name)
+                        {
+                            continue;
+                        }
+                        runtime.starting_profiles.insert(name.clone());
+                        runtime.startup_generations.insert(name.clone(), generation);
+                        runtime.supervisor.mark_settling(&name, generation);
+                        resumed.push((name, generation, scope));
                     }
                     let mut thermal_changed = false;
                     if let Some(temperature) = host_temperature {
@@ -303,14 +334,20 @@ fn spawn_device_supervisor(runtime: Shared) {
                         }
                     }
                     let actions = runtime.supervisor.due_actions(now);
-                    let config = (had_observations || thermal_changed || !actions.is_empty())
-                        .then(|| runtime.lifecycle_config_snapshot());
-                    (actions, config)
+                    let config = (had_observations
+                        || thermal_changed
+                        || !actions.is_empty()
+                        || !resumed.is_empty())
+                    .then(|| runtime.lifecycle_config_snapshot());
+                    (actions, config, resumed)
                 }
                 Err(_) => return,
             };
             if let Some(config) = config_to_save {
                 let _ = config.save();
+            }
+            for (profile, generation, scope) in resumed {
+                watch_profile_start(Arc::clone(&runtime), profile, generation, scope);
             }
 
             for action in actions {
