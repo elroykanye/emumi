@@ -234,6 +234,7 @@ impl DeviceSupervisor {
         entry.status.next_retry_at = None;
         entry.status.consecutive_failures = 0;
         entry.status.last_failure = None;
+        entry.status.snapshot_state = None;
         entry.unhealthy_samples = 0;
         entry.recovery_scope = None;
         entry.boot_started_at = None;
@@ -390,6 +391,7 @@ impl DeviceSupervisor {
         entry.status.next_retry_at = None;
         entry.status.consecutive_failures = 0;
         entry.status.last_failure = None;
+        entry.status.snapshot_state = None;
         entry.unhealthy_samples = 0;
         entry.cool_samples = 0;
         entry.boot_started_at = None;
@@ -543,6 +545,14 @@ impl DeviceSupervisor {
             Observation::Booting { scope } => {
                 let entry = self.entries.entry(profile.to_owned()).or_default();
                 if !entry.status.desired_running {
+                    return;
+                }
+                if matches!(
+                    entry.status.phase,
+                    DevicePhase::Backoff | DevicePhase::CircuitOpen | DevicePhase::SnapshotRecovery
+                ) && entry.status.next_retry_at.is_some()
+                    && (entry.status.scope.is_some() || entry.recovery_scope.is_some())
+                {
                     return;
                 }
                 let started_at = *entry.boot_started_at.get_or_insert(now);
@@ -739,6 +749,21 @@ mod tests {
                 .unwrap()
                 .contains("boot deadline")
         );
+        supervisor.observe(
+            "Device_1",
+            Observation::Booting {
+                scope: Some("emumi-Device_1-100.scope".into()),
+            },
+            132,
+        );
+        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Backoff);
+        assert_eq!(
+            supervisor.due_actions(161),
+            vec![SupervisorAction::Recover {
+                profile: "Device_1".into(),
+                scope: Some("emumi-Device_1-100.scope".into()),
+            }]
+        );
     }
 
     #[test]
@@ -871,6 +896,9 @@ mod tests {
         assert_eq!(supervisor.due_actions(10).len(), 1);
         let retry_generation = supervisor.status("Device_4").generation;
         assert!(!supervisor.schedule_snapshot_recovery("Device_4", retry_generation, 12));
+        assert!(supervisor.complete_ready("Device_4", retry_generation));
+        assert_eq!(supervisor.status("Device_4").snapshot_state, None);
+        assert!(supervisor.schedule_snapshot_recovery("Device_4", retry_generation, 13));
     }
 
     #[test]

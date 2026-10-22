@@ -1,5 +1,5 @@
 use crate::{
-    android::{AndroidTools, scope_belongs_to_profile},
+    android::{AndroidTools, STARTUP_CPU_QUOTA_PERCENT, scope_belongs_to_profile},
     config::AppConfig,
     cpu_policy::{CpuQuotaPolicy, ThermalDecision, startup_thermal_decision},
     manager_guard::ManagerGuard,
@@ -28,10 +28,9 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const MAX_RUNNING_PROFILES: usize = 4;
 const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
 const STARTUP_SETTLE_SECONDS: u64 = 20;
-const STARTUP_CPU_QUOTA_PERCENT: u16 = 80;
 const CPU_CONTROL_SAMPLE_SECONDS: u64 = 1;
+const CRITICAL_THERMAL_SAMPLES: u8 = 3;
 const NETSIMD_LOG_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 const NETSIMD_LOG_CHECK_SECONDS: u64 = 5;
 
@@ -441,7 +440,11 @@ fn classify_supervisor_observation(
         return Some(Observation::Booting { scope });
     }
     if scope.is_some() {
-        return Some(Observation::Unresponsive { scope });
+        return if matches!(previous_phase, Some(DevicePhase::Ready)) {
+            Some(Observation::Unresponsive { scope })
+        } else {
+            Some(Observation::Booting { scope })
+        };
     }
     if matches!(previous_phase, Some(DevicePhase::Ready)) {
         return Some(Observation::Absent { scope: None });
@@ -1149,6 +1152,24 @@ fn cpu_control_requires_device_discovery(phase: DevicePhase) -> bool {
     phase == DevicePhase::Ready
 }
 
+fn thermal_emergency_confirmed(hot_samples: &mut u8, temperature_c: Option<f32>) -> bool {
+    if temperature_c.is_some_and(|temperature| temperature.is_finite() && temperature >= 90.0) {
+        *hot_samples = hot_samples.saturating_add(1);
+    } else {
+        *hot_samples = 0;
+    }
+    *hot_samples >= CRITICAL_THERMAL_SAMPLES
+}
+
+fn startup_heat_confirmed(hot_samples: &mut u8, temperature_c: Option<f32>) -> bool {
+    if temperature_c.is_some_and(|temperature| temperature.is_finite() && temperature >= 85.0) {
+        *hot_samples = hot_samples.saturating_add(1);
+    } else {
+        *hot_samples = 0;
+    }
+    *hot_samples >= CRITICAL_THERMAL_SAMPLES
+}
+
 fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<String>) {
     let Some(scope_unit) = scope_unit else {
         return;
@@ -1159,8 +1180,9 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
             .unwrap_or(1);
         let mut policy = CpuQuotaPolicy::new(STARTUP_CPU_QUOTA_PERCENT);
         let mut host_monitor = HostMonitor::default();
-        let mut cool_startup_samples = 0_u8;
         let mut scope_stat_failures = 0_u8;
+        let mut critical_hot_samples = 0_u8;
+        let mut startup_hot_samples = 0_u8;
         loop {
             let (tools, status) = {
                 let Ok(runtime) = shared.lock() else {
@@ -1188,9 +1210,7 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
             // Thermal safety is sampled before ADB discovery or cgroup accounting.
             // A hung emulator probe therefore cannot delay the 90 C stop boundary.
             let host_stats = host_monitor.sample();
-            if host_stats
-                .cpu_temperature_c
-                .is_some_and(|temperature| temperature.is_finite() && temperature >= 90.0)
+            if thermal_emergency_confirmed(&mut critical_hot_samples, host_stats.cpu_temperature_c)
             {
                 let stopped = tools
                     .terminate_scope_and_wait(&scope_unit, false)
@@ -1276,27 +1296,16 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                     break;
                 }
             };
-            let startup_decision =
-                startup_thermal_decision(sample.quota_percent, host_stats.cpu_temperature_c);
+            let startup_decision = if starting
+                && !startup_heat_confirmed(&mut startup_hot_samples, host_stats.cpu_temperature_c)
+            {
+                ThermalDecision::Keep
+            } else {
+                startup_thermal_decision(sample.quota_percent, host_stats.cpu_temperature_c)
+            };
 
             let desired_quota = if starting {
-                if host_stats
-                    .cpu_temperature_c
-                    .is_some_and(|temperature| temperature < 75.0)
-                {
-                    cool_startup_samples = cool_startup_samples.saturating_add(1);
-                } else {
-                    cool_startup_samples = 0;
-                }
                 match startup_decision {
-                    ThermalDecision::Quota(percent) if percent > sample.quota_percent => {
-                        if cool_startup_samples >= 5 {
-                            cool_startup_samples = 0;
-                            Some(percent)
-                        } else {
-                            None
-                        }
-                    }
                     ThermalDecision::Quota(percent) => Some(percent),
                     ThermalDecision::Keep | ThermalDecision::Stop => None,
                 }
@@ -1863,18 +1872,6 @@ fn launch_block_reason(host: &HostStats) -> Option<String> {
                 .into(),
         );
     }
-    match host.cpu_temperature_c {
-        Some(temperature) if temperature.is_finite() && temperature < MAX_LAUNCH_TEMPERATURE_C => {}
-        Some(temperature) if temperature.is_finite() => {
-            return Some("CPU temperature is at or above 90 C; let the computer cool before starting another Android".into());
-        }
-        _ => {
-            return Some(
-                "EmuMi could not verify CPU temperature; restore hardware monitoring before starting another Android"
-                    .into(),
-            );
-        }
-    }
     None
 }
 
@@ -1929,7 +1926,7 @@ mod tests {
         classify_supervisor_observation, cpu_control_requires_device_discovery,
         enforce_launch_admission, graceful_stop_allowed, launch_args, launch_block_reason,
         new_cpu_controller_candidates, port_readiness_from_state, settle_after_boot_with,
-        validate_profile_options,
+        startup_heat_confirmed, thermal_emergency_confirmed, validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
     use crate::monitor::HostMonitor;
@@ -1952,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_admission_protects_host_memory_and_temperature() {
+    fn launch_admission_protects_host_memory_without_blocking_on_cpu_temperature() {
         let safe = HostStats {
             memory_available_bytes: 9 * 1024 * 1024 * 1024,
             cpu_temperature_c: Some(89.9),
@@ -1987,28 +1984,20 @@ mod tests {
             cpu_temperature_c: Some(90.0),
             ..safe
         };
-        assert!(launch_block_reason(&too_hot).unwrap().contains("90"));
+        assert_eq!(launch_block_reason(&too_hot), None);
 
         let missing_temperature = HostStats {
             memory_available_bytes: 12 * 1024 * 1024 * 1024,
             cpu_temperature_c: None,
             ..HostStats::default()
         };
-        assert!(
-            launch_block_reason(&missing_temperature)
-                .unwrap()
-                .contains("could not verify")
-        );
+        assert_eq!(launch_block_reason(&missing_temperature), None);
 
         let invalid_temperature = HostStats {
             cpu_temperature_c: Some(f32::NAN),
             ..missing_temperature
         };
-        assert!(
-            launch_block_reason(&invalid_temperature)
-                .unwrap()
-                .contains("could not verify")
-        );
+        assert_eq!(launch_block_reason(&invalid_temperature), None);
     }
 
     #[test]
@@ -2050,7 +2039,7 @@ mod tests {
 
     #[test]
     fn adaptive_cpu_control_starts_conservatively_and_reacts_quickly() {
-        assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 80);
+        assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 120);
         assert_eq!(CPU_CONTROL_SAMPLE_SECONDS, 1);
     }
 
@@ -2070,6 +2059,26 @@ mod tests {
     }
 
     #[test]
+    fn thermal_emergency_requires_three_consecutive_hot_samples() {
+        let mut hot_samples = 0;
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(91.0)));
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(89.0)));
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(95.0)));
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(96.0)));
+        assert!(thermal_emergency_confirmed(&mut hot_samples, Some(97.0)));
+    }
+
+    #[test]
+    fn startup_throttling_requires_three_consecutive_hot_samples() {
+        let mut hot_samples = 0;
+        assert!(!startup_heat_confirmed(&mut hot_samples, Some(95.0)));
+        assert!(!startup_heat_confirmed(&mut hot_samples, Some(70.0)));
+        assert!(!startup_heat_confirmed(&mut hot_samples, Some(86.0)));
+        assert!(!startup_heat_confirmed(&mut hot_samples, Some(87.0)));
+        assert!(startup_heat_confirmed(&mut hot_samples, Some(88.0)));
+    }
+
+    #[test]
     fn a_running_device_whose_boot_probe_stalls_is_unresponsive_not_booting() {
         assert_eq!(
             classify_supervisor_observation(
@@ -2082,6 +2091,21 @@ mod tests {
             Some(crate::supervisor::Observation::Unresponsive {
                 scope: Some("emumi-Device_3-123.scope".into()),
             })
+        );
+    }
+
+    #[test]
+    fn restored_owned_scope_keeps_booting_while_adb_is_still_starting() {
+        let scope = Some("emumi-Device_1-456.scope".into());
+        assert_eq!(
+            classify_supervisor_observation(
+                false,
+                false,
+                false,
+                Some(crate::supervisor::DevicePhase::Backoff),
+                scope.clone(),
+            ),
+            Some(crate::supervisor::Observation::Booting { scope })
         );
     }
 

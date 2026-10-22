@@ -42,8 +42,6 @@ pub fn startup_thermal_decision(
         } else {
             ThermalDecision::Keep
         }
-    } else if temperature < 75.0 && current_percent < 120 {
-        ThermalDecision::Quota(current_percent.saturating_add(10).min(120))
     } else {
         ThermalDecision::Keep
     }
@@ -144,7 +142,7 @@ impl CpuQuotaPolicy {
             self.calm_samples = 0;
             if self.busy_samples >= 2 && self.current_percent < ceiling {
                 self.busy_samples = 0;
-                self.current_percent = self.current_percent.saturating_add(60).min(ceiling);
+                self.current_percent = self.current_percent.saturating_add(10).min(ceiling);
                 return Some(self.current_percent);
             }
         } else if throttled_ratio <= 0.02 {
@@ -207,7 +205,7 @@ mod tests {
         );
         assert_eq!(
             policy.observe(stat(200, 180, 2_600_000), 2, 8, 45.0, Some(70.0)),
-            Some(240)
+            Some(190)
         );
         assert_eq!(
             policy.observe(stat(250, 225, 3_400_000), 2, 8, 45.0, Some(70.0)),
@@ -215,7 +213,7 @@ mod tests {
         );
         assert_eq!(
             policy.observe(stat(300, 270, 4_200_000), 2, 8, 45.0, Some(70.0)),
-            Some(300)
+            Some(200)
         );
     }
 
@@ -231,6 +229,7 @@ mod tests {
             policy.observe(stat(150, 50, 800_000), 4, 8, 40.0, Some(65.0)),
             None
         );
+
         assert_eq!(
             policy.observe(stat(200, 100, 1_600_000), 4, 8, 40.0, Some(65.0)),
             None
@@ -360,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             policy.observe(stat(110, 98, 1_700_000), 2, 8, 40.0, Some(70.0)),
-            Some(240)
+            Some(190)
         );
     }
 
@@ -368,7 +367,7 @@ mod tests {
     fn startup_thermal_controller_uses_the_confirmed_tiers() {
         assert_eq!(
             startup_thermal_decision(80, Some(70.0)),
-            ThermalDecision::Quota(90)
+            ThermalDecision::Keep
         );
         assert_eq!(
             startup_thermal_decision(120, Some(70.0)),
@@ -387,5 +386,9 @@ mod tests {
             ThermalDecision::Stop
         );
         assert_eq!(startup_thermal_decision(80, None), ThermalDecision::Keep);
+        assert_eq!(
+            startup_thermal_decision(50, Some(70.0)),
+            ThermalDecision::Keep
+        );
     }
 }

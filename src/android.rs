@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const STARTUP_CPU_QUOTA_PERCENT: u16 = 120;
+
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn command_output_with_timeout(
@@ -854,6 +856,9 @@ impl AndroidTools {
     }
 
     pub fn stop_scope_and_wait(&self, scope: &str) -> Result<(), String> {
+        if !self.scope_is_active(scope)? {
+            return Ok(());
+        }
         self.stop_scope(scope)?;
         for _ in 0..20 {
             match self.scope_is_active(scope)? {
@@ -870,6 +875,9 @@ impl AndroidTools {
         }
         if !valid_scope_unit(scope) {
             return Err("Unsafe emulator scope name".into());
+        }
+        if !self.scope_is_active(scope)? {
+            return Ok(());
         }
         let systemctl = path_command("systemctl")
             .ok_or("systemctl is required to terminate an emulator scope")?;
@@ -1052,7 +1060,7 @@ fn systemd_scope_launch_spec(
         OsString::from(format!("--unit={unit}")),
     ];
     args.extend([
-        OsString::from("--property=CPUQuota=80%"),
+        OsString::from(format!("--property=CPUQuota={STARTUP_CPU_QUOTA_PERCENT}%")),
         OsString::from("--property=CPUWeight=25"),
     ]);
     if options.host_memory_policy {
@@ -1664,7 +1672,7 @@ mod tests {
         );
         assert!(
             spec.args
-                .contains(&OsString::from("--property=CPUQuota=80%"))
+                .contains(&OsString::from("--property=CPUQuota=120%"))
         );
         assert!(
             spec.args
@@ -1929,7 +1937,7 @@ mod tests {
         assert!(args.contains(&std::borrow::Cow::Borrowed(
             "--property=MemorySwapMax=1024M"
         )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=80%")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=120%")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
         assert!(!args.contains(&std::borrow::Cow::Borrowed("--property=LimitCORE=0")));
