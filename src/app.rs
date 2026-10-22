@@ -31,6 +31,7 @@ const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const STARTUP_SETTLE_SECONDS: u64 = 20;
 const CPU_CONTROL_SAMPLE_SECONDS: u64 = 1;
 const CRITICAL_THERMAL_SAMPLES: u8 = 3;
+const EMERGENCY_STOP_TEMPERATURE_C: f32 = 98.0;
 const NETSIMD_LOG_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 const NETSIMD_LOG_CHECK_SECONDS: u64 = 5;
 
@@ -137,6 +138,7 @@ impl EmuMiApp {
         } else {
             DeviceSupervisor::restore(config.lifecycle_states.clone())
         };
+        let queued_profiles = restored_queued_profiles(&supervisor);
         let runtime = Arc::new(Mutex::new(Runtime {
             _manager_guard: manager_guard,
             tools,
@@ -145,7 +147,7 @@ impl EmuMiApp {
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
             startup_generations: BTreeMap::new(),
-            queued_profiles: VecDeque::new(),
+            queued_profiles,
             memory_warnings: BTreeMap::new(),
             cpu_controller_scopes: BTreeSet::new(),
             profile_scopes: BTreeMap::new(),
@@ -282,7 +284,25 @@ fn spawn_device_supervisor(runtime: Shared) {
                     )
                     && let Some(status) = phases.get(&name)
                 {
-                    restored_startups.push((name.clone(), status.generation, scope.clone()));
+                    restored_startups.push((
+                        name.clone(),
+                        status.generation,
+                        scope.clone(),
+                        boot_completed,
+                    ));
+                } else if scope.is_some()
+                    && !starting.contains(&name)
+                    && matches!(
+                        phase,
+                        Some(DevicePhase::Admitting)
+                            | Some(DevicePhase::Launching)
+                            | Some(DevicePhase::Booting)
+                            | Some(DevicePhase::Settling)
+                            | Some(DevicePhase::HalfOpen)
+                    )
+                    && let Some(status) = phases.get(&name)
+                {
+                    restored_startups.push((name.clone(), status.generation, scope.clone(), false));
                 }
                 let Some(observation) = classify_supervisor_observation(
                     running,
@@ -309,7 +329,7 @@ fn spawn_device_supervisor(runtime: Shared) {
                         runtime.supervisor.observe(&name, observation, now);
                     }
                     let mut resumed = Vec::new();
-                    for (name, generation, scope) in restored_startups {
+                    for (name, generation, scope, boot_completed) in restored_startups {
                         if runtime.starting_profiles.contains(&name)
                             || runtime.supervisor.generation(&name) != Some(generation)
                             || !runtime.supervisor.is_desired(&name)
@@ -318,7 +338,9 @@ fn spawn_device_supervisor(runtime: Shared) {
                         }
                         runtime.starting_profiles.insert(name.clone());
                         runtime.startup_generations.insert(name.clone(), generation);
-                        runtime.supervisor.mark_settling(&name, generation);
+                        if boot_completed {
+                            runtime.supervisor.mark_settling(&name, generation);
+                        }
                         resumed.push((name, generation, scope));
                     }
                     let mut thermal_changed = false;
@@ -418,9 +440,25 @@ fn spawn_device_supervisor(runtime: Shared) {
                     );
                 }
             }
+            let should_drain_restored_queue = runtime.lock().is_ok_and(|runtime| {
+                runtime.starting_profiles.is_empty() && !runtime.queued_profiles.is_empty()
+            });
+            if should_drain_restored_queue {
+                start_next_queued_profile(&runtime, StartupCompletion::TimedOut);
+            }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
+}
+
+fn restored_queued_profiles(supervisor: &DeviceSupervisor) -> VecDeque<String> {
+    supervisor
+        .statuses()
+        .into_iter()
+        .filter_map(|(name, status)| {
+            (status.desired_running && status.phase == DevicePhase::Queued).then_some(name)
+        })
+        .collect()
 }
 
 fn classify_supervisor_observation(
@@ -1153,7 +1191,9 @@ fn cpu_control_requires_device_discovery(phase: DevicePhase) -> bool {
 }
 
 fn thermal_emergency_confirmed(hot_samples: &mut u8, temperature_c: Option<f32>) -> bool {
-    if temperature_c.is_some_and(|temperature| temperature.is_finite() && temperature >= 90.0) {
+    if temperature_c.is_some_and(|temperature| {
+        temperature.is_finite() && temperature >= EMERGENCY_STOP_TEMPERATURE_C
+    }) {
         *hot_samples = hot_samples.saturating_add(1);
     } else {
         *hot_samples = 0;
@@ -1208,7 +1248,7 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                 break;
             }
             // Thermal safety is sampled before ADB discovery or cgroup accounting.
-            // A hung emulator probe therefore cannot delay the 90 C stop boundary.
+            // A hung emulator probe therefore cannot delay an emergency stop.
             let host_stats = host_monitor.sample();
             if thermal_emergency_confirmed(&mut critical_hot_samples, host_stats.cpu_temperature_c)
             {
@@ -1226,7 +1266,9 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                     runtime.supervisor.enter_thermal_hold(
                         &name,
                         generation,
-                        host_stats.cpu_temperature_c.unwrap_or(90.0),
+                        host_stats
+                            .cpu_temperature_c
+                            .unwrap_or(EMERGENCY_STOP_TEMPERATURE_C),
                         now_seconds(),
                     );
                     match stopped {
@@ -1240,7 +1282,9 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                             runtime.profile_scopes.remove(&name);
                             runtime.log(
                                 "warning",
-                                format!("Stopped {name} at the 90 C thermal limit"),
+                                format!(
+                                    "Stopped {name} at the {EMERGENCY_STOP_TEMPERATURE_C:.0} C emergency limit"
+                                ),
                             );
                         }
                         Err(error) => runtime.log(
@@ -1307,7 +1351,7 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
             let desired_quota = if starting {
                 match startup_decision {
                     ThermalDecision::Quota(percent) => Some(percent),
-                    ThermalDecision::Keep | ThermalDecision::Stop => None,
+                    ThermalDecision::Keep => None,
                 }
             } else {
                 policy.observe(
@@ -1925,13 +1969,17 @@ mod tests {
         CPU_CONTROL_SAMPLE_SECONDS, STARTUP_CPU_QUOTA_PERCENT, STARTUP_SETTLE_SECONDS,
         classify_supervisor_observation, cpu_control_requires_device_discovery,
         enforce_launch_admission, graceful_stop_allowed, launch_args, launch_block_reason,
-        new_cpu_controller_candidates, port_readiness_from_state, settle_after_boot_with,
-        startup_heat_confirmed, thermal_emergency_confirmed, validate_profile_options,
+        new_cpu_controller_candidates, port_readiness_from_state, restored_queued_profiles,
+        settle_after_boot_with, startup_heat_confirmed, thermal_emergency_confirmed,
+        validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
     use crate::monitor::HostMonitor;
     use crate::supervisor::DevicePhase;
-    use std::{collections::BTreeSet, fs};
+    use std::{
+        collections::{BTreeSet, VecDeque},
+        fs,
+    };
 
     #[test]
     fn snapshot_saving_stop_is_allowed_only_after_ready() {
@@ -2061,11 +2109,11 @@ mod tests {
     #[test]
     fn thermal_emergency_requires_three_consecutive_hot_samples() {
         let mut hot_samples = 0;
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(91.0)));
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(89.0)));
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(95.0)));
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(96.0)));
-        assert!(thermal_emergency_confirmed(&mut hot_samples, Some(97.0)));
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(99.0)));
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(97.0)));
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(98.0)));
+        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(99.0)));
+        assert!(thermal_emergency_confirmed(&mut hot_samples, Some(100.0)));
     }
 
     #[test]
@@ -2106,6 +2154,18 @@ mod tests {
                 scope.clone(),
             ),
             Some(crate::supervisor::Observation::Booting { scope })
+        );
+    }
+
+    #[test]
+    fn persisted_queue_is_rebuilt_after_manager_restart() {
+        let mut supervisor = crate::supervisor::DeviceSupervisor::new(BTreeSet::new());
+        supervisor.request_start("Device_1", 0);
+        supervisor.mark_queued("Device_1");
+
+        assert_eq!(
+            restored_queued_profiles(&supervisor),
+            VecDeque::from(["Device_1".to_owned()])
         );
     }
 

@@ -18,7 +18,6 @@ pub struct CpuQuotaPolicy {
 pub enum ThermalDecision {
     Keep,
     Quota(u16),
-    Stop,
 }
 
 pub fn startup_thermal_decision(
@@ -28,9 +27,7 @@ pub fn startup_thermal_decision(
     let Some(temperature) = temperature_c.filter(|value| value.is_finite()) else {
         return ThermalDecision::Keep;
     };
-    if temperature >= 90.0 {
-        ThermalDecision::Stop
-    } else if temperature >= 85.0 {
+    if temperature >= 85.0 {
         if current_percent != 50 {
             ThermalDecision::Quota(50)
         } else {
@@ -100,9 +97,14 @@ impl CpuQuotaPolicy {
             self.previous = Some(sample);
             self.busy_samples = 0;
             self.calm_samples = 0;
-            if self.current_percent > 80 {
-                self.current_percent = 80;
-                return Some(80);
+            let thermal_ceiling = if temperature_c.is_some_and(|value| value >= 90.0) {
+                50
+            } else {
+                80
+            };
+            if self.current_percent > thermal_ceiling {
+                self.current_percent = thermal_ceiling;
+                return Some(thermal_ceiling);
             }
             return None;
         }
@@ -306,21 +308,21 @@ mod tests {
     }
 
     #[test]
-    fn emergency_heat_immediately_forces_one_core_or_less() {
+    fn extreme_heat_immediately_forces_half_a_core() {
         let mut policy = CpuQuotaPolicy::new(240);
 
         assert_eq!(
             policy.observe(stat_at(240, 100, 90, 1_000_000), 2, 8, 45.0, Some(99.0)),
-            Some(80)
+            Some(50)
         );
         assert_eq!(
-            policy.observe(stat_at(80, 150, 145, 1_800_000), 2, 8, 45.0, Some(99.0)),
+            policy.observe(stat_at(50, 150, 145, 1_800_000), 2, 8, 45.0, Some(99.0)),
             None
         );
         for (periods, throttled_periods) in [(200, 195), (250, 245), (300, 295)] {
             assert_eq!(
                 policy.observe(
-                    stat_at(80, periods, throttled_periods, periods * 20_000),
+                    stat_at(50, periods, throttled_periods, periods * 20_000),
                     2,
                     8,
                     45.0,
@@ -383,7 +385,7 @@ mod tests {
         );
         assert_eq!(
             startup_thermal_decision(50, Some(90.0)),
-            ThermalDecision::Stop
+            ThermalDecision::Keep
         );
         assert_eq!(startup_thermal_decision(80, None), ThermalDecision::Keep);
         assert_eq!(

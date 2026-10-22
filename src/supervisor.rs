@@ -549,7 +549,11 @@ impl DeviceSupervisor {
                 }
                 if matches!(
                     entry.status.phase,
-                    DevicePhase::Backoff | DevicePhase::CircuitOpen | DevicePhase::SnapshotRecovery
+                    DevicePhase::Backoff
+                        | DevicePhase::CircuitOpen
+                        | DevicePhase::SnapshotRecovery
+                        | DevicePhase::ThermalHold
+                        | DevicePhase::Stopping
                 ) && entry.status.next_retry_at.is_some()
                     && (entry.status.scope.is_some() || entry.recovery_scope.is_some())
                 {
@@ -949,6 +953,17 @@ mod tests {
             DevicePhase::ThermalHold
         );
         assert!(supervisor.begin_admission("Device_4", 2, true).is_err());
+        supervisor.observe(
+            "Device_4",
+            Observation::Booting {
+                scope: Some("emumi-Device_4-stale.scope".into()),
+            },
+            3,
+        );
+        assert_eq!(
+            supervisor.status("Device_4").phase,
+            DevicePhase::ThermalHold
+        );
         assert!(!supervisor.observe_cool_sample("Device_4", 74.0, 3));
         assert!(!supervisor.observe_cool_sample("Device_4", 74.0, 4));
         assert!(supervisor.observe_cool_sample("Device_4", 74.0, 5));
