@@ -44,7 +44,6 @@ struct Runtime {
     _manager_guard: ManagerGuard,
     config: AppConfig,
     logs: Vec<ApiLog>,
-    monitor: HostMonitor,
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
     startup_generations: BTreeMap<String, u64>,
@@ -52,6 +51,10 @@ struct Runtime {
     memory_warnings: BTreeMap<String, String>,
     cpu_controller_scopes: BTreeSet<String>,
     profile_scopes: BTreeMap<String, String>,
+    cached_profiles: Vec<crate::model::AndroidProfile>,
+    cached_system_images: Vec<ImageDto>,
+    cached_device_stats: Vec<crate::model::DeviceHostStats>,
+    discovery_in_flight: bool,
     supervisor: DeviceSupervisor,
 }
 
@@ -78,7 +81,7 @@ struct AppState {
     logs: Vec<ApiLog>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ImageDto {
     package_id: String,
     label: String,
@@ -137,7 +140,6 @@ impl EmuMiApp {
             _manager_guard: manager_guard,
             config,
             logs: vec![ApiLog::new("success", "EmuMi is ready")],
-            monitor: HostMonitor::default(),
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
             startup_generations: BTreeMap::new(),
@@ -145,6 +147,10 @@ impl EmuMiApp {
             memory_warnings: BTreeMap::new(),
             cpu_controller_scopes: BTreeSet::new(),
             profile_scopes: BTreeMap::new(),
+            cached_profiles: Vec::new(),
+            cached_system_images: Vec::new(),
+            cached_device_stats: Vec::new(),
+            discovery_in_flight: false,
             supervisor,
         }));
         spawn_netsimd_log_guard(Arc::clone(&runtime));
@@ -408,20 +414,13 @@ impl Runtime {
         }
     }
 
-    fn persist_desired_profiles(&mut self) -> Result<(), String> {
-        self.lifecycle_config_snapshot()
-            .save()
-            .map(|_| ())
-            .map_err(|error| format!("Could not save device lifecycle state: {error}"))
-    }
-
     fn lifecycle_config_snapshot(&mut self) -> AppConfig {
         self.config.desired_running_profiles = self.supervisor.desired_profiles();
         self.config.lifecycle_states = self.supervisor.persisted_states();
         self.config.clone()
     }
 
-    fn ensure_profile_ports(&mut self, profile_names: &[String]) {
+    fn ensure_profile_ports(&mut self, profile_names: &[String]) -> bool {
         let mut used = BTreeSet::new();
         for name in profile_names {
             let options = self.config.profile_options.entry(name.clone()).or_default();
@@ -442,17 +441,14 @@ impl Runtime {
                 changed = true;
             }
         }
-        if changed {
-            let _ = self.config.save();
-        }
+        changed
     }
 
     fn next_profile_port(&self) -> Option<u16> {
         let active_profiles = self
-            .tools()
-            .discover_profiles()
-            .into_iter()
-            .map(|profile| profile.name)
+            .cached_profiles
+            .iter()
+            .map(|profile| profile.name.clone())
             .collect::<BTreeSet<_>>();
         let used = self
             .config
@@ -477,35 +473,63 @@ async fn script() -> impl IntoResponse {
 }
 
 async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
-    let tools = lock(&shared)?.tools();
-    let discovery_tools = tools.clone();
-    let (profiles, system_images, device_stats) = tokio::task::spawn_blocking(move || {
-        let profiles = discovery_tools.discover_profiles();
-        let system_images = discovery_tools
-            .installed_system_images()
-            .into_iter()
-            .map(|image| ImageDto {
-                label: image.label(),
-                package_id: image.package_id,
+    let (tools, should_refresh) = {
+        let mut runtime = lock(&shared)?;
+        let should_refresh = !runtime.discovery_in_flight;
+        if should_refresh {
+            runtime.discovery_in_flight = true;
+        }
+        (runtime.tools(), should_refresh)
+    };
+    if should_refresh {
+        let discovery_tools = tools.clone();
+        let refresh_shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let profiles = discovery_tools.discover_profiles();
+                let system_images = discovery_tools
+                    .installed_system_images()
+                    .into_iter()
+                    .map(|image| ImageDto {
+                        label: image.label(),
+                        package_id: image.package_id,
+                    })
+                    .collect();
+                let device_stats = sample_devices(&profiles);
+                (profiles, system_images, device_stats)
             })
-            .collect();
-        let device_stats = sample_devices(&profiles);
-        (profiles, system_images, device_stats)
-    })
-    .await
-    .map_err(|error| {
-        error_tuple(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Device discovery worker failed: {error}"),
-        )
-    })?;
+            .await;
+            if let Ok(mut runtime) = refresh_shared.lock() {
+                runtime.discovery_in_flight = false;
+                match result {
+                    Ok((profiles, system_images, device_stats)) => {
+                        let names = profiles
+                            .iter()
+                            .map(|profile| profile.name.clone())
+                            .collect::<Vec<_>>();
+                        let changed = runtime.ensure_profile_ports(&names);
+                        runtime.cached_profiles = profiles;
+                        runtime.cached_system_images = system_images;
+                        runtime.cached_device_stats = device_stats;
+                        if changed {
+                            let config = runtime.config.clone();
+                            drop(runtime);
+                            let _ = config.save();
+                        }
+                    }
+                    Err(error) => runtime.log(
+                        "warning",
+                        format!("Device discovery worker failed: {error}"),
+                    ),
+                }
+            }
+        });
+    }
+    let host_stats = HostMonitor::default().sample();
     let mut runtime = lock(&shared)?;
-    runtime.ensure_profile_ports(
-        &profiles
-            .iter()
-            .map(|profile| profile.name.clone())
-            .collect::<Vec<_>>(),
-    );
+    let profiles = runtime.cached_profiles.clone();
+    let system_images = runtime.cached_system_images.clone();
+    let device_stats = runtime.cached_device_stats.clone();
     let running_names = profiles
         .iter()
         .filter(|profile| profile.is_running())
@@ -514,6 +538,7 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
     runtime
         .rectangular_watchers
         .retain(|name| running_names.contains(name));
+    let mut rectangular_starts = Vec::new();
     for profile in &profiles {
         let rectangular = runtime
             .config
@@ -526,7 +551,7 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             && rectangular
             && runtime.rectangular_watchers.insert(profile.name.clone())
         {
-            tools.watch_rectangular_display_after_start(&profile.name);
+            rectangular_starts.push(profile.name.clone());
         }
     }
     let active_scopes = device_stats
@@ -590,11 +615,14 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             java: tools.java_home.is_some(),
             systemd_run: tools.systemd_run_available,
         },
-        stats: runtime.monitor.sample(),
+        stats: host_stats,
         device_stats,
         logs: runtime.logs.clone(),
     };
     drop(runtime);
+    for profile_name in rectangular_starts {
+        tools.watch_rectangular_display_after_start(&profile_name);
+    }
     for (profile_name, scope_unit) in new_cpu_controllers {
         schedule_adaptive_cpu_quota(Arc::clone(&shared), profile_name, Some(scope_unit));
     }
@@ -605,8 +633,7 @@ async fn create_profile(
     State(shared): State<Shared>,
     Json(request): Json<CreateRequest>,
 ) -> ApiResult<ApiMessage> {
-    let mut runtime = lock(&shared)?;
-    let tools = runtime.tools();
+    let tools = lock(&shared)?.tools();
     if tools
         .discover_profiles()
         .iter()
@@ -630,6 +657,7 @@ async fn create_profile(
     tools
         .create_profile(request.name.trim(), &request.device_id, &image)
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
+    let mut runtime = lock(&shared)?;
     let options = ProfileOptions {
         adb_port: runtime.next_profile_port(),
         ..ProfileOptions::default()
@@ -638,8 +666,15 @@ async fn create_profile(
         .config
         .profile_options
         .insert(request.name.trim().to_owned(), options);
-    let _ = runtime.config.save();
     runtime.log("success", format!("Created {}", request.name.trim()));
+    let config = runtime.config.clone();
+    drop(runtime);
+    config.save().map_err(|error| {
+        error_tuple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save the profile: {error}"),
+        )
+    })?;
     Ok(message("Android created"))
 }
 
@@ -1459,20 +1494,6 @@ async fn clone_profile(
     let clone_name = request.name.trim().to_owned();
     let (tools, mut options) = {
         let runtime = lock(&shared)?;
-        let profiles = runtime.tools().discover_profiles();
-        let source = profiles
-            .iter()
-            .find(|profile| profile.name == source_name)
-            .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Source Android not found"))?;
-        if source.is_running() {
-            return api_error(
-                StatusCode::CONFLICT,
-                "Stop the source Android before cloning it",
-            );
-        }
-        if profiles.iter().any(|profile| profile.name == clone_name) {
-            return api_error(StatusCode::CONFLICT, "That clone name is already in use");
-        }
         let options = runtime
             .config
             .profile_options
@@ -1485,6 +1506,20 @@ async fn clone_profile(
         }
         (runtime.tools(), options)
     };
+    let profiles = tools.discover_profiles();
+    let source = profiles
+        .iter()
+        .find(|profile| profile.name == source_name)
+        .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Source Android not found"))?;
+    if source.is_running() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "Stop the source Android before cloning it",
+        );
+    }
+    if profiles.iter().any(|profile| profile.name == clone_name) {
+        return api_error(StatusCode::CONFLICT, "That clone name is already in use");
+    }
 
     let source_for_copy = source_name.clone();
     let clone_for_copy = clone_name.clone();
@@ -1505,11 +1540,12 @@ async fn clone_profile(
         .config
         .profile_options
         .insert(clone_name.clone(), options);
-    runtime
-        .config
+    runtime.log("success", format!("Cloned {source_name} as {clone_name}"));
+    let config = runtime.config.clone();
+    drop(runtime);
+    config
         .save()
         .map_err(|error| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    runtime.log("success", format!("Cloned {source_name} as {clone_name}"));
     Ok(message(format!("{clone_name} cloned successfully")))
 }
 
@@ -1521,8 +1557,7 @@ async fn delete_profile(
     State(shared): State<Shared>,
     Path(name): Path<String>,
 ) -> ApiResult<ApiMessage> {
-    let mut runtime = lock(&shared)?;
-    let tools = runtime.tools();
+    let tools = lock(&shared)?.tools();
     if tools
         .discover_profiles()
         .iter()
@@ -1533,13 +1568,19 @@ async fn delete_profile(
     tools
         .delete_profile(&name)
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
+    let mut runtime = lock(&shared)?;
     runtime.supervisor.request_stop(&name);
     runtime.profile_scopes.remove(&name);
     runtime.config.profile_options.remove(&name);
-    runtime
-        .persist_desired_profiles()
-        .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
     runtime.log("info", format!("Deleted {name}"));
+    let config = runtime.lifecycle_config_snapshot();
+    drop(runtime);
+    config.save().map_err(|error| {
+        error_tuple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save device lifecycle state: {error}"),
+        )
+    })?;
     Ok(message("Android deleted"))
 }
 
@@ -1548,21 +1589,22 @@ async fn save_profile_settings(
     Path(name): Path<String>,
     Json(options): Json<ProfileOptions>,
 ) -> ApiResult<ApiMessage> {
-    let mut runtime = lock(&shared)?;
     validate_profile_options(&options)
         .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
     if options.window_scale.is_none() {
-        runtime
-            .tools()
+        let tools = { lock(&shared)?.tools() };
+        tools
             .forget_window_scale(&name)
             .map_err(|message| error_tuple(StatusCode::BAD_REQUEST, message))?;
     }
+    let mut runtime = lock(&shared)?;
     runtime.config.profile_options.insert(name.clone(), options);
-    runtime
-        .config
+    runtime.log("success", format!("Saved settings for {name}"));
+    let config = runtime.config.clone();
+    drop(runtime);
+    config
         .save()
         .map_err(|error| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    runtime.log("success", format!("Saved settings for {name}"));
     Ok(message("Profile settings saved"))
 }
 
@@ -1573,11 +1615,12 @@ async fn save_settings(
     let mut runtime = lock(&shared)?;
     runtime.config.android_sdk_path = settings.android_sdk_path.trim().to_owned();
     runtime.config.jdk_path = settings.jdk_path.trim().to_owned();
-    runtime
-        .config
+    runtime.log("success", "Tool paths saved");
+    let config = runtime.config.clone();
+    drop(runtime);
+    config
         .save()
         .map_err(|error| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    runtime.log("success", "Tool paths saved");
     Ok(message("Settings saved"))
 }
 

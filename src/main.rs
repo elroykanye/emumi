@@ -22,6 +22,11 @@ async fn main() {
         }
     };
 
+    if std::env::var_os("EMUMI_SERVER_ONLY").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        std::future::pending::<()>().await;
+        return;
+    }
+
     tauri::Builder::default()
         .setup(move |app| {
             WebviewWindowBuilder::new(
