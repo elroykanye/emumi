@@ -4,10 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
+    io::Write,
     path::PathBuf,
+    sync::Mutex,
 };
 
 const CURRENT_POLICY_VERSION: u32 = 2;
+static CONFIG_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -50,12 +53,22 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> io::Result<PathBuf> {
+        let _save_guard = CONFIG_SAVE_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("configuration save lock was poisoned"))?;
         let path = config_path().ok_or_else(|| io::Error::other("HOME is not set"))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let body = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        fs::write(&path, body)?;
+        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
         Ok(path)
     }
 
@@ -63,18 +76,20 @@ impl AppConfig {
         if self.policy_version >= CURRENT_POLICY_VERSION {
             return false;
         }
-        for options in self.profile_options.values_mut() {
-            options.picture = PicturePreset::Phone;
-            options.cores = 2;
-            options.memory_mb = 4096;
-            options.dpi = 240;
-            options.mute_audio = true;
-            options.headless_automation = true;
-            options.refresh_rate_hz = 30;
-            options.host_memory_policy = true;
-            options.memory_high_mb = 5632;
-            options.memory_max_mb = 6656;
-            options.memory_swap_max_mb = 1024;
+        if self.policy_version == 0 {
+            for options in self.profile_options.values_mut() {
+                options.picture = PicturePreset::Phone;
+                options.cores = 2;
+                options.memory_mb = 4096;
+                options.dpi = 240;
+                options.mute_audio = true;
+                options.headless_automation = true;
+                options.refresh_rate_hz = 30;
+                options.host_memory_policy = true;
+                options.memory_high_mb = 5632;
+                options.memory_max_mb = 6656;
+                options.memory_swap_max_mb = 1024;
+            }
         }
         self.policy_version = CURRENT_POLICY_VERSION;
         true
@@ -148,6 +163,21 @@ mod tests {
             decoded.desired_running_profiles,
             configured.desired_running_profiles
         );
+    }
+
+    #[test]
+    fn v1_lifecycle_migration_preserves_explicit_profile_preferences() {
+        let mut config: AppConfig = serde_json::from_str(
+            r#"{"policy_version":1,"profile_options":{"Device_4":{"cores":4,"memory_mb":6144,"headless_automation":false,"host_memory_policy":false}}}"#,
+        )
+        .unwrap();
+
+        assert!(config.migrate_policy());
+        assert_eq!(config.policy_version, CURRENT_POLICY_VERSION);
+        assert_eq!(config.profile_options["Device_4"].cores, 4);
+        assert_eq!(config.profile_options["Device_4"].memory_mb, 6144);
+        assert!(!config.profile_options["Device_4"].headless_automation);
+        assert!(!config.profile_options["Device_4"].host_memory_policy);
     }
 
     #[test]

@@ -59,7 +59,7 @@ pub enum SupervisorAction {
     },
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistedDeviceState {
     status: DeviceStatus,
     #[serde(default)]
@@ -127,6 +127,10 @@ impl DeviceSupervisor {
         self.entries
             .get(profile)
             .map(|entry| entry.status.generation)
+    }
+
+    pub fn status_snapshot(&self, profile: &str) -> Option<DeviceStatus> {
+        self.entries.get(profile).map(|entry| entry.status.clone())
     }
 
     pub fn persisted_states(&self) -> BTreeMap<String, PersistedDeviceState> {
@@ -232,13 +236,85 @@ impl DeviceSupervisor {
         entry.boot_started_at = None;
     }
 
-    pub fn mark_cleaned(&mut self, profile: &str) {
+    pub fn mark_cleaned(&mut self, profile: &str) -> bool {
         let entry = self.entries.entry(profile.to_owned()).or_default();
+        if entry.status.desired_running || !entry.status.stop_requested {
+            return false;
+        }
         entry.status.phase = DevicePhase::Cleaned;
         entry.status.scope = None;
         entry.status.pid = None;
         entry.recovery_scope = None;
         entry.status.phase = DevicePhase::Stopped;
+        true
+    }
+
+    pub fn cleanup_is_current(
+        &self,
+        profile: &str,
+        generation: u64,
+        scope: Option<&str>,
+        pid: Option<u32>,
+    ) -> bool {
+        self.entries.get(profile).is_some_and(|entry| {
+            entry.status.generation == generation
+                && !entry.status.desired_running
+                && entry.status.stop_requested
+                && entry.status.scope.as_deref() == scope
+                && entry.status.pid == pid
+        })
+    }
+
+    pub fn complete_cleanup(
+        &mut self,
+        profile: &str,
+        generation: u64,
+        scope: Option<&str>,
+        pid: Option<u32>,
+    ) -> bool {
+        if !self.cleanup_is_current(profile, generation, scope, pid) {
+            return false;
+        }
+        self.mark_cleaned(profile)
+    }
+
+    pub fn mark_cleanup_failed(
+        &mut self,
+        profile: &str,
+        generation: u64,
+        scope: Option<&str>,
+        pid: Option<u32>,
+        reason: impl Into<String>,
+    ) -> bool {
+        if !self.cleanup_is_current(profile, generation, scope, pid) {
+            return false;
+        }
+        let entry = self.entries.get_mut(profile).expect("checked entry");
+        entry.status.phase = DevicePhase::Stopping;
+        entry.status.last_failure = Some(reason.into());
+        true
+    }
+
+    pub fn confirm_ownership_gone(
+        &mut self,
+        profile: &str,
+        generation: u64,
+        scope: Option<&str>,
+        pid: Option<u32>,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if entry.status.generation != generation
+            || entry.status.scope.as_deref() != scope
+            || entry.status.pid != pid
+        {
+            return false;
+        }
+        entry.status.scope = None;
+        entry.status.pid = None;
+        entry.recovery_scope = None;
+        true
     }
 
     pub fn mark_launching(
@@ -327,8 +403,6 @@ impl DeviceSupervisor {
         entry.status.cpu_temperature_c = Some(temperature);
         entry.status.last_failure = Some(format!("Thermal stop at {temperature:.1} C"));
         entry.status.next_retry_at = Some(now.saturating_add(30));
-        entry.status.scope = None;
-        entry.status.pid = None;
         entry.cool_samples = 0;
         true
     }
@@ -431,7 +505,21 @@ impl DeviceSupervisor {
 
     pub fn observe(&mut self, profile: &str, observation: Observation, now: u64) {
         match observation {
-            Observation::Healthy => self.mark_running(profile),
+            Observation::Healthy => {
+                let startup_phase = self.entries.get(profile).is_some_and(|entry| {
+                    matches!(
+                        entry.status.phase,
+                        DevicePhase::Admitting
+                            | DevicePhase::Launching
+                            | DevicePhase::Booting
+                            | DevicePhase::Settling
+                            | DevicePhase::HalfOpen
+                    )
+                });
+                if !startup_phase {
+                    self.mark_running(profile);
+                }
+            }
             Observation::Booting { scope } => {
                 let entry = self.entries.entry(profile.to_owned()).or_default();
                 if !entry.status.desired_running {
@@ -763,5 +851,35 @@ mod tests {
         assert_eq!(supervisor.due_actions(10).len(), 1);
         let retry_generation = supervisor.status("Device_4").generation;
         assert!(!supervisor.schedule_snapshot_recovery("Device_4", retry_generation, 12));
+    }
+
+    #[test]
+    fn stale_stop_completion_cannot_clear_a_new_launch_generation() {
+        let mut supervisor = DeviceSupervisor::default();
+        let old = supervisor.begin_admission("Device_4", 0, true).unwrap();
+        supervisor.mark_launching("Device_4", old, "emumi-Device_4-100.scope".into(), 123);
+        supervisor.request_stop("Device_4");
+        let new = supervisor.begin_admission("Device_4", 1, true).unwrap();
+        supervisor.mark_launching("Device_4", new, "emumi-Device_4-200.scope".into(), 456);
+        supervisor.mark_booting("Device_4", new);
+
+        assert!(!supervisor.mark_cleaned("Device_4"));
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Booting);
+        assert_eq!(
+            supervisor.status("Device_4").scope.as_deref(),
+            Some("emumi-Device_4-200.scope")
+        );
+    }
+
+    #[test]
+    fn healthy_observation_cannot_bypass_startup_settling() {
+        let mut supervisor = DeviceSupervisor::default();
+        let generation = supervisor.begin_admission("Device_4", 0, true).unwrap();
+        supervisor.mark_booting("Device_4", generation);
+        supervisor.observe("Device_4", Observation::Healthy, 1);
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Booting);
+        supervisor.mark_settling("Device_4", generation);
+        supervisor.observe("Device_4", Observation::Healthy, 2);
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Settling);
     }
 }

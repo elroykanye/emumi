@@ -810,18 +810,6 @@ impl AndroidTools {
             .map_err(|error| format!("Could not update {}: {error}", path.display()))
     }
 
-    pub fn stop(&self, serial: &str) -> Result<(), String> {
-        let adb = self.adb.as_ref().ok_or("ADB was not found")?;
-        let status = Command::new(adb)
-            .args(["-s", serial, "emu", "kill"])
-            .status()
-            .map_err(|err| err.to_string())?;
-        status
-            .success()
-            .then_some(())
-            .ok_or_else(|| format!("ADB exited with {status}"))
-    }
-
     pub fn stop_scope(&self, scope: &str) -> Result<(), String> {
         let args = scope_stop_args(scope);
         if args.is_empty() {
@@ -840,29 +828,65 @@ impl AndroidTools {
             .ok_or_else(|| format!("systemd could not stop {scope}: {status}"))
     }
 
-    pub fn scope_is_active(&self, scope: &str) -> bool {
+    pub fn scope_is_active(&self, scope: &str) -> Result<bool, String> {
         let args = scope_active_args(scope);
         if args.is_empty() {
-            return false;
+            return Err("Unsafe emulator scope name".into());
         }
         let Some(systemctl) = path_command("systemctl") else {
-            return false;
+            return Err("systemctl was not found in PATH".into());
         };
-        Command::new(systemctl)
+        let status = Command::new(systemctl)
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|status| status.success())
+            .map_err(|error| format!("Could not check {scope}: {error}"))?;
+        if status.success() {
+            return Ok(true);
+        }
+        match status.code() {
+            Some(3 | 4) => Ok(false),
+            _ => Err(format!(
+                "systemd could not confirm whether {scope} is active: {status}"
+            )),
+        }
     }
 
     pub fn stop_scope_and_wait(&self, scope: &str) -> Result<(), String> {
         self.stop_scope(scope)?;
         for _ in 0..20 {
-            if !self.scope_is_active(scope) {
-                return Ok(());
+            match self.scope_is_active(scope)? {
+                false => return Ok(()),
+                true => thread::sleep(Duration::from_millis(100)),
             }
-            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!("{scope} did not stop within two seconds"))
+    }
+
+    pub fn terminate_scope_and_wait(&self, scope: &str, graceful: bool) -> Result<(), String> {
+        if graceful {
+            return self.stop_scope_and_wait(scope);
+        }
+        if !valid_scope_unit(scope) {
+            return Err("Unsafe emulator scope name".into());
+        }
+        let systemctl = path_command("systemctl")
+            .ok_or("systemctl is required to terminate an emulator scope")?;
+        let status = Command::new(systemctl)
+            .args(["--user", "kill", "--signal=KILL", scope])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Could not terminate {scope}: {error}"))?;
+        if !status.success() {
+            return Err(format!("systemd could not terminate {scope}: {status}"));
+        }
+        for _ in 0..20 {
+            match self.scope_is_active(scope)? {
+                false => return Ok(()),
+                true => thread::sleep(Duration::from_millis(100)),
+            }
         }
         Err(format!("{scope} did not stop within two seconds"))
     }
@@ -888,13 +912,29 @@ impl AndroidTools {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub fn owned_scope_for_profile(&self, profile_name: &str) -> Option<String> {
         validate_profile_name(profile_name).ok()?;
-        let prefix = format!("emumi-{profile_name}-");
         self.owned_scopes()
             .into_iter()
-            .filter(|scope| scope.starts_with(&prefix))
+            .filter(|scope| scope_belongs_to_profile(scope, profile_name))
             .max()
+    }
+
+    pub fn pid_is_active(&self, pid: u32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    pub fn wait_pid_gone(&self, pid: u32) -> Result<(), String> {
+        for _ in 0..20 {
+            if !self.pid_is_active(pid) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!(
+            "launcher PID {pid} did not exit within two seconds"
+        ))
     }
 
     pub fn disconnect_port(&self, port: u16) {
@@ -1011,6 +1051,10 @@ fn systemd_scope_launch_spec(
         OsString::from("--collect"),
         OsString::from(format!("--unit={unit}")),
     ];
+    args.extend([
+        OsString::from("--property=CPUQuota=80%"),
+        OsString::from("--property=CPUWeight=25"),
+    ]);
     if options.host_memory_policy {
         args.extend([
             OsString::from(format!("--property=MemoryHigh={}M", options.memory_high_mb)),
@@ -1019,12 +1063,6 @@ fn systemd_scope_launch_spec(
                 "--property=MemorySwapMax={}M",
                 options.memory_swap_max_mb
             )),
-            // Two Android vCPUs may use up to 1.8 host CPUs while Android and the
-            // game warm up. EmuMi reduces this scope after the post-ready window.
-            OsString::from("--property=CPUQuota=80%"),
-            // Emulator work stays responsive, but competes below normal desktop
-            // applications when several Androids are busy at once.
-            OsString::from("--property=CPUWeight=25"),
             OsString::from("--property=IOWeight=25"),
         ]);
     }
@@ -1043,6 +1081,17 @@ fn systemd_scope_launch_spec(
         args,
         scope_unit: Some(format!("{unit}.scope")),
     }
+}
+
+fn scope_profile(scope: &str) -> Option<String> {
+    let body = scope.strip_prefix("emumi-")?.strip_suffix(".scope")?;
+    let (profile, launch_id) = body.rsplit_once('-')?;
+    (!profile.is_empty() && launch_id.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| profile.to_owned())
+}
+
+pub(crate) fn scope_belongs_to_profile(scope: &str, profile: &str) -> bool {
+    scope_profile(scope).as_deref() == Some(profile)
 }
 
 fn scope_cpu_policy_args(scope_unit: &str, percent: u16, weight: u16) -> Vec<OsString> {
@@ -1597,6 +1646,50 @@ fn remove_ini_value(text: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mandatory_startup_quota_is_independent_of_optional_memory_policy() {
+        let options = ProfileOptions {
+            host_memory_policy: false,
+            ..Default::default()
+        };
+        let spec = systemd_scope_launch_spec(
+            "/fake/systemd-run".into(),
+            "/fake/prlimit".into(),
+            Path::new("/fake/emulator"),
+            &[],
+            "Device_4",
+            123,
+            &options,
+        );
+        assert!(
+            spec.args
+                .contains(&OsString::from("--property=CPUQuota=80%"))
+        );
+        assert!(
+            spec.args
+                .contains(&OsString::from("--property=CPUWeight=25"))
+        );
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("MemoryMax"))
+        );
+    }
+
+    #[test]
+    fn scope_identity_requires_an_exact_profile_before_the_numeric_launch_id() {
+        assert_eq!(
+            scope_profile("emumi-Device_4-123.scope").as_deref(),
+            Some("Device_4")
+        );
+        assert_ne!(
+            scope_profile("emumi-Device_4-other-123.scope").as_deref(),
+            Some("Device_4")
+        );
+        assert!(scope_profile("emumi-Device_4-not-a-number.scope").is_none());
+    }
 
     #[test]
     fn bounded_output_kills_a_hung_health_probe() {

@@ -1,5 +1,5 @@
 use crate::{
-    android::AndroidTools,
+    android::{AndroidTools, scope_belongs_to_profile},
     config::AppConfig,
     cpu_policy::{CpuQuotaPolicy, ThermalDecision, startup_thermal_decision},
     manager_guard::ManagerGuard,
@@ -42,6 +42,7 @@ pub struct EmuMiApp;
 
 struct Runtime {
     _manager_guard: ManagerGuard,
+    tools: AndroidTools,
     config: AppConfig,
     logs: Vec<ApiLog>,
     rectangular_watchers: BTreeSet<String>,
@@ -131,6 +132,7 @@ impl EmuMiApp {
     pub async fn start_server() -> Result<String, Box<dyn std::error::Error>> {
         let manager_guard = ManagerGuard::acquire()?;
         let config = AppConfig::load();
+        let tools = AndroidTools::detect(&config.android_sdk_path, &config.jdk_path);
         let supervisor = if config.lifecycle_states.is_empty() {
             DeviceSupervisor::new(config.desired_running_profiles.clone())
         } else {
@@ -138,6 +140,7 @@ impl EmuMiApp {
         };
         let runtime = Arc::new(Mutex::new(Runtime {
             _manager_guard: manager_guard,
+            tools,
             config,
             logs: vec![ApiLog::new("success", "EmuMi is ready")],
             rectangular_watchers: BTreeSet::new(),
@@ -258,10 +261,9 @@ fn spawn_device_supervisor(runtime: Shared) {
                     .iter()
                     .find(|profile| profile.name == name && profile.is_running());
                 let scope = known_scopes.get(&name).cloned().or_else(|| {
-                    let prefix = format!("emumi-{name}-");
                     owned_scopes
                         .iter()
-                        .filter(|unit| unit.starts_with(&prefix))
+                        .filter(|unit| scope_belongs_to_profile(unit, &name))
                         .max()
                         .cloned()
                 });
@@ -280,6 +282,7 @@ fn spawn_device_supervisor(runtime: Shared) {
                 observations.push((name, scope, observation));
             }
 
+            let had_observations = !observations.is_empty();
             let (actions, config_to_save) = match runtime.lock() {
                 Ok(mut runtime) => {
                     for (name, scope, observation) in observations {
@@ -300,7 +303,7 @@ fn spawn_device_supervisor(runtime: Shared) {
                         }
                     }
                     let actions = runtime.supervisor.due_actions(now);
-                    let config = (thermal_changed || !actions.is_empty())
+                    let config = (had_observations || thermal_changed || !actions.is_empty())
                         .then(|| runtime.lifecycle_config_snapshot());
                     (actions, config)
                 }
@@ -312,9 +315,10 @@ fn spawn_device_supervisor(runtime: Shared) {
 
             for action in actions {
                 let SupervisorAction::Recover { profile, scope } = action;
-                let (tools, port) = match runtime.lock() {
+                let (tools, status, port) = match runtime.lock() {
                     Ok(runtime) => (
                         runtime.tools(),
+                        runtime.supervisor.status_snapshot(&profile),
                         runtime
                             .config
                             .profile_options
@@ -323,13 +327,51 @@ fn spawn_device_supervisor(runtime: Shared) {
                     ),
                     Err(_) => return,
                 };
-                if let Some(scope) = scope.or_else(|| tools.owned_scope_for_profile(&profile)) {
-                    let _ = tools.stop_scope_and_wait(&scope);
+                let Some(status) = status else {
+                    continue;
+                };
+                let generation = status.generation;
+                let owned_scope = scope.or(status.scope.clone());
+                let cleanup = (|| {
+                    if let Some(scope) = &owned_scope {
+                        tools.terminate_scope_and_wait(scope, false)?;
+                    }
+                    if let Some(pid) = status.pid {
+                        tools.wait_pid_gone(pid)?;
+                    }
+                    Ok::<(), String>(())
+                })();
+                if let Err(error) = cleanup {
+                    if let Ok(mut runtime) = runtime.lock() {
+                        runtime.supervisor.record_failure(
+                            &profile,
+                            format!("Recovery could not stop the previous scope: {error}"),
+                            owned_scope,
+                            now_seconds(),
+                        );
+                        runtime.log(
+                            "error",
+                            format!("Recovery for {profile} is delayed: {error}"),
+                        );
+                        let config = runtime.lifecycle_config_snapshot();
+                        drop(runtime);
+                        let _ = config.save();
+                    }
+                    continue;
                 }
                 if let Some(port) = port {
                     tools.disconnect_port(port);
                 }
                 let _ = tools.cleanup_profile_runtime(&profile);
+                if let Ok(mut runtime) = runtime.lock() {
+                    runtime.supervisor.confirm_ownership_gone(
+                        &profile,
+                        generation,
+                        status.scope.as_deref(),
+                        status.pid,
+                    );
+                    runtime.profile_scopes.remove(&profile);
+                }
                 if let Err((_, Json(error))) =
                     start_named_profile_internal(&runtime, &profile, false)
                     && let Ok(mut runtime) = runtime.lock()
@@ -404,7 +446,7 @@ impl ApiLog {
 
 impl Runtime {
     fn tools(&self) -> AndroidTools {
-        AndroidTools::detect(&self.config.android_sdk_path, &self.config.jdk_path)
+        self.tools.clone()
     }
 
     fn log(&mut self, level: &'static str, message: impl Into<String>) {
@@ -1083,18 +1125,13 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
         let mut cool_startup_samples = 0_u8;
         let mut scope_stat_failures = 0_u8;
         loop {
-            let (tools, status, port) = {
+            let (tools, status) = {
                 let Ok(runtime) = shared.lock() else {
                     return;
                 };
                 (
                     runtime.tools(),
                     runtime.supervisor.statuses().get(&name).cloned(),
-                    runtime
-                        .config
-                        .profile_options
-                        .get(&name)
-                        .and_then(|options| options.adb_port),
                 )
             };
             let Some(status) = status else {
@@ -1118,25 +1155,42 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                 .cpu_temperature_c
                 .is_some_and(|temperature| temperature.is_finite() && temperature >= 90.0)
             {
-                let _ = tools.stop_scope_and_wait(&scope_unit);
-                if let Some(port) = port {
-                    tools.disconnect_port(port);
-                }
-                let _ = tools.cleanup_profile_runtime(&name);
+                let stopped = tools
+                    .terminate_scope_and_wait(&scope_unit, false)
+                    .and_then(|_| {
+                        status
+                            .pid
+                            .map(|pid| tools.wait_pid_gone(pid))
+                            .unwrap_or(Ok(()))
+                    });
                 if let Ok(mut runtime) = shared.lock() {
                     runtime.starting_profiles.remove(&name);
                     runtime.startup_generations.remove(&name);
-                    runtime.profile_scopes.remove(&name);
                     runtime.supervisor.enter_thermal_hold(
                         &name,
                         generation,
                         host_stats.cpu_temperature_c.unwrap_or(90.0),
                         now_seconds(),
                     );
-                    runtime.log(
-                        "warning",
-                        format!("Stopped {name} at the 90 C thermal limit"),
-                    );
+                    match stopped {
+                        Ok(()) => {
+                            runtime.supervisor.confirm_ownership_gone(
+                                &name,
+                                generation,
+                                status.scope.as_deref(),
+                                status.pid,
+                            );
+                            runtime.profile_scopes.remove(&name);
+                            runtime.log(
+                                "warning",
+                                format!("Stopped {name} at the 90 C thermal limit"),
+                            );
+                        }
+                        Err(error) => runtime.log(
+                            "error",
+                            format!("Thermal emergency could not confirm {name} stopped: {error}"),
+                        ),
+                    }
                     let config = runtime.lifecycle_config_snapshot();
                     drop(runtime);
                     let _ = config.save();
@@ -1347,13 +1401,15 @@ fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     runtime.startup_generations.remove(name);
     runtime.queued_profiles.retain(|queued| queued != name);
     let tools = runtime.tools();
+    let prior_status = runtime.supervisor.status_snapshot(name).unwrap_or_default();
     runtime.supervisor.request_stop(name);
-    let scope = runtime.profile_scopes.remove(name);
-    let port = runtime
-        .config
-        .profile_options
-        .get(name)
-        .and_then(|options| options.adb_port);
+    let generation = runtime.supervisor.generation(name).unwrap_or_default();
+    let scope = prior_status
+        .scope
+        .clone()
+        .or_else(|| runtime.profile_scopes.get(name).cloned());
+    let pid = prior_status.pid;
+    let graceful = graceful_stop_allowed(prior_status.phase);
     let config = runtime.lifecycle_config_snapshot();
     drop(runtime);
     config.save().map_err(|error| {
@@ -1366,32 +1422,70 @@ fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let shared = Arc::clone(shared);
     let name = name.to_owned();
     tokio::task::spawn_blocking(move || {
-        let scope = scope.or_else(|| tools.owned_scope_for_profile(&name));
-        let serial = tools
-            .discover_profiles()
-            .into_iter()
-            .find(|profile| profile.name == name)
-            .and_then(|profile| profile.running_serial);
-        if let Some(serial) = &serial {
-            let _ = tools.stop(serial);
-            std::thread::sleep(std::time::Duration::from_millis(750));
+        let cleanup_current = || {
+            shared.lock().is_ok_and(|runtime| {
+                runtime
+                    .supervisor
+                    .cleanup_is_current(&name, generation, scope.as_deref(), pid)
+            })
+        };
+        if !cleanup_current() {
+            return;
         }
-        if let Some(scope) = &scope {
-            let _ = tools.stop_scope_and_wait(scope);
-        }
-        if let Some(port) = port {
-            tools.disconnect_port(port);
-        }
-        let _ = tools.cleanup_profile_runtime(&name);
+        let cleanup_result = (|| {
+            if let Some(scope) = &scope {
+                tools.terminate_scope_and_wait(scope, graceful)?;
+            }
+            if let Some(pid) = pid {
+                tools.wait_pid_gone(pid)?;
+            }
+            Ok::<(), String>(())
+        })();
         if let Ok(mut runtime) = shared.lock() {
-            runtime.supervisor.mark_cleaned(&name);
-            runtime.log("info", format!("Stopped and cleaned up {name}"));
+            let changed = match cleanup_result {
+                Ok(()) => {
+                    let cleaned = runtime.supervisor.complete_cleanup(
+                        &name,
+                        generation,
+                        scope.as_deref(),
+                        pid,
+                    );
+                    if cleaned {
+                        runtime.profile_scopes.remove(&name);
+                        runtime.log("info", format!("Stopped and cleaned up {name}"));
+                    }
+                    cleaned
+                }
+                Err(error) => {
+                    let retained = runtime.supervisor.mark_cleanup_failed(
+                        &name,
+                        generation,
+                        scope.as_deref(),
+                        pid,
+                        error.clone(),
+                    );
+                    if retained {
+                        runtime.log(
+                            "error",
+                            format!("Could not finish stopping {name}: {error}"),
+                        );
+                    }
+                    retained
+                }
+            };
+            if !changed {
+                return;
+            }
             let config = runtime.lifecycle_config_snapshot();
             drop(runtime);
             let _ = config.save();
         }
     });
     Ok(message("Android stop requested"))
+}
+
+fn graceful_stop_allowed(phase: DevicePhase) -> bool {
+    phase == DevicePhase::Ready
 }
 
 async fn start_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiResult<ApiMessage> {
@@ -1640,9 +1734,13 @@ async fn save_settings(
     State(shared): State<Shared>,
     Json(settings): Json<SettingsDto>,
 ) -> ApiResult<ApiMessage> {
+    let android_sdk_path = settings.android_sdk_path.trim().to_owned();
+    let jdk_path = settings.jdk_path.trim().to_owned();
+    let tools = AndroidTools::detect(&android_sdk_path, &jdk_path);
     let mut runtime = lock(&shared)?;
-    runtime.config.android_sdk_path = settings.android_sdk_path.trim().to_owned();
-    runtime.config.jdk_path = settings.jdk_path.trim().to_owned();
+    runtime.config.android_sdk_path = android_sdk_path;
+    runtime.config.jdk_path = jdk_path;
+    runtime.tools = tools;
     runtime.log("success", "Tool paths saved");
     let config = runtime.config.clone();
     drop(runtime);
@@ -1792,12 +1890,29 @@ mod tests {
     use super::{
         CPU_CONTROL_SAMPLE_SECONDS, STARTUP_CPU_QUOTA_PERCENT, STARTUP_SETTLE_SECONDS,
         classify_supervisor_observation, cpu_control_requires_device_discovery,
-        enforce_launch_admission, launch_args, launch_block_reason, new_cpu_controller_candidates,
-        port_readiness_from_state, settle_after_boot_with, validate_profile_options,
+        enforce_launch_admission, graceful_stop_allowed, launch_args, launch_block_reason,
+        new_cpu_controller_candidates, port_readiness_from_state, settle_after_boot_with,
+        validate_profile_options,
     };
     use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
     use crate::monitor::HostMonitor;
+    use crate::supervisor::DevicePhase;
     use std::{collections::BTreeSet, fs};
+
+    #[test]
+    fn snapshot_saving_stop_is_allowed_only_after_ready() {
+        assert!(graceful_stop_allowed(DevicePhase::Ready));
+        for phase in [
+            DevicePhase::Admitting,
+            DevicePhase::Launching,
+            DevicePhase::Booting,
+            DevicePhase::Settling,
+            DevicePhase::ThermalHold,
+            DevicePhase::Backoff,
+        ] {
+            assert!(!graceful_stop_allowed(phase), "{phase:?}");
+        }
+    }
 
     #[test]
     fn launch_admission_protects_host_memory_and_temperature() {

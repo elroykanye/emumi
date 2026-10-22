@@ -39,10 +39,31 @@ pub fn recover_snapshot_in(
     if !is_snapshot_load_failure(owned_log) {
         return Ok(RecoveryOutcome::NotSnapshotFailure);
     }
-    let snapshots = avd_root.join(format!("{profile}.avd")).join("snapshots");
+    let canonical_root = avd_root
+        .canonicalize()
+        .map_err(|error| format!("Could not validate the AVD root: {error}"))?;
+    let profile_dir = avd_root.join(format!("{profile}.avd"));
+    let snapshots = profile_dir.join("snapshots");
     let source = snapshots.join("default_boot");
-    if !source.is_dir() {
+    if !source.exists() {
         return Ok(RecoveryOutcome::SnapshotMissing);
+    }
+    for (label, path) in [
+        ("profile", &profile_dir),
+        ("snapshot directory", &snapshots),
+        ("default snapshot", &source),
+    ] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("Could not validate {label}: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!("Unsafe {label} path"));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("Could not resolve {label}: {error}"))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(format!("Unsafe {label} path outside the AVD root"));
+        }
     }
     let quarantine = snapshots.join(format!("default_boot.emumi-quarantine-{now}"));
     if quarantine.exists() {
@@ -91,7 +112,7 @@ fn read_tail(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{RecoveryOutcome, recover_snapshot_in};
-    use std::fs;
+    use std::{fs, os::unix::fs::symlink};
 
     fn avd_root(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -157,6 +178,32 @@ mod tests {
 
         assert!(error.contains("profile name"));
         assert!(root.join("Device_4.avd/snapshots/default_boot").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn profile_symlink_cannot_quarantine_another_profiles_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "emumi-snapshot-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let other = root.join("Other.avd/snapshots/default_boot");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("ram.img"), "unrelated").unwrap();
+        symlink(root.join("Other.avd"), root.join("Device_4.avd")).unwrap();
+
+        let error =
+            recover_snapshot_in(&root, "Device_4", "Failed to load snapshot", 123).unwrap_err();
+
+        assert!(error.contains("Unsafe profile"));
+        assert_eq!(
+            fs::read_to_string(other.join("ram.img")).unwrap(),
+            "unrelated"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

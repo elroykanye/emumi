@@ -97,3 +97,4 @@ done
 grep -q '"manager_id"' "$rig/second-state.json"
 
 echo "PASS manager wire: exclusive lock, atomic stale endpoint replacement, cached state ${first_time}s, stop intent ${stop_time}s"
+python3 "$repo_root/tests/manager_safety_wire.py" "$binary"
