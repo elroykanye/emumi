@@ -8,6 +8,7 @@ use std::{
 pub struct ManagerGuard {
     _file: File,
     state_dir: PathBuf,
+    manager_id: String,
 }
 
 impl ManagerGuard {
@@ -19,6 +20,7 @@ impl ManagerGuard {
         fs::create_dir_all(state_dir)?;
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(state_dir.join("manager.lock"))?;
@@ -31,11 +33,23 @@ impl ManagerGuard {
         Ok(Self {
             _file: file,
             state_dir: state_dir.to_owned(),
+            manager_id: format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         })
     }
 
     pub fn publish_endpoint(&self, url: &str) -> io::Result<()> {
         publish_endpoint_atomic(&self.state_dir, url)
+    }
+
+    pub fn manager_id(&self) -> &str {
+        &self.manager_id
     }
 }
 
@@ -110,11 +124,13 @@ mod tests {
             fs::read_to_string(root.join("api-url")).unwrap(),
             "http://127.0.0.1:45997\n"
         );
-        assert!(
-            fs::read_dir(&root)
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
                 .unwrap()
-                .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with("api-url.tmp"))
-        );
+                .file_name()
+                .to_string_lossy()
+                .starts_with("api-url.tmp")
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -400,7 +400,7 @@ impl AndroidTools {
         args: &[String],
         options: &ProfileOptions,
         _admission: LaunchAdmission,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<LaunchHandle, String> {
         let emulator = self
             .emulator
             .as_ref()
@@ -449,10 +449,13 @@ impl AndroidTools {
             }
             RendererPreference::Default => {}
         }
-        command
-            .spawn()
-            .map(|_| scope_unit)
-            .map_err(|err| err.to_string())
+        let child = command.spawn().map_err(|err| err.to_string())?;
+        let launcher_pid = child.id();
+        reap_child_in_background(child);
+        Ok(LaunchHandle {
+            scope_unit,
+            launcher_pid,
+        })
     }
 
     pub fn set_scope_cpu_policy(
@@ -940,6 +943,21 @@ struct LaunchSpec {
     scope_unit: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchHandle {
+    pub scope_unit: Option<String>,
+    pub launcher_pid: u32,
+}
+
+fn reap_child_in_background(mut child: std::process::Child) {
+    std::thread::Builder::new()
+        .name(format!("emumi-launcher-wait-{}", child.id()))
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .expect("EmuMi must be able to create a launcher reaper thread");
+}
+
 fn launch_spec(
     emulator: &Path,
     emulator_args: &[OsString],
@@ -1003,7 +1021,7 @@ fn systemd_scope_launch_spec(
             )),
             // Two Android vCPUs may use up to 1.8 host CPUs while Android and the
             // game warm up. EmuMi reduces this scope after the post-ready window.
-            OsString::from("--property=CPUQuota=180%"),
+            OsString::from("--property=CPUQuota=80%"),
             // Emulator work stays responsive, but competes below normal desktop
             // applications when several Androids are busy at once.
             OsString::from("--property=CPUWeight=25"),
@@ -1818,7 +1836,7 @@ mod tests {
         assert!(args.contains(&std::borrow::Cow::Borrowed(
             "--property=MemorySwapMax=1024M"
         )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=180%")));
+        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=80%")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
         assert!(!args.contains(&std::borrow::Cow::Borrowed("--property=LimitCORE=0")));
@@ -1840,6 +1858,21 @@ mod tests {
                 OsString::from("CPUWeight=100"),
             ]
         );
+    }
+
+    #[test]
+    fn launcher_children_are_reaped_by_a_dedicated_waiter() {
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        reap_child_in_background(child);
+
+        for _ in 0..100 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("launcher child {pid} was left as a zombie");
     }
 
     #[test]

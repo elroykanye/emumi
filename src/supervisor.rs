@@ -1,28 +1,45 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-const FAILURE_DELAYS_SECONDS: [u64; 6] = [5, 15, 45, 120, 300, 900];
+const FAILURE_DELAYS_SECONDS: [u64; 3] = [30, 120, 600];
+const CIRCUIT_OPEN_SECONDS: u64 = 1800;
 const UNHEALTHY_SAMPLE_LIMIT: u8 = 3;
+const COOL_SAMPLE_LIMIT: u8 = 3;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DevicePhase {
     #[default]
     Stopped,
     Queued,
-    Starting,
-    Running,
-    Recovering,
-    Degraded,
+    Admitting,
+    Launching,
+    Booting,
+    Settling,
+    Ready,
+    ThermalHold,
+    SnapshotRecovery,
+    Backoff,
+    HalfOpen,
+    CircuitOpen,
+    Stopping,
+    Cleaned,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceStatus {
     pub phase: DevicePhase,
     pub desired_running: bool,
+    pub generation: u64,
+    pub stop_requested: bool,
     pub consecutive_failures: u32,
     pub next_retry_at: Option<u64>,
     pub last_failure: Option<String>,
+    pub scope: Option<String>,
+    pub pid: Option<u32>,
+    pub cpu_quota_percent: Option<u16>,
+    pub cpu_temperature_c: Option<f32>,
+    pub snapshot_state: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,17 +59,24 @@ pub enum SupervisorAction {
     },
 }
 
-#[derive(Clone, Debug, Default)]
-struct DeviceEntry {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PersistedDeviceState {
     status: DeviceStatus,
+    #[serde(default)]
     unhealthy_samples: u8,
+    #[serde(default)]
+    cool_samples: u8,
+    #[serde(default)]
     recovery_scope: Option<String>,
+    #[serde(default)]
     boot_started_at: Option<u64>,
+    #[serde(default)]
+    manual_admission: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct DeviceSupervisor {
-    entries: BTreeMap<String, DeviceEntry>,
+    entries: BTreeMap<String, PersistedDeviceState>,
 }
 
 impl DeviceSupervisor {
@@ -62,15 +86,15 @@ impl DeviceSupervisor {
             .map(|profile| {
                 (
                     profile,
-                    DeviceEntry {
+                    PersistedDeviceState {
                         status: DeviceStatus {
-                            phase: DevicePhase::Recovering,
+                            phase: DevicePhase::Backoff,
                             desired_running: true,
                             next_retry_at: Some(0),
                             last_failure: Some("Manager resumed supervision".into()),
                             ..DeviceStatus::default()
                         },
-                        ..DeviceEntry::default()
+                        ..PersistedDeviceState::default()
                     },
                 )
             })
@@ -99,6 +123,20 @@ impl DeviceSupervisor {
             .is_some_and(|entry| entry.status.desired_running)
     }
 
+    pub fn generation(&self, profile: &str) -> Option<u64> {
+        self.entries
+            .get(profile)
+            .map(|entry| entry.status.generation)
+    }
+
+    pub fn persisted_states(&self) -> BTreeMap<String, PersistedDeviceState> {
+        self.entries.clone()
+    }
+
+    pub fn restore(states: BTreeMap<String, PersistedDeviceState>) -> Self {
+        Self { entries: states }
+    }
+
     #[cfg(test)]
     pub fn status(&self, profile: &str) -> &DeviceStatus {
         &self
@@ -108,19 +146,73 @@ impl DeviceSupervisor {
             .status
     }
 
-    pub fn request_start(&mut self, profile: &str, _now: u64) {
+    pub fn begin_admission(
+        &mut self,
+        profile: &str,
+        _now: u64,
+        manual: bool,
+    ) -> Result<u64, String> {
         let entry = self.entries.entry(profile.to_owned()).or_default();
+        if entry.status.desired_running
+            && matches!(
+                entry.status.phase,
+                DevicePhase::Admitting
+                    | DevicePhase::Launching
+                    | DevicePhase::Booting
+                    | DevicePhase::Settling
+                    | DevicePhase::HalfOpen
+            )
+        {
+            return Err("Android already has an active start generation".into());
+        }
+        entry.status.generation = entry.status.generation.wrapping_add(1).max(1);
         entry.status.desired_running = true;
-        entry.status.phase = DevicePhase::Starting;
+        entry.status.stop_requested = false;
+        entry.status.phase = DevicePhase::Admitting;
         entry.status.next_retry_at = None;
+        entry.manual_admission = manual;
         entry.unhealthy_samples = 0;
+        entry.cool_samples = 0;
         entry.boot_started_at = None;
+        Ok(entry.status.generation)
+    }
+
+    pub fn admission_succeeded(&mut self, profile: &str, generation: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if entry.status.generation != generation
+            || !entry.status.desired_running
+            || entry.status.stop_requested
+        {
+            return false;
+        }
+        if entry.manual_admission {
+            entry.status.consecutive_failures = 0;
+            entry.status.last_failure = None;
+        }
+        entry.manual_admission = false;
+        true
+    }
+
+    pub fn reject_admission(&mut self, profile: &str, reason: impl Into<String>, now: u64) {
+        let entry = self.entries.entry(profile.to_owned()).or_default();
+        entry.status.phase = DevicePhase::Backoff;
+        entry.status.last_failure = Some(reason.into());
+        entry.status.next_retry_at = Some(now.saturating_add(FAILURE_DELAYS_SECONDS[0]));
+        entry.manual_admission = false;
+    }
+
+    #[cfg(test)]
+    pub fn request_start(&mut self, profile: &str, now: u64) {
+        let _ = self.begin_admission(profile, now, true);
     }
 
     pub fn mark_queued(&mut self, profile: &str) {
         let entry = self.entries.entry(profile.to_owned()).or_default();
         entry.status.desired_running = true;
         entry.status.phase = DevicePhase::Queued;
+        entry.status.stop_requested = false;
         entry.status.next_retry_at = None;
         entry.unhealthy_samples = 0;
         entry.boot_started_at = None;
@@ -129,7 +221,9 @@ impl DeviceSupervisor {
     pub fn request_stop(&mut self, profile: &str) {
         let entry = self.entries.entry(profile.to_owned()).or_default();
         entry.status.desired_running = false;
-        entry.status.phase = DevicePhase::Stopped;
+        entry.status.phase = DevicePhase::Stopping;
+        entry.status.stop_requested = true;
+        entry.status.generation = entry.status.generation.wrapping_add(1).max(1);
         entry.status.next_retry_at = None;
         entry.status.consecutive_failures = 0;
         entry.status.last_failure = None;
@@ -138,15 +232,164 @@ impl DeviceSupervisor {
         entry.boot_started_at = None;
     }
 
-    pub fn mark_running(&mut self, profile: &str) {
+    pub fn mark_cleaned(&mut self, profile: &str) {
         let entry = self.entries.entry(profile.to_owned()).or_default();
-        entry.status.phase = DevicePhase::Running;
+        entry.status.phase = DevicePhase::Cleaned;
+        entry.status.scope = None;
+        entry.status.pid = None;
+        entry.recovery_scope = None;
+        entry.status.phase = DevicePhase::Stopped;
+    }
+
+    pub fn mark_launching(
+        &mut self,
+        profile: &str,
+        generation: u64,
+        scope: String,
+        pid: u32,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if entry.status.generation != generation
+            || !entry.status.desired_running
+            || entry.status.stop_requested
+        {
+            return false;
+        }
+        entry.status.phase = DevicePhase::Launching;
+        entry.status.scope = Some(scope.clone());
+        entry.status.pid = Some(pid);
+        entry.recovery_scope = Some(scope);
+        true
+    }
+
+    pub fn mark_booting(&mut self, profile: &str, generation: u64) -> bool {
+        self.set_generation_phase(profile, generation, DevicePhase::Booting)
+    }
+
+    pub fn mark_settling(&mut self, profile: &str, generation: u64) -> bool {
+        self.set_generation_phase(profile, generation, DevicePhase::Settling)
+    }
+
+    fn set_generation_phase(&mut self, profile: &str, generation: u64, phase: DevicePhase) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if entry.status.generation != generation
+            || !entry.status.desired_running
+            || entry.status.stop_requested
+        {
+            return false;
+        }
+        entry.status.phase = phase;
+        true
+    }
+
+    pub fn complete_ready(&mut self, profile: &str, generation: u64) -> bool {
+        if !self.set_generation_phase(profile, generation, DevicePhase::Ready) {
+            return false;
+        }
+        let entry = self.entries.get_mut(profile).expect("entry exists");
         entry.status.next_retry_at = None;
         entry.status.consecutive_failures = 0;
         entry.status.last_failure = None;
         entry.unhealthy_samples = 0;
-        entry.recovery_scope = None;
+        entry.cool_samples = 0;
         entry.boot_started_at = None;
+        true
+    }
+
+    pub fn mark_running(&mut self, profile: &str) {
+        let generation = self
+            .entries
+            .entry(profile.to_owned())
+            .or_default()
+            .status
+            .generation;
+        let _ = self.complete_ready(profile, generation);
+    }
+
+    pub fn enter_thermal_hold(
+        &mut self,
+        profile: &str,
+        generation: u64,
+        temperature: f32,
+        now: u64,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if entry.status.generation != generation || !entry.status.desired_running {
+            return false;
+        }
+        entry.status.phase = DevicePhase::ThermalHold;
+        entry.status.cpu_temperature_c = Some(temperature);
+        entry.status.last_failure = Some(format!("Thermal stop at {temperature:.1} C"));
+        entry.status.next_retry_at = Some(now.saturating_add(30));
+        entry.status.scope = None;
+        entry.status.pid = None;
+        entry.cool_samples = 0;
+        true
+    }
+
+    pub fn schedule_snapshot_recovery(&mut self, profile: &str, generation: u64, now: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if entry.status.generation != generation
+            || !entry.status.desired_running
+            || entry.status.snapshot_state.as_deref() == Some("cold_retry_used")
+        {
+            return false;
+        }
+        entry.status.phase = DevicePhase::SnapshotRecovery;
+        entry.status.snapshot_state = Some("cold_retry_used".into());
+        entry.status.last_failure = Some("Failed default_boot snapshot quarantined".into());
+        entry.status.next_retry_at = Some(now);
+        entry.recovery_scope = entry.status.scope.take();
+        entry.status.pid = None;
+        true
+    }
+
+    pub fn observe_cool_sample(&mut self, profile: &str, temperature: f32, now: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        entry.status.cpu_temperature_c = Some(temperature);
+        if entry.status.phase != DevicePhase::ThermalHold {
+            return false;
+        }
+        if temperature < 75.0 {
+            entry.cool_samples = entry.cool_samples.saturating_add(1);
+        } else {
+            entry.cool_samples = 0;
+        }
+        if entry.cool_samples < COOL_SAMPLE_LIMIT {
+            return false;
+        }
+        entry.status.phase = DevicePhase::Backoff;
+        entry.status.next_retry_at = Some(now);
+        entry.cool_samples = 0;
+        true
+    }
+
+    pub fn update_telemetry(
+        &mut self,
+        profile: &str,
+        generation: u64,
+        quota_percent: u16,
+        temperature_c: Option<f32>,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(profile) else {
+            return false;
+        };
+        if entry.status.generation != generation || !entry.status.desired_running {
+            return false;
+        }
+        entry.status.cpu_quota_percent = Some(quota_percent);
+        entry.status.cpu_temperature_c = temperature_c;
+        true
     }
 
     pub fn record_failure(
@@ -162,22 +405,23 @@ impl DeviceSupervisor {
         }
         if matches!(
             entry.status.phase,
-            DevicePhase::Recovering | DevicePhase::Degraded
+            DevicePhase::Backoff | DevicePhase::CircuitOpen
         ) && entry.status.next_retry_at.is_some()
         {
             return;
         }
         entry.status.consecutive_failures = entry.status.consecutive_failures.saturating_add(1);
-        let delay_index = (entry.status.consecutive_failures as usize)
-            .saturating_sub(1)
-            .min(FAILURE_DELAYS_SECONDS.len() - 1);
-        let delay = FAILURE_DELAYS_SECONDS[delay_index];
-        entry.status.phase =
-            if entry.status.consecutive_failures >= FAILURE_DELAYS_SECONDS.len() as u32 {
-                DevicePhase::Degraded
-            } else {
-                DevicePhase::Recovering
-            };
+        let circuit = entry.status.consecutive_failures > FAILURE_DELAYS_SECONDS.len() as u32;
+        let delay = if circuit {
+            CIRCUIT_OPEN_SECONDS
+        } else {
+            FAILURE_DELAYS_SECONDS[(entry.status.consecutive_failures - 1) as usize]
+        };
+        entry.status.phase = if circuit {
+            DevicePhase::CircuitOpen
+        } else {
+            DevicePhase::Backoff
+        };
         entry.status.next_retry_at = Some(now.saturating_add(delay));
         entry.status.last_failure = Some(reason.into());
         entry.unhealthy_samples = 0;
@@ -194,7 +438,8 @@ impl DeviceSupervisor {
                     return;
                 }
                 let started_at = *entry.boot_started_at.get_or_insert(now);
-                entry.status.phase = DevicePhase::Starting;
+                entry.status.phase = DevicePhase::Booting;
+                entry.status.scope = scope.clone();
                 entry.recovery_scope = scope.clone();
                 if now.saturating_sub(started_at) >= 120 {
                     self.record_failure(
@@ -228,7 +473,7 @@ impl DeviceSupervisor {
                 if !entry.status.desired_running {
                     entry.status.phase = DevicePhase::Stopped;
                     entry.status.next_retry_at = None;
-                } else if entry.status.phase == DevicePhase::Running {
+                } else if entry.status.phase == DevicePhase::Ready {
                     entry.unhealthy_samples = entry.unhealthy_samples.saturating_add(1);
                     if entry.unhealthy_samples >= UNHEALTHY_SAMPLE_LIMIT {
                         self.record_failure(profile, "Emulator disappeared from ADB", scope, now);
@@ -244,7 +489,7 @@ impl DeviceSupervisor {
             if !entry.status.desired_running
                 || !matches!(
                     entry.status.phase,
-                    DevicePhase::Recovering | DevicePhase::Degraded
+                    DevicePhase::Backoff | DevicePhase::CircuitOpen | DevicePhase::SnapshotRecovery
                 )
                 || !entry
                     .status
@@ -257,7 +502,13 @@ impl DeviceSupervisor {
                 profile: profile.clone(),
                 scope: entry.recovery_scope.take(),
             });
-            entry.status.phase = DevicePhase::Starting;
+            entry.status.generation = entry.status.generation.wrapping_add(1).max(1);
+            entry.status.stop_requested = false;
+            entry.status.phase = if entry.status.phase == DevicePhase::CircuitOpen {
+                DevicePhase::HalfOpen
+            } else {
+                DevicePhase::Admitting
+            };
             entry.status.next_retry_at = None;
             entry.unhealthy_samples = 0;
             entry.boot_started_at = None;
@@ -283,10 +534,10 @@ mod tests {
             },
             1,
         );
-        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Recovering);
-        assert!(supervisor.due_actions(5).is_empty());
+        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Backoff);
+        assert!(supervisor.due_actions(30).is_empty());
         assert_eq!(
-            supervisor.due_actions(6),
+            supervisor.due_actions(31),
             vec![SupervisorAction::Recover {
                 profile: "Device_1".into(),
                 scope: Some("emumi-Device_1-100.scope".into()),
@@ -301,20 +552,25 @@ mod tests {
     }
 
     #[test]
-    fn repeated_failures_back_off_and_enter_a_cooldown() {
+    fn repeated_failures_back_off_and_enter_a_circuit() {
         let mut supervisor = DeviceSupervisor::default();
         supervisor.request_start("Device_3", 0);
 
-        let expected_delays = [5, 15, 45, 120, 300, 900];
+        let expected_delays = [30, 120, 600, 1800];
         let mut now = 0;
         for (index, delay) in expected_delays.into_iter().enumerate() {
             supervisor.record_failure("Device_3", "native crash", None, now);
             let status = supervisor.status("Device_3");
             assert_eq!(status.next_retry_at, Some(now + delay));
             assert_eq!(status.consecutive_failures, index as u32 + 1);
-            if index == expected_delays.len() - 1 {
-                assert_eq!(status.phase, DevicePhase::Degraded);
-            }
+            assert_eq!(
+                status.phase,
+                if index == expected_delays.len() - 1 {
+                    DevicePhase::CircuitOpen
+                } else {
+                    DevicePhase::Backoff
+                }
+            );
             now += delay;
             assert_eq!(supervisor.due_actions(now).len(), 1);
         }
@@ -330,7 +586,7 @@ mod tests {
         supervisor.observe("Device_1", Observation::Healthy, 100);
         supervisor.observe("Device_3", Observation::Absent { scope: None }, 100);
 
-        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Running);
+        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Ready);
         assert_eq!(
             supervisor.due_actions(100),
             vec![SupervisorAction::Recover {
@@ -351,9 +607,9 @@ mod tests {
 
         supervisor.observe("Device_1", missing.clone(), 1);
         supervisor.observe("Device_1", missing.clone(), 2);
-        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Running);
+        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Ready);
         supervisor.observe("Device_1", missing, 3);
-        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Recovering);
+        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Backoff);
     }
 
     #[test]
@@ -364,9 +620,9 @@ mod tests {
         };
         supervisor.observe("Device_1", booting.clone(), 10);
         supervisor.observe("Device_1", booting.clone(), 100);
-        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Starting);
+        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Booting);
         supervisor.observe("Device_1", booting, 131);
-        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Recovering);
+        assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Backoff);
         assert!(
             supervisor
                 .status("Device_1")
@@ -397,7 +653,7 @@ mod tests {
 
         let status = supervisor.status("Device_1");
         assert_eq!(status.consecutive_failures, 1);
-        assert_eq!(status.next_retry_at, Some(125));
+        assert_eq!(status.next_retry_at, Some(150));
     }
 
     #[test]
@@ -405,9 +661,107 @@ mod tests {
         let mut supervisor = DeviceSupervisor::default();
         supervisor.request_start("Device_1", 0);
         supervisor.record_failure("Device_1", "native crash", None, 0);
-        assert_eq!(supervisor.due_actions(5).len(), 1);
+        assert_eq!(supervisor.due_actions(30).len(), 1);
 
         supervisor.request_stop("Device_1");
         assert!(!supervisor.is_desired("Device_1"));
+    }
+
+    #[test]
+    fn launch_generation_moves_through_explicit_phases_and_rejects_late_completion() {
+        let mut supervisor = DeviceSupervisor::default();
+        let first = supervisor.begin_admission("Device_4", 10, true).unwrap();
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Admitting);
+        supervisor.mark_launching("Device_4", first, "emumi-Device_4-10.scope".into(), 1234);
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Launching);
+        supervisor.mark_booting("Device_4", first);
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Booting);
+        supervisor.mark_settling("Device_4", first);
+        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Settling);
+
+        supervisor.request_stop("Device_4");
+        assert!(!supervisor.complete_ready("Device_4", first));
+        assert!(!supervisor.status("Device_4").desired_running);
+        assert!(supervisor.status("Device_4").stop_requested);
+    }
+
+    #[test]
+    fn failures_use_three_backoffs_then_a_thirty_minute_single_probe_circuit() {
+        let mut supervisor = DeviceSupervisor::default();
+        supervisor.begin_admission("Device_3", 0, true).unwrap();
+        let expected = [30, 120, 600];
+        let mut now = 0;
+        for delay in expected {
+            supervisor.record_failure("Device_3", "crash", None, now);
+            assert_eq!(supervisor.status("Device_3").phase, DevicePhase::Backoff);
+            assert_eq!(
+                supervisor.status("Device_3").next_retry_at,
+                Some(now + delay)
+            );
+            now += delay;
+            assert_eq!(supervisor.due_actions(now).len(), 1);
+        }
+
+        supervisor.record_failure("Device_3", "crash", None, now);
+        assert_eq!(
+            supervisor.status("Device_3").phase,
+            DevicePhase::CircuitOpen
+        );
+        assert_eq!(
+            supervisor.status("Device_3").next_retry_at,
+            Some(now + 1800)
+        );
+        assert!(supervisor.due_actions(now + 1799).is_empty());
+        assert_eq!(supervisor.due_actions(now + 1800).len(), 1);
+        assert_eq!(supervisor.status("Device_3").phase, DevicePhase::HalfOpen);
+        assert!(supervisor.due_actions(now + 1800).is_empty());
+    }
+
+    #[test]
+    fn manual_start_cannot_erase_failures_until_admission_succeeds() {
+        let mut supervisor = DeviceSupervisor::default();
+        supervisor.begin_admission("Device_3", 0, true).unwrap();
+        supervisor.record_failure("Device_3", "crash", None, 0);
+        assert_eq!(supervisor.status("Device_3").consecutive_failures, 1);
+
+        supervisor.reject_admission("Device_3", "host too hot", 5);
+        assert_eq!(supervisor.status("Device_3").consecutive_failures, 1);
+        let generation = supervisor.begin_admission("Device_3", 6, true).unwrap();
+        supervisor.admission_succeeded("Device_3", generation);
+        assert_eq!(supervisor.status("Device_3").consecutive_failures, 0);
+    }
+
+    #[test]
+    fn thermal_hold_is_persistable_and_requires_three_cool_samples() {
+        let mut supervisor = DeviceSupervisor::default();
+        let generation = supervisor.begin_admission("Device_3", 0, true).unwrap();
+        supervisor.enter_thermal_hold("Device_3", generation, 96.0, 10);
+        assert_eq!(
+            supervisor.status("Device_3").phase,
+            DevicePhase::ThermalHold
+        );
+
+        let persisted = supervisor.persisted_states();
+        let mut restored = DeviceSupervisor::restore(persisted);
+        assert_eq!(restored.status("Device_3").phase, DevicePhase::ThermalHold);
+        assert!(!restored.observe_cool_sample("Device_3", 74.0, 20));
+        assert!(!restored.observe_cool_sample("Device_3", 74.0, 21));
+        assert!(restored.observe_cool_sample("Device_3", 74.0, 22));
+        assert_eq!(restored.status("Device_3").phase, DevicePhase::Backoff);
+    }
+
+    #[test]
+    fn snapshot_recovery_allows_exactly_one_cold_retry_per_failure_streak() {
+        let mut supervisor = DeviceSupervisor::default();
+        let generation = supervisor.begin_admission("Device_4", 0, true).unwrap();
+        assert!(supervisor.schedule_snapshot_recovery("Device_4", generation, 10));
+        assert_eq!(
+            supervisor.status("Device_4").phase,
+            DevicePhase::SnapshotRecovery
+        );
+        assert!(!supervisor.schedule_snapshot_recovery("Device_4", generation, 11));
+        assert_eq!(supervisor.due_actions(10).len(), 1);
+        let retry_generation = supervisor.status("Device_4").generation;
+        assert!(!supervisor.schedule_snapshot_recovery("Device_4", retry_generation, 12));
     }
 }

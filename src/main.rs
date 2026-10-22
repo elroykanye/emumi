@@ -6,6 +6,7 @@ mod manager_guard;
 mod model;
 mod monitor;
 mod netsimd_log;
+mod snapshot_recovery;
 mod supervisor;
 
 use app::EmuMiApp;

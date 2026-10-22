@@ -1,4 +1,5 @@
 use crate::model::{PicturePreset, ProfileOptions};
+use crate::supervisor::PersistedDeviceState;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -6,7 +7,7 @@ use std::{
     path::PathBuf,
 };
 
-const CURRENT_POLICY_VERSION: u32 = 1;
+const CURRENT_POLICY_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -15,6 +16,7 @@ pub struct AppConfig {
     pub jdk_path: String,
     pub profile_options: BTreeMap<String, ProfileOptions>,
     pub desired_running_profiles: BTreeSet<String>,
+    pub lifecycle_states: BTreeMap<String, PersistedDeviceState>,
     #[serde(default = "legacy_policy_version")]
     pub policy_version: u32,
 }
@@ -26,6 +28,7 @@ impl Default for AppConfig {
             jdk_path: String::new(),
             profile_options: BTreeMap::new(),
             desired_running_profiles: BTreeSet::new(),
+            lifecycle_states: BTreeMap::new(),
             policy_version: CURRENT_POLICY_VERSION,
         }
     }
@@ -145,5 +148,27 @@ mod tests {
             decoded.desired_running_profiles,
             configured.desired_running_profiles
         );
+    }
+
+    #[test]
+    fn lifecycle_retry_and_thermal_state_round_trip_with_the_config() {
+        let mut supervisor = crate::supervisor::DeviceSupervisor::default();
+        let generation = supervisor.begin_admission("Device_3", 0, true).unwrap();
+        supervisor.enter_thermal_hold("Device_3", generation, 94.0, 10);
+        let config = AppConfig {
+            desired_running_profiles: BTreeSet::from(["Device_3".to_owned()]),
+            lifecycle_states: supervisor.persisted_states(),
+            ..AppConfig::default()
+        };
+
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded: AppConfig = serde_json::from_str(&encoded).unwrap();
+        let restored = crate::supervisor::DeviceSupervisor::restore(decoded.lifecycle_states);
+
+        assert_eq!(
+            restored.status("Device_3").phase,
+            crate::supervisor::DevicePhase::ThermalHold
+        );
+        assert_eq!(restored.status("Device_3").next_retry_at, Some(40));
     }
 }

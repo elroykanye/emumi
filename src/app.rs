@@ -1,11 +1,12 @@
 use crate::{
     android::AndroidTools,
     config::AppConfig,
-    cpu_policy::CpuQuotaPolicy,
+    cpu_policy::{CpuQuotaPolicy, ThermalDecision, startup_thermal_decision},
     manager_guard::ManagerGuard,
     model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
     netsimd_log::{self, GuardOutcome},
+    snapshot_recovery::{self, RecoveryOutcome},
     supervisor::{DevicePhase, DeviceStatus, DeviceSupervisor, Observation, SupervisorAction},
 };
 use axum::{
@@ -29,8 +30,8 @@ const MAX_RUNNING_PROFILES: usize = 4;
 const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_LAUNCH_TEMPERATURE_C: f32 = 90.0;
 const STARTUP_SETTLE_SECONDS: u64 = 20;
-const STARTUP_CPU_QUOTA_PERCENT: u16 = 180;
-const CPU_CONTROL_SAMPLE_SECONDS: u64 = 5;
+const STARTUP_CPU_QUOTA_PERCENT: u16 = 80;
+const CPU_CONTROL_SAMPLE_SECONDS: u64 = 1;
 const NETSIMD_LOG_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 const NETSIMD_LOG_CHECK_SECONDS: u64 = 5;
 
@@ -47,7 +48,6 @@ struct Runtime {
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
     startup_generations: BTreeMap<String, u64>,
-    next_startup_generation: u64,
     queued_profiles: VecDeque<String>,
     memory_warnings: BTreeMap<String, String>,
     cpu_controller_scopes: BTreeSet<String>,
@@ -64,6 +64,7 @@ struct ApiLog {
 
 #[derive(Serialize)]
 struct AppState {
+    manager_id: String,
     profiles: Vec<crate::model::AndroidProfile>,
     profile_options: BTreeMap<String, ProfileOptions>,
     starting_profiles: BTreeSet<String>,
@@ -127,7 +128,11 @@ impl EmuMiApp {
     pub async fn start_server() -> Result<String, Box<dyn std::error::Error>> {
         let manager_guard = ManagerGuard::acquire()?;
         let config = AppConfig::load();
-        let supervisor = DeviceSupervisor::new(config.desired_running_profiles.clone());
+        let supervisor = if config.lifecycle_states.is_empty() {
+            DeviceSupervisor::new(config.desired_running_profiles.clone())
+        } else {
+            DeviceSupervisor::restore(config.lifecycle_states.clone())
+        };
         let runtime = Arc::new(Mutex::new(Runtime {
             _manager_guard: manager_guard,
             config,
@@ -136,7 +141,6 @@ impl EmuMiApp {
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
             startup_generations: BTreeMap::new(),
-            next_startup_generation: 1,
             queued_profiles: VecDeque::new(),
             memory_warnings: BTreeMap::new(),
             cpu_controller_scopes: BTreeSet::new(),
@@ -165,7 +169,11 @@ impl EmuMiApp {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let url = format!("http://{address}");
-        runtime.lock().unwrap()._manager_guard.publish_endpoint(&url)?;
+        runtime
+            .lock()
+            .unwrap()
+            ._manager_guard
+            .publish_endpoint(&url)?;
         tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("EmuMi server stopped: {error}");
@@ -236,6 +244,7 @@ fn spawn_device_supervisor(runtime: Shared) {
             };
             let profiles = tools.discover_profiles();
             let owned_scopes = tools.owned_scopes();
+            let host_temperature = HostMonitor::default().sample().cpu_temperature_c;
             let now = now_seconds();
             let mut observations = Vec::new();
             for name in desired {
@@ -265,7 +274,7 @@ fn spawn_device_supervisor(runtime: Shared) {
                 observations.push((name, scope, observation));
             }
 
-            let actions = match runtime.lock() {
+            let (actions, config_to_save) = match runtime.lock() {
                 Ok(mut runtime) => {
                     for (name, scope, observation) in observations {
                         if let Some(scope) = scope {
@@ -273,10 +282,27 @@ fn spawn_device_supervisor(runtime: Shared) {
                         }
                         runtime.supervisor.observe(&name, observation, now);
                     }
-                    runtime.supervisor.due_actions(now)
+                    let mut thermal_changed = false;
+                    if let Some(temperature) = host_temperature {
+                        for (name, status) in &phases {
+                            if status.phase == DevicePhase::ThermalHold {
+                                thermal_changed |=
+                                    runtime
+                                        .supervisor
+                                        .observe_cool_sample(name, temperature, now);
+                            }
+                        }
+                    }
+                    let actions = runtime.supervisor.due_actions(now);
+                    let config = (thermal_changed || !actions.is_empty())
+                        .then(|| runtime.lifecycle_config_snapshot());
+                    (actions, config)
                 }
                 Err(_) => return,
             };
+            if let Some(config) = config_to_save {
+                let _ = config.save();
+            }
 
             for action in actions {
                 let SupervisorAction::Recover { profile, scope } = action;
@@ -323,7 +349,7 @@ fn classify_supervisor_observation(
     if running && boot_completed {
         return Some(Observation::Healthy);
     }
-    if running && matches!(previous_phase, Some(DevicePhase::Running)) {
+    if running && matches!(previous_phase, Some(DevicePhase::Ready)) {
         return Some(Observation::Unresponsive { scope });
     }
     if running || starting {
@@ -332,10 +358,19 @@ fn classify_supervisor_observation(
     if scope.is_some() {
         return Some(Observation::Unresponsive { scope });
     }
-    if matches!(previous_phase, Some(DevicePhase::Running)) {
+    if matches!(previous_phase, Some(DevicePhase::Ready)) {
         return Some(Observation::Absent { scope: None });
     }
-    if matches!(previous_phase, Some(DevicePhase::Starting)) {
+    if matches!(
+        previous_phase,
+        Some(
+            DevicePhase::Admitting
+                | DevicePhase::Launching
+                | DevicePhase::Booting
+                | DevicePhase::Settling
+                | DevicePhase::HalfOpen
+        )
+    ) {
         return Some(Observation::Exited { scope: None });
     }
     None
@@ -374,11 +409,16 @@ impl Runtime {
     }
 
     fn persist_desired_profiles(&mut self) -> Result<(), String> {
-        self.config.desired_running_profiles = self.supervisor.desired_profiles();
-        self.config
+        self.lifecycle_config_snapshot()
             .save()
             .map(|_| ())
             .map_err(|error| format!("Could not save device lifecycle state: {error}"))
+    }
+
+    fn lifecycle_config_snapshot(&mut self) -> AppConfig {
+        self.config.desired_running_profiles = self.supervisor.desired_profiles();
+        self.config.lifecycle_states = self.supervisor.persisted_states();
+        self.config.clone()
     }
 
     fn ensure_profile_ports(&mut self, profile_names: &[String]) {
@@ -531,6 +571,7 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
         }
     }
     let state = AppState {
+        manager_id: runtime._manager_guard.manager_id().to_owned(),
         profiles,
         profile_options: runtime.config.profile_options.clone(),
         starting_profiles: runtime.starting_profiles.clone(),
@@ -618,93 +659,120 @@ fn start_named_profile_internal(
     name: &str,
     user_requested: bool,
 ) -> ApiResult<ApiMessage> {
-    let mut runtime = lock(shared)?;
-    if !user_requested && !runtime.supervisor.is_desired(name) {
-        return Ok(message("Recovery was cancelled by an intentional stop"));
-    }
-    let tools = runtime.tools();
+    let tools = {
+        let runtime = lock(shared)?;
+        if !user_requested && !runtime.supervisor.is_desired(name) {
+            return Ok(message("Recovery was cancelled by an intentional stop"));
+        }
+        runtime.tools()
+    };
     let profile = tools
         .discover_profiles()
         .into_iter()
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
-    if runtime.starting_profiles.contains(name) {
-        if user_requested {
-            runtime.supervisor.request_start(name, now_seconds());
-            runtime
-                .persist_desired_profiles()
-                .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-        }
-        return Ok(message("Android is already starting"));
-    }
-    if runtime.queued_profiles.iter().any(|queued| queued == name) {
-        if user_requested {
-            runtime.supervisor.mark_queued(name);
-            runtime
-                .persist_desired_profiles()
-                .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-        }
-        return Ok(message("Android is already queued"));
-    }
-    if profile.is_running() {
-        if user_requested {
-            runtime.supervisor.request_start(name, now_seconds());
-            runtime.supervisor.mark_running(name);
-            runtime
-                .persist_desired_profiles()
-                .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-        }
-        return Ok(message("Android is already running"));
-    }
-    let running = tools
-        .discover_profiles()
+    let discovered_profiles = tools.discover_profiles();
+    let running = discovered_profiles
         .into_iter()
         .filter(|candidate| candidate.is_running())
         .count();
-    if running + runtime.starting_profiles.len() + runtime.queued_profiles.len()
-        >= MAX_RUNNING_PROFILES
-    {
-        return api_error(
-            StatusCode::CONFLICT,
-            "This computer is limited to four running Androids. Stop an idle one first.",
-        );
-    }
-    if user_requested {
-        runtime.supervisor.request_start(name, now_seconds());
-        runtime
-            .persist_desired_profiles()
-            .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-    }
-    if !runtime.starting_profiles.is_empty() {
-        runtime.queued_profiles.push_back(name.to_owned());
-        runtime.supervisor.mark_queued(name);
-        runtime.log(
-            "info",
-            format!("Queued {name} until the current Android settles"),
-        );
-        return Ok(message("Android is queued for an adaptive start"));
-    }
-    let launch_admission = match enforce_launch_admission(&mut runtime.monitor) {
-        Ok(admission) => admission,
-        Err(reason) => {
+    let host_stats = HostMonitor::default().sample();
+
+    let (options, startup_generation, config_to_save) = {
+        let mut runtime = lock(shared)?;
+        if !user_requested && !runtime.supervisor.is_desired(name) {
+            return Ok(message("Recovery was cancelled by an intentional stop"));
+        }
+        if runtime.starting_profiles.contains(name) {
+            return Ok(message("Android is already starting"));
+        }
+        if runtime.queued_profiles.iter().any(|queued| queued == name) {
+            return Ok(message("Android is already queued"));
+        }
+        if profile.is_running() {
+            if user_requested {
+                let generation = runtime
+                    .supervisor
+                    .begin_admission(name, now_seconds(), true)
+                    .map_err(|message| error_tuple(StatusCode::CONFLICT, message))?;
+                runtime.supervisor.admission_succeeded(name, generation);
+                runtime.supervisor.complete_ready(name, generation);
+                let config = runtime.lifecycle_config_snapshot();
+                drop(runtime);
+                config.save().map_err(|error| {
+                    error_tuple(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not save device lifecycle state: {error}"),
+                    )
+                })?;
+            }
+            return Ok(message("Android is already running"));
+        }
+        if running + runtime.starting_profiles.len() + runtime.queued_profiles.len()
+            >= MAX_RUNNING_PROFILES
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "This computer is limited to four running Androids. Stop an idle one first.",
+            );
+        }
+        let generation = if user_requested {
             runtime
                 .supervisor
-                .record_failure(name, reason.clone(), None, now_seconds());
+                .begin_admission(name, now_seconds(), true)
+                .map_err(|message| error_tuple(StatusCode::CONFLICT, message))?
+        } else {
+            runtime.supervisor.generation(name).ok_or_else(|| {
+                error_tuple(StatusCode::CONFLICT, "Recovery generation is unavailable")
+            })?
+        };
+        if !runtime.starting_profiles.is_empty() {
+            runtime.queued_profiles.push_back(name.to_owned());
+            runtime.supervisor.mark_queued(name);
+            runtime.log(
+                "info",
+                format!("Queued {name} until the current Android settles"),
+            );
+            let config = runtime.lifecycle_config_snapshot();
+            drop(runtime);
+            config.save().map_err(|error| {
+                error_tuple(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Could not save device lifecycle state: {error}"),
+                )
+            })?;
+            return Ok(message("Android is queued for an adaptive start"));
+        }
+        if let Some(reason) = launch_block_reason(&host_stats) {
+            runtime
+                .supervisor
+                .reject_admission(name, reason.clone(), now_seconds());
+            let config = runtime.lifecycle_config_snapshot();
+            drop(runtime);
+            let _ = config.save();
             return Err(error_tuple(StatusCode::CONFLICT, reason));
         }
+        runtime.supervisor.admission_succeeded(name, generation);
+        let options = runtime
+            .config
+            .profile_options
+            .entry(name.to_owned())
+            .or_default()
+            .clone();
+        runtime.starting_profiles.insert(name.to_owned());
+        runtime
+            .startup_generations
+            .insert(name.to_owned(), generation);
+        let config = runtime.lifecycle_config_snapshot();
+        (options, generation, config)
     };
-    let options = runtime
-        .config
-        .profile_options
-        .entry(name.to_owned())
-        .or_default()
-        .clone();
-    runtime.starting_profiles.insert(name.to_owned());
-    let startup_generation = runtime.next_startup_generation;
-    runtime.next_startup_generation = runtime.next_startup_generation.wrapping_add(1).max(1);
-    runtime
-        .startup_generations
-        .insert(name.to_owned(), startup_generation);
+    config_to_save.save().map_err(|error| {
+        error_tuple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save device lifecycle state: {error}"),
+        )
+    })?;
+
     let (display_width, display_height) = display_dimensions(options.picture);
     let start_result = tools
         .configure_input_and_window(
@@ -723,44 +791,81 @@ fn start_named_profile_internal(
                 Ok(())
             }
         })
-        .and_then(|_| tools.start(&profile, &launch_args(&options), &options, launch_admission));
-    let scope_unit = match start_result {
-        Ok(scope_unit) => scope_unit,
+        .and_then(|_| {
+            tools.start(
+                &profile,
+                &launch_args(&options),
+                &options,
+                LaunchAdmission::granted(),
+            )
+        });
+    let launch_handle = match start_result {
+        Ok(launch_handle) => launch_handle,
         Err(message) => {
-            runtime.starting_profiles.remove(name);
-            runtime.startup_generations.remove(name);
-            runtime
-                .supervisor
-                .record_failure(name, message.clone(), None, now_seconds());
+            if let Ok(mut runtime) = shared.lock() {
+                runtime.starting_profiles.remove(name);
+                runtime.startup_generations.remove(name);
+                runtime
+                    .supervisor
+                    .record_failure(name, message.clone(), None, now_seconds());
+                let config = runtime.lifecycle_config_snapshot();
+                drop(runtime);
+                let _ = config.save();
+            }
             return Err(error_tuple(StatusCode::BAD_REQUEST, message));
         }
     };
-    if let Some(scope) = &scope_unit {
-        runtime
-            .profile_scopes
-            .insert(name.to_owned(), scope.clone());
-    }
+    let scope_unit = launch_handle.scope_unit.clone();
+    let config_to_save = {
+        let mut runtime = lock(shared)?;
+        if runtime.startup_generations.get(name) != Some(&startup_generation)
+            || !runtime.supervisor.is_desired(name)
+        {
+            drop(runtime);
+            if let Some(scope) = &scope_unit {
+                let _ = tools.stop_scope_and_wait(scope);
+            }
+            let _ = tools.cleanup_profile_runtime(name);
+            return Ok(message("Android start was cancelled"));
+        }
+        if let Some(scope) = &scope_unit {
+            runtime
+                .profile_scopes
+                .insert(name.to_owned(), scope.clone());
+            runtime.supervisor.mark_launching(
+                name,
+                startup_generation,
+                scope.clone(),
+                launch_handle.launcher_pid,
+            );
+            runtime.supervisor.mark_booting(name, startup_generation);
+        }
+        if options.rectangular_display {
+            runtime.rectangular_watchers.insert(name.to_owned());
+        }
+        if options.cold_boot
+            && let Some(saved) = runtime.config.profile_options.get_mut(name)
+        {
+            saved.cold_boot = false;
+        }
+        if options.speed == SpeedPreset::LeanGaming {
+            runtime.log(
+                "success",
+                format!("Starting {name} with a clean Lean Gaming boot"),
+            );
+        } else {
+            runtime.log("success", format!("Starting {name}"));
+        }
+        runtime.lifecycle_config_snapshot()
+    };
+    let _ = config_to_save.save();
     if options.rectangular_display {
-        runtime.rectangular_watchers.insert(name.to_owned());
         tools.watch_rectangular_display_after_start(name);
     }
     if options.speed == SpeedPreset::LeanGaming {
         tools.watch_lean_profile_after_start(name, options.suspend_store_during_automation);
     }
-    if options.cold_boot
-        && let Some(saved) = runtime.config.profile_options.get_mut(name)
-    {
-        saved.cold_boot = false;
-        let _ = runtime.config.save();
-    }
-    if options.speed == SpeedPreset::LeanGaming {
-        runtime.log(
-            "success",
-            format!("Starting {name} with a clean Lean Gaming boot"),
-        );
-    } else {
-        runtime.log("success", format!("Starting {name}"));
-    }
+    register_adaptive_cpu_controller(shared, name.to_owned(), scope_unit.clone());
     watch_profile_start(
         Arc::clone(shared),
         name.to_owned(),
@@ -780,16 +885,29 @@ fn watch_profile_start(
         let mut booted = false;
         for _ in 0..240 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let Ok(runtime) = shared.lock() else {
-                return;
+            let tools = {
+                let Ok(runtime) = shared.lock() else {
+                    return;
+                };
+                if runtime.startup_generations.get(&name) != Some(&startup_generation)
+                    || !runtime.supervisor.is_desired(&name)
+                {
+                    return;
+                }
+                runtime.tools()
             };
-            if runtime.tools().profile_boot_completed(&name) {
+            if tools.profile_boot_completed(&name) {
                 booted = true;
                 break;
             }
         }
 
         let completion = if booted {
+            if let Ok(mut runtime) = shared.lock()
+                && runtime.startup_generations.get(&name) == Some(&startup_generation)
+            {
+                runtime.supervisor.mark_settling(&name, startup_generation);
+            }
             // Give login, Play services and the automation target time to warm up.
             // Then require three calm host samples before admitting the next AVD.
             let settled = settle_after_boot().await;
@@ -812,7 +930,17 @@ fn watch_profile_start(
             StartupCompletion::TimedOut
         };
 
+        let snapshot_recovered = if booted {
+            false
+        } else {
+            matches!(
+                snapshot_recovery::recover_owned_snapshot_failure(&name, now_seconds()),
+                Ok(RecoveryOutcome::Quarantined)
+            )
+        };
+
         let mut timed_out_cleanup = None;
+        let mut config_to_save = None;
         if let Ok(mut runtime) = shared.lock() {
             if runtime.startup_generations.get(&name) != Some(&startup_generation) {
                 return;
@@ -820,18 +948,37 @@ fn watch_profile_start(
             runtime.starting_profiles.remove(&name);
             runtime.startup_generations.remove(&name);
             if booted {
-                runtime.supervisor.mark_running(&name);
-                runtime.log("success", format!("{name} is ready"));
+                if runtime.supervisor.complete_ready(&name, startup_generation) {
+                    runtime.log("success", format!("{name} is ready"));
+                }
             } else {
                 let cleanup_scope = scope_unit
                     .clone()
                     .or_else(|| runtime.profile_scopes.get(&name).cloned());
-                runtime.supervisor.record_failure(
-                    &name,
-                    "Emulator exceeded its 120 second boot deadline",
-                    cleanup_scope.clone(),
-                    now_seconds(),
-                );
+                let snapshot_retry = snapshot_recovered
+                    && runtime.supervisor.schedule_snapshot_recovery(
+                        &name,
+                        startup_generation,
+                        now_seconds(),
+                    );
+                if snapshot_retry {
+                    if let Some(options) = runtime.config.profile_options.get_mut(&name) {
+                        options.cold_boot = true;
+                    }
+                    runtime.log(
+                        "warning",
+                        format!(
+                            "{name} snapshot failed; quarantined default_boot for one cold retry"
+                        ),
+                    );
+                } else {
+                    runtime.supervisor.record_failure(
+                        &name,
+                        "Emulator exceeded its 120 second boot deadline",
+                        cleanup_scope.clone(),
+                        now_seconds(),
+                    );
+                }
                 timed_out_cleanup = Some((
                     runtime.tools(),
                     cleanup_scope,
@@ -843,6 +990,10 @@ fn watch_profile_start(
                 ));
                 runtime.log("warning", format!("{name} did not finish starting"));
             }
+            config_to_save = Some(runtime.lifecycle_config_snapshot());
+        }
+        if let Some(config) = config_to_save {
+            let _ = config.save();
         }
         if let Some((tools, scope, port)) = timed_out_cleanup {
             if let Some(scope) = scope {
@@ -854,9 +1005,7 @@ fn watch_profile_start(
             let _ = tools.cleanup_profile_runtime(&name);
         }
         start_next_queued_profile(&shared, completion);
-        if booted {
-            register_adaptive_cpu_controller(&shared, name, scope_unit);
-        }
+        let _ = scope_unit;
     });
 }
 
@@ -892,22 +1041,34 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
             .unwrap_or(1);
         let mut policy = CpuQuotaPolicy::new(STARTUP_CPU_QUOTA_PERCENT);
         let mut host_monitor = HostMonitor::default();
+        let mut cool_startup_samples = 0_u8;
         loop {
-            let (tools, running_emulators, profile_is_running) = {
+            let (tools, status, port) = {
                 let Ok(runtime) = shared.lock() else {
                     return;
                 };
-                let tools = runtime.tools();
-                let profiles = tools.discover_profiles();
-                let profile_is_running = profiles
-                    .iter()
-                    .any(|profile| profile.name == name && profile.is_running());
-                let running_emulators = profiles
-                    .iter()
-                    .filter(|profile| profile.is_running())
-                    .count();
-                (tools, running_emulators, profile_is_running)
+                (
+                    runtime.tools(),
+                    runtime.supervisor.statuses().get(&name).cloned(),
+                    runtime
+                        .config
+                        .profile_options
+                        .get(&name)
+                        .and_then(|options| options.adb_port),
+                )
             };
+            let Some(status) = status else {
+                break;
+            };
+            let generation = status.generation;
+            let profiles = tools.discover_profiles();
+            let profile_is_running = profiles
+                .iter()
+                .any(|profile| profile.name == name && profile.is_running());
+            let running_emulators = profiles
+                .iter()
+                .filter(|profile| profile.is_running())
+                .count();
             let sample = match tools.scope_cpu_stat(&scope_unit) {
                 Ok(sample) => sample,
                 Err(error) => {
@@ -924,17 +1085,88 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                 }
             };
             let host_stats = host_monitor.sample();
-            if let Some(percent) = policy.observe(
-                sample,
-                running_emulators,
-                logical_cpus,
-                host_stats.cpu_percent,
-                host_stats.cpu_temperature_c,
-            ) {
+            let starting = matches!(
+                status.phase,
+                DevicePhase::Admitting
+                    | DevicePhase::Launching
+                    | DevicePhase::Booting
+                    | DevicePhase::Settling
+            );
+            let startup_decision =
+                startup_thermal_decision(sample.quota_percent, host_stats.cpu_temperature_c);
+            if startup_decision == ThermalDecision::Stop
+                || host_stats
+                    .cpu_temperature_c
+                    .is_some_and(|temperature| temperature.is_finite() && temperature >= 90.0)
+            {
+                let _ = tools.stop_scope_and_wait(&scope_unit);
+                if let Some(port) = port {
+                    tools.disconnect_port(port);
+                }
+                let _ = tools.cleanup_profile_runtime(&name);
+                if let Ok(mut runtime) = shared.lock() {
+                    runtime.starting_profiles.remove(&name);
+                    runtime.startup_generations.remove(&name);
+                    runtime.profile_scopes.remove(&name);
+                    runtime.supervisor.enter_thermal_hold(
+                        &name,
+                        generation,
+                        host_stats.cpu_temperature_c.unwrap_or(90.0),
+                        now_seconds(),
+                    );
+                    runtime.log(
+                        "warning",
+                        format!("Stopped {name} at the 90 C thermal limit"),
+                    );
+                    let config = runtime.lifecycle_config_snapshot();
+                    drop(runtime);
+                    let _ = config.save();
+                }
+                break;
+            }
+
+            let desired_quota = if starting {
+                if host_stats
+                    .cpu_temperature_c
+                    .is_some_and(|temperature| temperature < 75.0)
+                {
+                    cool_startup_samples = cool_startup_samples.saturating_add(1);
+                } else {
+                    cool_startup_samples = 0;
+                }
+                match startup_decision {
+                    ThermalDecision::Quota(percent) if percent > sample.quota_percent => {
+                        if cool_startup_samples >= 5 {
+                            cool_startup_samples = 0;
+                            Some(percent)
+                        } else {
+                            None
+                        }
+                    }
+                    ThermalDecision::Quota(percent) => Some(percent),
+                    ThermalDecision::Keep | ThermalDecision::Stop => None,
+                }
+            } else {
+                policy.observe(
+                    sample,
+                    running_emulators,
+                    logical_cpus,
+                    host_stats.cpu_percent,
+                    host_stats.cpu_temperature_c,
+                )
+            };
+
+            if let Some(percent) = desired_quota {
                 let weight = if percent > 120 { 100 } else { 25 };
                 match tools.set_scope_cpu_policy(&scope_unit, percent, weight) {
                     Ok(()) => {
                         if let Ok(mut runtime) = shared.lock() {
+                            runtime.supervisor.update_telemetry(
+                                &name,
+                                generation,
+                                percent,
+                                host_stats.cpu_temperature_c,
+                            );
                             runtime.log(
                                 "success",
                                 format!(
@@ -952,6 +1184,13 @@ fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<
                         }
                     }
                 }
+            } else if let Ok(mut runtime) = shared.lock() {
+                runtime.supervisor.update_telemetry(
+                    &name,
+                    generation,
+                    sample.quota_percent,
+                    host_stats.cpu_temperature_c,
+                );
             }
             tokio::time::sleep(std::time::Duration::from_secs(CPU_CONTROL_SAMPLE_SECONDS)).await;
         }
@@ -1039,46 +1278,57 @@ async fn stop_profile(
 
 fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     let mut runtime = lock(shared)?;
+    // Persist cancellation before any ADB, systemd or filesystem operation so a
+    // blocked probe cannot delay or reverse an intentional stop.
     runtime.starting_profiles.remove(name);
     runtime.startup_generations.remove(name);
     runtime.queued_profiles.retain(|queued| queued != name);
     let tools = runtime.tools();
-    let profile = tools
-        .discover_profiles()
-        .into_iter()
-        .find(|profile| profile.name == name)
-        .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
     runtime.supervisor.request_stop(name);
-    runtime
-        .persist_desired_profiles()
-        .map_err(|message| error_tuple(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-    let scope = runtime
-        .profile_scopes
-        .remove(name)
-        .or_else(|| tools.owned_scope_for_profile(name));
+    let scope = runtime.profile_scopes.remove(name);
     let port = runtime
         .config
         .profile_options
         .get(name)
         .and_then(|options| options.adb_port);
-    let serial = profile.running_serial;
+    let config = runtime.lifecycle_config_snapshot();
     drop(runtime);
+    config.save().map_err(|error| {
+        error_tuple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save device lifecycle state: {error}"),
+        )
+    })?;
 
-    if let Some(serial) = &serial {
-        let _ = tools.stop(serial);
-        std::thread::sleep(std::time::Duration::from_millis(750));
-    }
-    if let Some(scope) = &scope {
-        let _ = tools.stop_scope_and_wait(scope);
-    }
-    if let Some(port) = port {
-        tools.disconnect_port(port);
-    }
-    let _ = tools.cleanup_profile_runtime(name);
-    if let Ok(mut runtime) = shared.lock() {
-        runtime.log("info", format!("Stopped and cleaned up {name}"));
-    }
-    Ok(message("Android stopped"))
+    let shared = Arc::clone(shared);
+    let name = name.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let scope = scope.or_else(|| tools.owned_scope_for_profile(&name));
+        let serial = tools
+            .discover_profiles()
+            .into_iter()
+            .find(|profile| profile.name == name)
+            .and_then(|profile| profile.running_serial);
+        if let Some(serial) = &serial {
+            let _ = tools.stop(serial);
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        }
+        if let Some(scope) = &scope {
+            let _ = tools.stop_scope_and_wait(scope);
+        }
+        if let Some(port) = port {
+            tools.disconnect_port(port);
+        }
+        let _ = tools.cleanup_profile_runtime(&name);
+        if let Ok(mut runtime) = shared.lock() {
+            runtime.supervisor.mark_cleaned(&name);
+            runtime.log("info", format!("Stopped and cleaned up {name}"));
+            let config = runtime.lifecycle_config_snapshot();
+            drop(runtime);
+            let _ = config.save();
+        }
+    });
+    Ok(message("Android stop requested"))
 }
 
 async fn start_port(State(shared): State<Shared>, Path(port): Path<u16>) -> ApiResult<ApiMessage> {
@@ -1141,7 +1391,7 @@ fn port_readiness_from_state(
         };
     };
     match status.phase {
-        DevicePhase::Running => PortReadiness {
+        DevicePhase::Ready => PortReadiness {
             ready: true,
             phase: "ready",
             message: format!("{name} is ready for app launch"),
@@ -1151,26 +1401,32 @@ fn port_readiness_from_state(
             phase: "queued",
             message: format!("{name} is queued for startup"),
         },
-        DevicePhase::Starting => PortReadiness {
+        DevicePhase::Admitting
+        | DevicePhase::Launching
+        | DevicePhase::Booting
+        | DevicePhase::Settling
+        | DevicePhase::HalfOpen => PortReadiness {
             ready: false,
             phase: "starting",
             message: format!("{name} is still completing its clean boot"),
         },
-        DevicePhase::Recovering => PortReadiness {
-            ready: false,
-            phase: "recovering",
-            message: status
-                .last_failure
-                .unwrap_or_else(|| format!("{name} is recovering")),
-        },
-        DevicePhase::Degraded => PortReadiness {
+        DevicePhase::Backoff | DevicePhase::SnapshotRecovery | DevicePhase::ThermalHold => {
+            PortReadiness {
+                ready: false,
+                phase: "recovering",
+                message: status
+                    .last_failure
+                    .unwrap_or_else(|| format!("{name} is recovering")),
+            }
+        }
+        DevicePhase::CircuitOpen => PortReadiness {
             ready: false,
             phase: "degraded",
             message: status
                 .last_failure
                 .unwrap_or_else(|| format!("{name} needs attention")),
         },
-        DevicePhase::Stopped => PortReadiness {
+        DevicePhase::Stopping | DevicePhase::Cleaned | DevicePhase::Stopped => PortReadiness {
             ready: false,
             phase: "stopped",
             message: format!("{name} is stopped"),
@@ -1416,10 +1672,12 @@ fn launch_block_reason(host: &HostStats) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn enforce_launch_admission(monitor: &mut HostMonitor) -> Result<LaunchAdmission, String> {
     enforce_launch_admission_with(|| monitor.sample())
 }
 
+#[cfg(test)]
 fn enforce_launch_admission_with(
     sample: impl FnOnce() -> HostStats,
 ) -> Result<LaunchAdmission, String> {
@@ -1569,8 +1827,8 @@ mod tests {
 
     #[test]
     fn adaptive_cpu_control_starts_conservatively_and_reacts_quickly() {
-        assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 180);
-        assert_eq!(CPU_CONTROL_SAMPLE_SECONDS, 5);
+        assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 80);
+        assert_eq!(CPU_CONTROL_SAMPLE_SECONDS, 1);
     }
 
     #[test]
@@ -1580,7 +1838,7 @@ mod tests {
                 true,
                 false,
                 false,
-                Some(crate::supervisor::DevicePhase::Running),
+                Some(crate::supervisor::DevicePhase::Ready),
                 Some("emumi-Device_3-123.scope".into()),
             ),
             Some(crate::supervisor::Observation::Unresponsive {
@@ -1592,7 +1850,7 @@ mod tests {
     #[test]
     fn readiness_uses_cached_supervision_without_waiting_for_adb() {
         let running = crate::supervisor::DeviceStatus {
-            phase: crate::supervisor::DevicePhase::Running,
+            phase: crate::supervisor::DevicePhase::Ready,
             desired_running: true,
             ..Default::default()
         };
@@ -1601,7 +1859,7 @@ mod tests {
         assert_eq!(ready.phase, "ready");
 
         let recovering = crate::supervisor::DeviceStatus {
-            phase: crate::supervisor::DevicePhase::Recovering,
+            phase: crate::supervisor::DevicePhase::Backoff,
             desired_running: true,
             last_failure: Some("health probe timed out".into()),
             ..Default::default()

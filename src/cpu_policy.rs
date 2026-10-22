@@ -14,6 +14,41 @@ pub struct CpuQuotaPolicy {
     thermal_limited: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThermalDecision {
+    Keep,
+    Quota(u16),
+    Stop,
+}
+
+pub fn startup_thermal_decision(
+    current_percent: u16,
+    temperature_c: Option<f32>,
+) -> ThermalDecision {
+    let Some(temperature) = temperature_c.filter(|value| value.is_finite()) else {
+        return ThermalDecision::Keep;
+    };
+    if temperature >= 90.0 {
+        ThermalDecision::Stop
+    } else if temperature >= 85.0 {
+        if current_percent != 50 {
+            ThermalDecision::Quota(50)
+        } else {
+            ThermalDecision::Keep
+        }
+    } else if temperature >= 80.0 {
+        if current_percent > 80 {
+            ThermalDecision::Quota(80)
+        } else {
+            ThermalDecision::Keep
+        }
+    } else if temperature < 75.0 && current_percent < 120 {
+        ThermalDecision::Quota(current_percent.saturating_add(10).min(120))
+    } else {
+        ThermalDecision::Keep
+    }
+}
+
 const THERMAL_LIMIT_ENTER_C: f32 = 85.0;
 const THERMAL_LIMIT_EXIT_C: f32 = 80.0;
 
@@ -327,5 +362,30 @@ mod tests {
             policy.observe(stat(110, 98, 1_700_000), 2, 8, 40.0, Some(70.0)),
             Some(240)
         );
+    }
+
+    #[test]
+    fn startup_thermal_controller_uses_the_confirmed_tiers() {
+        assert_eq!(
+            startup_thermal_decision(80, Some(70.0)),
+            ThermalDecision::Quota(90)
+        );
+        assert_eq!(
+            startup_thermal_decision(120, Some(70.0)),
+            ThermalDecision::Keep
+        );
+        assert_eq!(
+            startup_thermal_decision(120, Some(80.0)),
+            ThermalDecision::Quota(80)
+        );
+        assert_eq!(
+            startup_thermal_decision(80, Some(85.0)),
+            ThermalDecision::Quota(50)
+        );
+        assert_eq!(
+            startup_thermal_decision(50, Some(90.0)),
+            ThermalDecision::Stop
+        );
+        assert_eq!(startup_thermal_decision(80, None), ThermalDecision::Keep);
     }
 }

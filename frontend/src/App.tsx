@@ -69,14 +69,21 @@ type Page = "androids" | "monitor" | "logs" | "settings";
 type PendingAction = "starting" | "stopping";
 type Speed = "Efficient" | "LeanGaming" | "Balanced" | "Fast";
 type Picture = "Compact" | "Phone" | "Sharp";
-type LifecyclePhase = "stopped" | "queued" | "starting" | "running" | "recovering" | "degraded";
+type LifecyclePhase = "stopped" | "queued" | "admitting" | "launching" | "booting" | "settling" | "ready" | "thermal_hold" | "snapshot_recovery" | "backoff" | "half_open" | "circuit_open" | "stopping" | "cleaned";
 
 type DeviceSupervision = {
   phase: LifecyclePhase;
   desired_running: boolean;
+  generation: number;
+  stop_requested: boolean;
   consecutive_failures: number;
   next_retry_at: number | null;
   last_failure: string | null;
+  scope: string | null;
+  pid: number | null;
+  cpu_quota_percent: number | null;
+  cpu_temperature_c: number | null;
+  snapshot_state: string | null;
 };
 
 type AndroidProfile = {
@@ -131,6 +138,7 @@ type DeviceHostStats = {
 };
 
 type AppState = {
+  manager_id: string;
   profiles: AndroidProfile[];
   profile_options: Record<string, ProfileOptions>;
   starting_profiles: string[];
@@ -184,10 +192,13 @@ function statusLabel(profile: AndroidProfile, pending?: PendingAction, lifecycle
   if (pending === "starting") return "Starting…";
   if (pending === "stopping") return "Stopping…";
   if (lifecycle?.phase === "queued") return "Queued";
-  if (lifecycle?.phase === "starting") return "Starting…";
-  if (lifecycle?.phase === "recovering") return "Recovering…";
-  if (lifecycle?.phase === "degraded") return "Recovery paused";
-  if (lifecycle?.phase === "running") return "Running";
+  if (lifecycle && ["admitting", "launching", "booting", "settling", "half_open"].includes(lifecycle.phase)) return lifecycle.phase === "settling" ? "Settling…" : "Starting…";
+  if (lifecycle?.phase === "snapshot_recovery") return "Snapshot recovery";
+  if (lifecycle?.phase === "thermal_hold") return "Cooling down";
+  if (lifecycle?.phase === "backoff") return "Retry scheduled";
+  if (lifecycle?.phase === "circuit_open") return "Recovery paused";
+  if (lifecycle?.phase === "stopping" || lifecycle?.phase === "cleaned") return "Stopping…";
+  if (lifecycle?.phase === "ready") return "Ready";
   return profile.running_serial ? "Running" : "Stopped";
 }
 
@@ -199,9 +210,9 @@ function runActionLabel(profile: AndroidProfile, pending?: PendingAction, lifecy
 }
 
 function lifecycleColor(profile: AndroidProfile, pending?: PendingAction, lifecycle?: DeviceSupervision): "default" | "success" | "warning" | "error" {
-  if (lifecycle?.phase === "degraded") return "error";
-  if (pending || lifecycle && ["queued", "starting", "recovering"].includes(lifecycle.phase)) return "warning";
-  return profile.running_serial || lifecycle?.phase === "running" ? "success" : "default";
+  if (lifecycle?.phase === "circuit_open") return "error";
+  if (pending || lifecycle && ["queued", "admitting", "launching", "booting", "settling", "half_open", "snapshot_recovery", "thermal_hold", "backoff", "stopping", "cleaned"].includes(lifecycle.phase)) return "warning";
+  return profile.running_serial || lifecycle?.phase === "ready" ? "success" : "default";
 }
 
 function displayProfileName(name: string) {
@@ -523,7 +534,8 @@ function ProfileDetail({ profile, options, pending, lifecycle, setPending, perfo
             <Tooltip title={running ? "Stop this Android before deleting it" : "Delete this Android"}><span><Button sx={{ minWidth: 104 }} variant="outlined" color="error" startIcon={<DeleteOutlineRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setDeleteName(profile.name)}>Delete</Button></span></Tooltip>
             <Button sx={{ minWidth: 112 }} variant="contained" color={running || lifecycle?.desired_running ? "error" : "primary"} startIcon={pending ? <CircularProgress size={18} color="inherit" /> : running || lifecycle?.desired_running ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending) || busy} onClick={() => void toggleRun()}>{runActionLabel(profile, pending, lifecycle)}</Button>
           </Stack>
-          {lifecycle?.last_failure && <Alert severity={lifecycle.phase === "degraded" ? "error" : "warning"}>{lifecycle.last_failure}{lifecycle.next_retry_at ? ` · retry scheduled automatically` : ""}</Alert>}
+          {lifecycle && <Stack direction="row" gap={1} flexWrap="wrap"><Chip size="small" variant="outlined" label={`Generation ${lifecycle.generation}`} />{lifecycle.scope && <Chip size="small" variant="outlined" label={lifecycle.scope} />}{lifecycle.pid && <Chip size="small" variant="outlined" label={`Launcher PID ${lifecycle.pid}`} />}{lifecycle.cpu_quota_percent && <Chip size="small" variant="outlined" label={`CPU quota ${lifecycle.cpu_quota_percent}%`} />}{lifecycle.cpu_temperature_c !== null && <Chip size="small" variant="outlined" label={`${lifecycle.cpu_temperature_c.toFixed(1)} °C`} />}{lifecycle.snapshot_state && <Chip size="small" variant="outlined" label={lifecycle.snapshot_state} />}{lifecycle.stop_requested && <Chip size="small" color="warning" label="Stop requested" />}</Stack>}
+          {lifecycle?.last_failure && <Alert severity={lifecycle.phase === "circuit_open" ? "error" : "warning"}>{lifecycle.last_failure}{lifecycle.next_retry_at ? ` · retry scheduled automatically` : ""}</Alert>}
         </Stack>
       </CardContent></Card>
 
@@ -709,7 +721,7 @@ function SettingsPage({ state, perform, busy }: { state: AppState; perform: Perf
   ] as const;
   return <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1.4fr) minmax(320px, 1fr)" }, gap: 3 }}>
     <Card><CardContent><Stack direction="row" alignItems="center" mb={3}><Box sx={{ flexGrow: 1 }}><Typography variant="h6">Tool locations</Typography><Typography variant="body2" color="text.secondary">EmuMi normally detects these automatically.</Typography></Box><CodeRounded color="action" /></Stack><Stack spacing={2.5}><TextField fullWidth label="Android SDK path" value={sdkPath} onChange={(event) => setSdkPath(event.target.value)} helperText="Usually /home/you/Android/Sdk" /><TextField fullWidth label="JDK path" value={jdkPath} onChange={(event) => setJdkPath(event.target.value)} helperText="Leave blank to use Java from your PATH" /><Box><Button sx={{ minWidth: 112 }} variant="contained" disabled={!dirty || busy} startIcon={busy ? <CircularProgress size={18} color="inherit" /> : undefined} onClick={() => void perform("/api/settings", { method: "POST", body: JSON.stringify({ android_sdk_path: sdkPath, jdk_path: jdkPath }) })}>{busy ? "Saving…" : dirty ? "Save paths" : "Saved"}</Button></Box></Stack></CardContent></Card>
-    <Card><CardContent><Typography variant="h6">System check</Typography><Typography variant="body2" color="text.secondary" mb={2}>Everything required to create and run Androids</Typography><List disablePadding>{checks.map(([name, detail, ok]) => <ListItem key={name} disableGutters divider><ListItemIcon>{ok ? <CheckCircleRounded color="success" /> : <WarningAmberRounded color="warning" />}</ListItemIcon><ListItemText primary={name} secondary={detail} /><Chip size="small" color={ok ? "success" : "warning"} variant="outlined" label={ok ? "Ready" : "Check"} /></ListItem>)}</List><Alert severity="info" icon={<HelpOutlineRounded />} sx={{ mt: 2 }}>Changes take effect on the next refresh or launch.</Alert></CardContent></Card>
+    <Card><CardContent><Typography variant="h6">System check</Typography><Typography variant="body2" color="text.secondary">Everything required to create and run Androids</Typography><Typography variant="caption" color="text.secondary" display="block" mb={2}>Manager {state.manager_id}</Typography><List disablePadding>{checks.map(([name, detail, ok]) => <ListItem key={name} disableGutters divider><ListItemIcon>{ok ? <CheckCircleRounded color="success" /> : <WarningAmberRounded color="warning" />}</ListItemIcon><ListItemText primary={name} secondary={detail} /><Chip size="small" color={ok ? "success" : "warning"} variant="outlined" label={ok ? "Ready" : "Check"} /></ListItem>)}</List><Alert severity="info" icon={<HelpOutlineRounded />} sx={{ mt: 2 }}>Changes take effect on the next refresh or launch.</Alert></CardContent></Card>
   </Box>;
 }
 
