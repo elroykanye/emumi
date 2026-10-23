@@ -9,7 +9,7 @@ use std::{
     sync::Mutex,
 };
 
-const CURRENT_POLICY_VERSION: u32 = 2;
+const CURRENT_POLICY_VERSION: u32 = 3;
 static CONFIG_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,10 +85,6 @@ impl AppConfig {
                 options.mute_audio = true;
                 options.headless_automation = true;
                 options.refresh_rate_hz = 30;
-                options.host_memory_policy = true;
-                options.memory_high_mb = 5632;
-                options.memory_max_mb = 6656;
-                options.memory_swap_max_mb = 1024;
             }
         }
         self.policy_version = CURRENT_POLICY_VERSION;
@@ -134,10 +130,6 @@ mod tests {
         assert!(options.mute_audio);
         assert!(options.disable_vulkan);
         assert_eq!(options.refresh_rate_hz, 30);
-        assert!(options.host_memory_policy);
-        assert_eq!(options.memory_high_mb, 5632);
-        assert_eq!(options.memory_max_mb, 6656);
-        assert_eq!(options.memory_swap_max_mb, 1024);
         let intel = &config.profile_options["Device_Intel"];
         assert_eq!(intel.cores, 2);
         assert_eq!(intel.gpu_mode, "host-intel");
@@ -177,28 +169,20 @@ mod tests {
         assert_eq!(config.profile_options["Device_4"].cores, 4);
         assert_eq!(config.profile_options["Device_4"].memory_mb, 6144);
         assert!(!config.profile_options["Device_4"].headless_automation);
-        assert!(!config.profile_options["Device_4"].host_memory_policy);
     }
 
     #[test]
-    fn lifecycle_retry_and_thermal_state_round_trip_with_the_config() {
-        let mut supervisor = crate::supervisor::DeviceSupervisor::default();
-        let generation = supervisor.begin_admission("Device_3", 0, true).unwrap();
-        supervisor.enter_thermal_hold("Device_3", generation, 94.0, 10);
-        let config = AppConfig {
-            desired_running_profiles: BTreeSet::from(["Device_3".to_owned()]),
-            lifecycle_states: supervisor.persisted_states(),
-            ..AppConfig::default()
-        };
-
-        let encoded = serde_json::to_string(&config).unwrap();
-        let decoded: AppConfig = serde_json::from_str(&encoded).unwrap();
+    fn legacy_thermal_state_is_readable_and_resumes_without_a_hold() {
+        let decoded: AppConfig = serde_json::from_str(
+            r#"{"lifecycle_states":{"Device_3":{"status":{"phase":"thermal_hold","desired_running":true,"generation":1,"stop_requested":false,"consecutive_failures":0,"next_retry_at":40,"last_failure":"Thermal stop","scope":null,"pid":null,"snapshot_state":null}}}}"#,
+        )
+        .unwrap();
         let restored = crate::supervisor::DeviceSupervisor::restore(decoded.lifecycle_states);
 
         assert_eq!(
             restored.status("Device_3").phase,
-            crate::supervisor::DevicePhase::ThermalHold
+            crate::supervisor::DevicePhase::Backoff
         );
-        assert_eq!(restored.status("Device_3").next_retry_at, Some(40));
+        assert_eq!(restored.status("Device_3").next_retry_at, Some(0));
     }
 }

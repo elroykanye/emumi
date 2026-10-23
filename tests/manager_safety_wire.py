@@ -34,7 +34,7 @@ def run_case(mode: str) -> dict:
     ):
         path.mkdir(parents=True, exist_ok=True)
     executable(sdk / "emulator/emulator", 'printf "Device_4\\n"\n')
-    if mode in {"thermal", "adopt", "restart"}:
+    if mode in {"legacy_hold", "adopt", "restart"}:
         executable(
             sdk / "platform-tools/adb",
             '''case "$*" in
@@ -59,7 +59,7 @@ case "$*" in
 esac
 ''',
     )
-    phase = {"thermal": "thermal_hold", "restart": "booting"}.get(mode, "ready")
+    phase = {"legacy_hold": "thermal_hold", "restart": "booting"}.get(mode, "ready")
     config = {
         "android_sdk_path": str(sdk),
         "policy_version": 2,
@@ -73,12 +73,12 @@ esac
                     "generation": 1,
                     "stop_requested": False,
                     "consecutive_failures": 0,
-                    "next_retry_at": int(time.time()) + 30 if mode == "thermal" else None,
-                    "last_failure": "Thermal stop at 95 C" if mode == "thermal" else None,
+                    "next_retry_at": int(time.time()) + 30 if mode == "legacy_hold" else None,
+                    "last_failure": "Thermal stop at 95 C" if mode == "legacy_hold" else None,
                     "scope": None if mode == "adopt" else "emumi-Device_4-123.scope",
                     "pid": None if mode == "adopt" else 999999,
                     "cpu_quota_percent": 80,
-                    "cpu_temperature_c": 95.0 if mode == "thermal" else 60.0,
+                    "cpu_temperature_c": 95.0 if mode == "legacy_hold" else 60.0,
                     "snapshot_state": None,
                 }
             }
@@ -133,10 +133,12 @@ esac
             assert saved["next_retry_at"] == current["next_retry_at"]
             return {"phase": saved["phase"], "retry": saved["next_retry_at"]}
 
-        if mode == "thermal":
+        if mode == "legacy_hold":
             time.sleep(0.5)
             status = request("/api/state")["device_supervision"]["Device_4"]
-            assert status["phase"] == "thermal_hold"
+            assert status["phase"] != "thermal_hold"
+            assert "cpu_quota_percent" not in status
+            assert "cpu_temperature_c" not in status
             return {"phase": status["phase"]}
 
         if mode == "restart":
@@ -174,6 +176,6 @@ esac
 
 results = {
     mode: run_case(mode)
-    for mode in ("cleanup", "persistence", "mutex", "thermal", "adopt", "restart")
+    for mode in ("cleanup", "persistence", "mutex", "legacy_hold", "adopt", "restart")
 }
 print("PASS manager safety wire " + json.dumps(results, sort_keys=True))

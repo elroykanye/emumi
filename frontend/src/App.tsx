@@ -81,8 +81,6 @@ type DeviceSupervision = {
   last_failure: string | null;
   scope: string | null;
   pid: number | null;
-  cpu_quota_percent: number | null;
-  cpu_temperature_c: number | null;
   snapshot_state: string | null;
 };
 
@@ -113,10 +111,6 @@ type ProfileOptions = {
   disable_vulkan: boolean;
   refresh_rate_hz: number;
   suspend_store_during_automation: boolean;
-  host_memory_policy: boolean;
-  memory_high_mb: number;
-  memory_max_mb: number;
-  memory_swap_max_mb: number;
 };
 
 type DeviceHostStats = {
@@ -142,7 +136,6 @@ type AppState = {
   profiles: AndroidProfile[];
   profile_options: Record<string, ProfileOptions>;
   starting_profiles: string[];
-  queued_profiles: string[];
   device_supervision: Record<string, DeviceSupervision>;
   system_images: { package_id: string; label: string }[];
   config: { android_sdk_path: string; jdk_path: string };
@@ -172,10 +165,6 @@ const defaultOptions: ProfileOptions = {
   disable_vulkan: true,
   refresh_rate_hz: 30,
   suspend_store_during_automation: true,
-  host_memory_policy: true,
-  memory_high_mb: 5632,
-  memory_max_mb: 6656,
-  memory_swap_max_mb: 1024,
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -271,7 +260,7 @@ export default function App() {
         const updated = { ...current };
         for (const [name, action] of Object.entries(updated)) {
           const profile = next.profiles.find((item) => item.name === name);
-          const activeStart = next.starting_profiles.includes(name) || next.queued_profiles.includes(name);
+          const activeStart = next.starting_profiles.includes(name);
           if (!profile || (action === "starting" && (profile.running_serial || activeStart)) || (action === "stopping" && !profile.running_serial && !activeStart)) {
             delete updated[name];
           }
@@ -494,10 +483,6 @@ function ProfileDetail({ profile, options, pending, lifecycle, setPending, perfo
         rectangular_display: true,
         refresh_rate_hz: 30,
         suspend_store_during_automation: true,
-        host_memory_policy: true,
-        memory_high_mb: 5632,
-        memory_max_mb: 6656,
-        memory_swap_max_mb: 1024,
       } : {}),
     }));
   };
@@ -534,7 +519,7 @@ function ProfileDetail({ profile, options, pending, lifecycle, setPending, perfo
             <Tooltip title={running ? "Stop this Android before deleting it" : "Delete this Android"}><span><Button sx={{ minWidth: 104 }} variant="outlined" color="error" startIcon={<DeleteOutlineRounded />} disabled={running || Boolean(pending) || busy} onClick={() => setDeleteName(profile.name)}>Delete</Button></span></Tooltip>
             <Button sx={{ minWidth: 112 }} variant="contained" color={running || lifecycle?.desired_running ? "error" : "primary"} startIcon={pending ? <CircularProgress size={18} color="inherit" /> : running || lifecycle?.desired_running ? <StopRounded /> : <PlayArrowRounded />} disabled={Boolean(pending) || busy} onClick={() => void toggleRun()}>{runActionLabel(profile, pending, lifecycle)}</Button>
           </Stack>
-          {lifecycle && <Stack direction="row" gap={1} flexWrap="wrap"><Chip size="small" variant="outlined" label={`Generation ${lifecycle.generation}`} />{lifecycle.scope && <Chip size="small" variant="outlined" label={lifecycle.scope} />}{lifecycle.pid && <Chip size="small" variant="outlined" label={`Launcher PID ${lifecycle.pid}`} />}{lifecycle.cpu_quota_percent && <Chip size="small" variant="outlined" label={`CPU quota ${lifecycle.cpu_quota_percent}%`} />}{lifecycle.cpu_temperature_c !== null && <Chip size="small" variant="outlined" label={`${lifecycle.cpu_temperature_c.toFixed(1)} °C`} />}{lifecycle.snapshot_state && <Chip size="small" variant="outlined" label={lifecycle.snapshot_state} />}{lifecycle.stop_requested && <Chip size="small" color="warning" label="Stop requested" />}</Stack>}
+          {lifecycle && <Stack direction="row" gap={1} flexWrap="wrap"><Chip size="small" variant="outlined" label={`Generation ${lifecycle.generation}`} />{lifecycle.scope && <Chip size="small" variant="outlined" label={lifecycle.scope} />}{lifecycle.pid && <Chip size="small" variant="outlined" label={`Launcher PID ${lifecycle.pid}`} />}{lifecycle.snapshot_state && <Chip size="small" variant="outlined" label={lifecycle.snapshot_state} />}{lifecycle.stop_requested && <Chip size="small" color="warning" label="Stop requested" />}</Stack>}
           {lifecycle?.last_failure && <Alert severity={lifecycle.phase === "circuit_open" ? "error" : "warning"}>{lifecycle.last_failure}{lifecycle.next_retry_at ? ` · retry scheduled automatically` : ""}</Alert>}
         </Stack>
       </CardContent></Card>
@@ -610,16 +595,6 @@ function ProfileDetail({ profile, options, pending, lifecycle, setPending, perfo
               <FormControlLabel control={<Switch checked={draft.speed === "LeanGaming" || draft.cold_boot} disabled={draft.speed === "LeanGaming"} onChange={(event) => setDraft({ ...draft, cold_boot: event.target.checked })} />} label={draft.speed === "LeanGaming" ? "Clean boot always on" : "Cold boot next time"} />
               <FormControlLabel control={<Switch checked={draft.disable_vulkan} onChange={(event) => setDraft({ ...draft, disable_vulkan: event.target.checked })} />} label="Disable Vulkan (recommended for Linux stability)" />
             </Box>
-            <Divider sx={{ my: 2 }} />
-            <FormControlLabel control={<Switch checked={draft.host_memory_policy} onChange={(event) => setDraft({ ...draft, host_memory_policy: event.target.checked })} />} label="Protect the Linux host with per-emulator resource controls" />
-            {draft.host_memory_policy && <Stack spacing={2} mt={2}>
-              <Alert severity="info">EmuMi gives this Android lower CPU and disk priority under contention, starts memory reclaim at MemoryHigh, and treats MemoryMax as a last-resort ceiling. Android still receives its configured guest memory.</Alert>
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "repeat(3, 1fr)" }, gap: 2 }}>
-                <TextField label="MemoryHigh (MB)" type="number" value={draft.memory_high_mb} helperText="Reclaim begins here" onChange={(event) => setDraft({ ...draft, memory_high_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 4096, step: 256 } }} />
-                <TextField label="MemoryMax (MB)" type="number" value={draft.memory_max_mb} helperText="Last-resort ceiling" onChange={(event) => setDraft({ ...draft, memory_max_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 4096, step: 256 } }} />
-                <TextField label="SwapMax (MB)" type="number" value={draft.memory_swap_max_mb} helperText="Host swap allowance" onChange={(event) => setDraft({ ...draft, memory_swap_max_mb: Number(event.target.value) })} slotProps={{ htmlInput: { min: 0, step: 256 } }} />
-              </Box>
-            </Stack>}
           </AccordionDetails>
         </Accordion>
       </CardContent></Card>
@@ -717,7 +692,7 @@ function SettingsPage({ state, perform, busy }: { state: AppState; perform: Perf
     ["AVD Manager", "Creates and removes Android profiles", state.health.avd_manager],
     ["KVM acceleration", "Provides fast Linux virtualization", state.health.kvm],
     ["Java", "Runs Android SDK management tools", state.health.java],
-    ["systemd scopes", "Per-emulator CPU, disk, memory and swap controls", state.health.systemd_run],
+    ["systemd scopes", "Own and clean up each emulator process tree", state.health.systemd_run],
   ] as const;
   return <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1.4fr) minmax(320px, 1fr)" }, gap: 3 }}>
     <Card><CardContent><Stack direction="row" alignItems="center" mb={3}><Box sx={{ flexGrow: 1 }}><Typography variant="h6">Tool locations</Typography><Typography variant="body2" color="text.secondary">EmuMi normally detects these automatically.</Typography></Box><CodeRounded color="action" /></Stack><Stack spacing={2.5}><TextField fullWidth label="Android SDK path" value={sdkPath} onChange={(event) => setSdkPath(event.target.value)} helperText="Usually /home/you/Android/Sdk" /><TextField fullWidth label="JDK path" value={jdkPath} onChange={(event) => setJdkPath(event.target.value)} helperText="Leave blank to use Java from your PATH" /><Box><Button sx={{ minWidth: 112 }} variant="contained" disabled={!dirty || busy} startIcon={busy ? <CircularProgress size={18} color="inherit" /> : undefined} onClick={() => void perform("/api/settings", { method: "POST", body: JSON.stringify({ android_sdk_path: sdkPath, jdk_path: jdkPath }) })}>{busy ? "Saving…" : dirty ? "Save paths" : "Saved"}</Button></Box></Stack></CardContent></Card>

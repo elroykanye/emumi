@@ -1,9 +1,8 @@
 use crate::{
-    android::{AndroidTools, STARTUP_CPU_QUOTA_PERCENT, scope_belongs_to_profile},
+    android::{AndroidTools, scope_belongs_to_profile},
     config::AppConfig,
-    cpu_policy::{CpuQuotaPolicy, ThermalDecision, startup_thermal_decision},
     manager_guard::ManagerGuard,
-    model::{HostStats, LaunchAdmission, PicturePreset, ProfileOptions, SpeedPreset},
+    model::{PicturePreset, ProfileOptions, SpeedPreset},
     monitor::{HostMonitor, sample_devices},
     netsimd_log::{self, GuardOutcome},
     snapshot_recovery::{self, RecoveryOutcome},
@@ -18,7 +17,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -27,11 +26,6 @@ use tokio::net::TcpListener;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const MAX_RUNNING_PROFILES: usize = 4;
-const MIN_AVAILABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const STARTUP_SETTLE_SECONDS: u64 = 20;
-const CPU_CONTROL_SAMPLE_SECONDS: u64 = 1;
-const CRITICAL_THERMAL_SAMPLES: u8 = 3;
-const EMERGENCY_STOP_TEMPERATURE_C: f32 = 98.0;
 const NETSIMD_LOG_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 const NETSIMD_LOG_CHECK_SECONDS: u64 = 5;
 
@@ -48,9 +42,7 @@ struct Runtime {
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
     startup_generations: BTreeMap<String, u64>,
-    queued_profiles: VecDeque<String>,
     memory_warnings: BTreeMap<String, String>,
-    cpu_controller_scopes: BTreeSet<String>,
     profile_scopes: BTreeMap<String, String>,
     cached_profiles: Vec<crate::model::AndroidProfile>,
     cached_system_images: Vec<ImageDto>,
@@ -72,7 +64,6 @@ struct AppState {
     profiles: Vec<crate::model::AndroidProfile>,
     profile_options: BTreeMap<String, ProfileOptions>,
     starting_profiles: BTreeSet<String>,
-    queued_profiles: Vec<String>,
     device_supervision: BTreeMap<String, DeviceStatus>,
     system_images: Vec<ImageDto>,
     config: SettingsDto,
@@ -138,7 +129,6 @@ impl EmuMiApp {
         } else {
             DeviceSupervisor::restore(config.lifecycle_states.clone())
         };
-        let queued_profiles = restored_queued_profiles(&supervisor);
         let runtime = Arc::new(Mutex::new(Runtime {
             _manager_guard: manager_guard,
             tools,
@@ -147,9 +137,7 @@ impl EmuMiApp {
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
             startup_generations: BTreeMap::new(),
-            queued_profiles,
             memory_warnings: BTreeMap::new(),
-            cpu_controller_scopes: BTreeSet::new(),
             profile_scopes: BTreeMap::new(),
             cached_profiles: Vec::new(),
             cached_system_images: Vec::new(),
@@ -254,7 +242,6 @@ fn spawn_device_supervisor(runtime: Shared) {
             };
             let profiles = tools.discover_profiles();
             let owned_scopes = tools.owned_scopes();
-            let host_temperature = HostMonitor::default().sample().cpu_temperature_c;
             let now = now_seconds();
             let mut observations = Vec::new();
             let mut restored_startups = Vec::new();
@@ -343,23 +330,9 @@ fn spawn_device_supervisor(runtime: Shared) {
                         }
                         resumed.push((name, generation, scope));
                     }
-                    let mut thermal_changed = false;
-                    if let Some(temperature) = host_temperature {
-                        for (name, status) in &phases {
-                            if status.phase == DevicePhase::ThermalHold {
-                                thermal_changed |=
-                                    runtime
-                                        .supervisor
-                                        .observe_cool_sample(name, temperature, now);
-                            }
-                        }
-                    }
                     let actions = runtime.supervisor.due_actions(now);
-                    let config = (had_observations
-                        || thermal_changed
-                        || !actions.is_empty()
-                        || !resumed.is_empty())
-                    .then(|| runtime.lifecycle_config_snapshot());
+                    let config = (had_observations || !actions.is_empty() || !resumed.is_empty())
+                        .then(|| runtime.lifecycle_config_snapshot());
                     (actions, config, resumed)
                 }
                 Err(_) => return,
@@ -440,25 +413,9 @@ fn spawn_device_supervisor(runtime: Shared) {
                     );
                 }
             }
-            let should_drain_restored_queue = runtime.lock().is_ok_and(|runtime| {
-                runtime.starting_profiles.is_empty() && !runtime.queued_profiles.is_empty()
-            });
-            if should_drain_restored_queue {
-                start_next_queued_profile(&runtime, StartupCompletion::TimedOut);
-            }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
-}
-
-fn restored_queued_profiles(supervisor: &DeviceSupervisor) -> VecDeque<String> {
-    supervisor
-        .statuses()
-        .into_iter()
-        .filter_map(|(name, status)| {
-            (status.desired_running && status.phase == DevicePhase::Queued).then_some(name)
-        })
-        .collect()
 }
 
 fn classify_supervisor_observation(
@@ -674,10 +631,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             rectangular_starts.push(profile.name.clone());
         }
     }
-    let active_scopes = device_stats
-        .iter()
-        .filter_map(|sample| sample.scope_name.clone())
-        .collect::<BTreeSet<_>>();
     for sample in &device_stats {
         if let Some(scope) = &sample.scope_name {
             runtime
@@ -685,15 +638,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
                 .insert(sample.profile_name.clone(), scope.clone());
         }
     }
-    runtime
-        .cpu_controller_scopes
-        .retain(|scope| active_scopes.contains(scope));
-    let starting_profiles = runtime.starting_profiles.clone();
-    let new_cpu_controllers = new_cpu_controller_candidates(
-        &device_stats,
-        &starting_profiles,
-        &mut runtime.cpu_controller_scopes,
-    );
     let running_profile_names = device_stats
         .iter()
         .map(|sample| sample.profile_name.clone())
@@ -720,7 +664,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
         profiles,
         profile_options: runtime.config.profile_options.clone(),
         starting_profiles: runtime.starting_profiles.clone(),
-        queued_profiles: runtime.queued_profiles.iter().cloned().collect(),
         device_supervision: runtime.supervisor.statuses(),
         system_images,
         config: SettingsDto {
@@ -742,9 +685,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
     drop(runtime);
     for profile_name in rectangular_starts {
         tools.watch_rectangular_display_after_start(&profile_name);
-    }
-    for (profile_name, scope_unit) in new_cpu_controllers {
-        schedule_adaptive_cpu_quota(Arc::clone(&shared), profile_name, Some(scope_unit));
     }
     Ok(Json(state))
 }
@@ -826,12 +766,12 @@ fn start_named_profile_internal(
         .into_iter()
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
-    let discovered_profiles = tools.discover_profiles();
-    let running = discovered_profiles
+    let running_profiles = tools
+        .discover_profiles()
         .into_iter()
         .filter(|candidate| candidate.is_running())
-        .count();
-    let host_stats = HostMonitor::default().sample();
+        .map(|candidate| candidate.name)
+        .collect::<BTreeSet<_>>();
 
     let (options, startup_generation, config_to_save) = {
         let mut runtime = lock(shared)?;
@@ -840,9 +780,6 @@ fn start_named_profile_internal(
         }
         if runtime.starting_profiles.contains(name) {
             return Ok(message("Android is already starting"));
-        }
-        if runtime.queued_profiles.iter().any(|queued| queued == name) {
-            return Ok(message("Android is already queued"));
         }
         if profile.is_running() {
             if user_requested {
@@ -863,9 +800,7 @@ fn start_named_profile_internal(
             }
             return Ok(message("Android is already running"));
         }
-        if running + runtime.starting_profiles.len() + runtime.queued_profiles.len()
-            >= MAX_RUNNING_PROFILES
-        {
+        if !has_device_slot(&running_profiles, &runtime.starting_profiles) {
             return api_error(
                 StatusCode::CONFLICT,
                 "This computer is limited to four running Androids. Stop an idle one first.",
@@ -881,32 +816,6 @@ fn start_named_profile_internal(
                 error_tuple(StatusCode::CONFLICT, "Recovery generation is unavailable")
             })?
         };
-        if !runtime.starting_profiles.is_empty() {
-            runtime.queued_profiles.push_back(name.to_owned());
-            runtime.supervisor.mark_queued(name);
-            runtime.log(
-                "info",
-                format!("Queued {name} until the current Android settles"),
-            );
-            let config = runtime.lifecycle_config_snapshot();
-            drop(runtime);
-            config.save().map_err(|error| {
-                error_tuple(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Could not save device lifecycle state: {error}"),
-                )
-            })?;
-            return Ok(message("Android is queued for an adaptive start"));
-        }
-        if let Some(reason) = launch_block_reason(&host_stats) {
-            runtime
-                .supervisor
-                .reject_admission(name, reason.clone(), now_seconds());
-            let config = runtime.lifecycle_config_snapshot();
-            drop(runtime);
-            let _ = config.save();
-            return Err(error_tuple(StatusCode::CONFLICT, reason));
-        }
         runtime.supervisor.admission_succeeded(name, generation);
         let options = runtime
             .config
@@ -946,14 +855,7 @@ fn start_named_profile_internal(
                 Ok(())
             }
         })
-        .and_then(|_| {
-            tools.start(
-                &profile,
-                &launch_args(&options),
-                &options,
-                LaunchAdmission::granted(),
-            )
-        });
+        .and_then(|_| tools.start(&profile, &launch_args(&options), &options));
     let launch_handle = match start_result {
         Ok(launch_handle) => launch_handle,
         Err(message) => {
@@ -1020,7 +922,6 @@ fn start_named_profile_internal(
     if options.speed == SpeedPreset::LeanGaming {
         tools.watch_lean_profile_after_start(name, options.suspend_store_during_automation);
     }
-    register_adaptive_cpu_controller(shared, name.to_owned(), scope_unit.clone());
     watch_profile_start(
         Arc::clone(shared),
         name.to_owned(),
@@ -1028,6 +929,10 @@ fn start_named_profile_internal(
         scope_unit,
     );
     Ok(message("Android is starting"))
+}
+
+fn has_device_slot(running: &BTreeSet<String>, starting: &BTreeSet<String>) -> bool {
+    running.union(starting).count() < MAX_RUNNING_PROFILES
 }
 
 fn watch_profile_start(
@@ -1056,34 +961,6 @@ fn watch_profile_start(
                 break;
             }
         }
-
-        let completion = if booted {
-            if let Ok(mut runtime) = shared.lock()
-                && runtime.startup_generations.get(&name) == Some(&startup_generation)
-            {
-                runtime.supervisor.mark_settling(&name, startup_generation);
-            }
-            // Give login, Play services and the automation target time to warm up.
-            // Then require three calm host samples before admitting the next AVD.
-            let settled = settle_after_boot().await;
-            let mut monitor = HostMonitor::default();
-            let _ = monitor.sample();
-            let mut calm_samples = 0;
-            for _ in 0..45 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                if monitor.sample().cpu_percent < 85.0 {
-                    calm_samples += 1;
-                    if calm_samples >= 3 {
-                        break;
-                    }
-                } else {
-                    calm_samples = 0;
-                }
-            }
-            StartupCompletion::Settled(settled)
-        } else {
-            StartupCompletion::TimedOut
-        };
 
         let snapshot_recovered = if booted {
             false
@@ -1159,321 +1036,8 @@ fn watch_profile_start(
             }
             let _ = tools.cleanup_profile_runtime(&name);
         }
-        start_next_queued_profile(&shared, completion);
         let _ = scope_unit;
     });
-}
-
-#[derive(Debug)]
-struct StartupSettled;
-
-#[derive(Debug)]
-enum StartupCompletion {
-    Settled(StartupSettled),
-    TimedOut,
-}
-
-async fn settle_after_boot() -> StartupSettled {
-    settle_after_boot_with(tokio::time::sleep).await
-}
-
-async fn settle_after_boot_with<F, Fut>(sleep: F) -> StartupSettled
-where
-    F: FnOnce(std::time::Duration) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    sleep(std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)).await;
-    StartupSettled
-}
-
-fn cpu_control_requires_device_discovery(phase: DevicePhase) -> bool {
-    phase == DevicePhase::Ready
-}
-
-fn thermal_emergency_confirmed(hot_samples: &mut u8, temperature_c: Option<f32>) -> bool {
-    if temperature_c.is_some_and(|temperature| {
-        temperature.is_finite() && temperature >= EMERGENCY_STOP_TEMPERATURE_C
-    }) {
-        *hot_samples = hot_samples.saturating_add(1);
-    } else {
-        *hot_samples = 0;
-    }
-    *hot_samples >= CRITICAL_THERMAL_SAMPLES
-}
-
-fn startup_heat_confirmed(hot_samples: &mut u8, temperature_c: Option<f32>) -> bool {
-    if temperature_c.is_some_and(|temperature| temperature.is_finite() && temperature >= 85.0) {
-        *hot_samples = hot_samples.saturating_add(1);
-    } else {
-        *hot_samples = 0;
-    }
-    *hot_samples >= CRITICAL_THERMAL_SAMPLES
-}
-
-fn schedule_adaptive_cpu_quota(shared: Shared, name: String, scope_unit: Option<String>) {
-    let Some(scope_unit) = scope_unit else {
-        return;
-    };
-    tokio::spawn(async move {
-        let logical_cpus = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
-        let mut policy = CpuQuotaPolicy::new(STARTUP_CPU_QUOTA_PERCENT);
-        let mut host_monitor = HostMonitor::default();
-        let mut scope_stat_failures = 0_u8;
-        let mut critical_hot_samples = 0_u8;
-        let mut startup_hot_samples = 0_u8;
-        loop {
-            let (tools, status) = {
-                let Ok(runtime) = shared.lock() else {
-                    return;
-                };
-                (
-                    runtime.tools(),
-                    runtime.supervisor.statuses().get(&name).cloned(),
-                )
-            };
-            let Some(status) = status else {
-                break;
-            };
-            let generation = status.generation;
-            let starting = matches!(
-                status.phase,
-                DevicePhase::Admitting
-                    | DevicePhase::Launching
-                    | DevicePhase::Booting
-                    | DevicePhase::Settling
-            );
-            if !starting && !cpu_control_requires_device_discovery(status.phase) {
-                break;
-            }
-            // Thermal safety is sampled before ADB discovery or cgroup accounting.
-            // A hung emulator probe therefore cannot delay an emergency stop.
-            let host_stats = host_monitor.sample();
-            if thermal_emergency_confirmed(&mut critical_hot_samples, host_stats.cpu_temperature_c)
-            {
-                let stopped = tools
-                    .terminate_scope_and_wait(&scope_unit, false)
-                    .and_then(|_| {
-                        status
-                            .pid
-                            .map(|pid| tools.wait_pid_gone(pid))
-                            .unwrap_or(Ok(()))
-                    });
-                if let Ok(mut runtime) = shared.lock() {
-                    runtime.starting_profiles.remove(&name);
-                    runtime.startup_generations.remove(&name);
-                    runtime.supervisor.enter_thermal_hold(
-                        &name,
-                        generation,
-                        host_stats
-                            .cpu_temperature_c
-                            .unwrap_or(EMERGENCY_STOP_TEMPERATURE_C),
-                        now_seconds(),
-                    );
-                    match stopped {
-                        Ok(()) => {
-                            runtime.supervisor.confirm_ownership_gone(
-                                &name,
-                                generation,
-                                status.scope.as_deref(),
-                                status.pid,
-                            );
-                            runtime.profile_scopes.remove(&name);
-                            runtime.log(
-                                "warning",
-                                format!(
-                                    "Stopped {name} at the {EMERGENCY_STOP_TEMPERATURE_C:.0} C emergency limit"
-                                ),
-                            );
-                        }
-                        Err(error) => runtime.log(
-                            "error",
-                            format!("Thermal emergency could not confirm {name} stopped: {error}"),
-                        ),
-                    }
-                    let config = runtime.lifecycle_config_snapshot();
-                    drop(runtime);
-                    let _ = config.save();
-                }
-                break;
-            }
-
-            let (profile_is_running, running_emulators) =
-                if cpu_control_requires_device_discovery(status.phase) {
-                    let profiles = tools.discover_profiles();
-                    (
-                        profiles
-                            .iter()
-                            .any(|profile| profile.name == name && profile.is_running()),
-                        profiles
-                            .iter()
-                            .filter(|profile| profile.is_running())
-                            .count(),
-                    )
-                } else {
-                    (true, 1)
-                };
-            let sample = match tools.scope_cpu_stat(&scope_unit) {
-                Ok(sample) => {
-                    scope_stat_failures = 0;
-                    sample
-                }
-                Err(error) => {
-                    scope_stat_failures = scope_stat_failures.saturating_add(1);
-                    if starting && scope_stat_failures < 3 {
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            CPU_CONTROL_SAMPLE_SECONDS,
-                        ))
-                        .await;
-                        continue;
-                    }
-                    if !profile_is_running {
-                        break;
-                    }
-                    if let Ok(mut runtime) = shared.lock() {
-                        runtime.log(
-                            "warning",
-                            format!("Stopped adaptive CPU control for {name}: {error}"),
-                        );
-                    }
-                    break;
-                }
-            };
-            let startup_decision = if starting
-                && !startup_heat_confirmed(&mut startup_hot_samples, host_stats.cpu_temperature_c)
-            {
-                ThermalDecision::Keep
-            } else {
-                startup_thermal_decision(sample.quota_percent, host_stats.cpu_temperature_c)
-            };
-
-            let desired_quota = if starting {
-                match startup_decision {
-                    ThermalDecision::Quota(percent) => Some(percent),
-                    ThermalDecision::Keep => None,
-                }
-            } else {
-                policy.observe(
-                    sample,
-                    running_emulators,
-                    logical_cpus,
-                    host_stats.cpu_percent,
-                    host_stats.cpu_temperature_c,
-                )
-            };
-
-            if let Some(percent) = desired_quota {
-                let weight = if percent > 120 { 100 } else { 25 };
-                match tools.set_scope_cpu_policy(&scope_unit, percent, weight) {
-                    Ok(()) => {
-                        if let Ok(mut runtime) = shared.lock() {
-                            runtime.supervisor.update_telemetry(
-                                &name,
-                                generation,
-                                percent,
-                                host_stats.cpu_temperature_c,
-                            );
-                            runtime.log(
-                                "success",
-                                format!(
-                                    "Adjusted {name} CPU quota to {percent}% with weight {weight}"
-                                ),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        if let Ok(mut runtime) = shared.lock() {
-                            runtime.log(
-                                "warning",
-                                format!("Could not adjust {name} CPU quota: {error}"),
-                            );
-                        }
-                    }
-                }
-            } else if let Ok(mut runtime) = shared.lock() {
-                runtime.supervisor.update_telemetry(
-                    &name,
-                    generation,
-                    sample.quota_percent,
-                    host_stats.cpu_temperature_c,
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(CPU_CONTROL_SAMPLE_SECONDS)).await;
-        }
-        if let Ok(mut runtime) = shared.lock() {
-            runtime.cpu_controller_scopes.remove(&scope_unit);
-        }
-    });
-}
-
-fn register_adaptive_cpu_controller(shared: &Shared, name: String, scope_unit: Option<String>) {
-    let Some(scope_unit) = scope_unit else {
-        return;
-    };
-    let should_start = shared
-        .lock()
-        .map(|mut runtime| runtime.cpu_controller_scopes.insert(scope_unit.clone()))
-        .unwrap_or(false);
-    if should_start {
-        schedule_adaptive_cpu_quota(Arc::clone(shared), name, Some(scope_unit));
-    }
-}
-
-fn new_cpu_controller_candidates(
-    samples: &[crate::model::DeviceHostStats],
-    starting_profiles: &BTreeSet<String>,
-    registered_scopes: &mut BTreeSet<String>,
-) -> Vec<(String, String)> {
-    samples
-        .iter()
-        .filter(|sample| !starting_profiles.contains(&sample.profile_name))
-        .filter_map(|sample| {
-            let scope = sample.scope_name.clone()?;
-            registered_scopes
-                .insert(scope.clone())
-                .then(|| (sample.profile_name.clone(), scope))
-        })
-        .collect()
-}
-
-fn start_next_queued_profile(shared: &Shared, completion: StartupCompletion) {
-    match completion {
-        StartupCompletion::Settled(_proof) => {}
-        StartupCompletion::TimedOut => {}
-    }
-    loop {
-        let next = match shared.lock() {
-            Ok(mut runtime) => runtime.queued_profiles.pop_front(),
-            Err(_) => return,
-        };
-        let Some(next) = next else {
-            return;
-        };
-        match start_named_profile_internal(shared, &next, false) {
-            Ok(_) => {
-                let is_now_starting = shared
-                    .lock()
-                    .map(|runtime| runtime.starting_profiles.contains(&next))
-                    .unwrap_or(false);
-                if is_now_starting {
-                    return;
-                }
-                // The queued profile may have been started outside EmuMi while it waited.
-                // In that case no watcher will drain the rest of this queue, so keep going.
-            }
-            Err((_, Json(error))) => {
-                if let Ok(mut runtime) = shared.lock() {
-                    runtime.log(
-                        "error",
-                        format!("Could not start queued {next}: {}", error.message),
-                    );
-                    runtime.starting_profiles.remove(&next);
-                    runtime.startup_generations.remove(&next);
-                }
-            }
-        }
-    }
 }
 
 async fn stop_profile(
@@ -1489,7 +1053,6 @@ fn stop_named_profile(shared: &Shared, name: &str) -> ApiResult<ApiMessage> {
     // blocked probe cannot delay or reverse an intentional stop.
     runtime.starting_profiles.remove(name);
     runtime.startup_generations.remove(name);
-    runtime.queued_profiles.retain(|queued| queued != name);
     let tools = runtime.tools();
     let prior_status = runtime.supervisor.status_snapshot(name).unwrap_or_default();
     runtime.supervisor.request_stop(name);
@@ -1602,7 +1165,6 @@ async fn port_readiness(
 
     let readiness = port_readiness_from_state(
         &name,
-        runtime.queued_profiles.iter().any(|queued| queued == &name),
         runtime.starting_profiles.contains(&name),
         runtime.supervisor.statuses().remove(&name),
     );
@@ -1612,17 +1174,9 @@ async fn port_readiness(
 
 fn port_readiness_from_state(
     name: &str,
-    queued: bool,
     starting: bool,
     status: Option<DeviceStatus>,
 ) -> PortReadiness {
-    if queued {
-        return PortReadiness {
-            ready: false,
-            phase: "queued",
-            message: format!("{name} is queued for startup"),
-        };
-    }
     if starting {
         return PortReadiness {
             ready: false,
@@ -1895,40 +1449,7 @@ fn validate_profile_options(options: &ProfileOptions) -> Result<(), String> {
     if !(15..=120).contains(&options.refresh_rate_hz) {
         return Err("Refresh rate must be between 15 and 120 Hz".into());
     }
-    if options.host_memory_policy {
-        if options.memory_high_mb < 4096 {
-            return Err("MemoryHigh must be at least 4096 MB for safe initial testing".into());
-        }
-        if options.memory_max_mb < options.memory_high_mb {
-            return Err("MemoryMax must be greater than or equal to MemoryHigh".into());
-        }
-        if options.memory_max_mb < options.memory_mb {
-            return Err("MemoryMax cannot be lower than Android guest memory".into());
-        }
-    }
     Ok(())
-}
-
-fn launch_block_reason(host: &HostStats) -> Option<String> {
-    if host.memory_available_bytes < MIN_AVAILABLE_MEMORY_BYTES {
-        return Some(
-            "EmuMi needs at least 8 GB of available host memory before starting another Android"
-                .into(),
-        );
-    }
-    None
-}
-
-#[cfg(test)]
-fn enforce_launch_admission(monitor: &mut HostMonitor) -> Result<LaunchAdmission, String> {
-    enforce_launch_admission_with(|| monitor.sample())
-}
-
-#[cfg(test)]
-fn enforce_launch_admission_with(
-    sample: impl FnOnce() -> HostStats,
-) -> Result<LaunchAdmission, String> {
-    launch_block_reason(&sample()).map_or_else(|| Ok(LaunchAdmission::granted()), Err)
 }
 
 fn display_dimensions(_picture: PicturePreset) -> (u16, u16) {
@@ -1966,20 +1487,12 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 #[cfg(test)]
 mod tests {
     use super::{
-        CPU_CONTROL_SAMPLE_SECONDS, STARTUP_CPU_QUOTA_PERCENT, STARTUP_SETTLE_SECONDS,
-        classify_supervisor_observation, cpu_control_requires_device_discovery,
-        enforce_launch_admission, graceful_stop_allowed, launch_args, launch_block_reason,
-        new_cpu_controller_candidates, port_readiness_from_state, restored_queued_profiles,
-        settle_after_boot_with, startup_heat_confirmed, thermal_emergency_confirmed,
-        validate_profile_options,
+        MAX_RUNNING_PROFILES, classify_supervisor_observation, graceful_stop_allowed,
+        has_device_slot, launch_args, port_readiness_from_state,
     };
-    use crate::model::{HostStats, PicturePreset, ProfileOptions, SpeedPreset};
-    use crate::monitor::HostMonitor;
+    use crate::model::{PicturePreset, ProfileOptions, SpeedPreset};
     use crate::supervisor::DevicePhase;
-    use std::{
-        collections::{BTreeSet, VecDeque},
-        fs,
-    };
+    use std::collections::BTreeSet;
 
     #[test]
     fn snapshot_saving_stop_is_allowed_only_after_ready() {
@@ -1997,133 +1510,25 @@ mod tests {
     }
 
     #[test]
-    fn launch_admission_protects_host_memory_without_blocking_on_cpu_temperature() {
-        let safe = HostStats {
-            memory_available_bytes: 9 * 1024 * 1024 * 1024,
-            cpu_temperature_c: Some(89.9),
-            ..HostStats::default()
-        };
-        assert_eq!(launch_block_reason(&safe), None);
+    fn manager_allows_four_concurrent_androids() {
+        assert_eq!(MAX_RUNNING_PROFILES, 4);
+        let three = BTreeSet::from([
+            "Device_1".to_owned(),
+            "Device_2".to_owned(),
+            "Device_3".to_owned(),
+        ]);
+        assert!(has_device_slot(&three, &BTreeSet::new()));
 
-        let unavailable_or_exhausted = HostStats {
-            memory_available_bytes: 0,
-            ..safe.clone()
-        };
-        assert!(
-            launch_block_reason(&unavailable_or_exhausted)
-                .unwrap()
-                .contains("8 GB")
-        );
+        let four = BTreeSet::from([
+            "Device_1".to_owned(),
+            "Device_2".to_owned(),
+            "Device_3".to_owned(),
+            "Device_4".to_owned(),
+        ]);
+        assert!(!has_device_slot(&four, &BTreeSet::new()));
 
-        let exact_boundary = HostStats {
-            memory_available_bytes: 8 * 1024 * 1024 * 1024,
-            ..safe.clone()
-        };
-        assert_eq!(launch_block_reason(&exact_boundary), None);
-
-        let low_memory = HostStats {
-            memory_available_bytes: 7 * 1024 * 1024 * 1024,
-            ..safe.clone()
-        };
-        assert!(launch_block_reason(&low_memory).unwrap().contains("8 GB"));
-
-        let too_hot = HostStats {
-            memory_available_bytes: 12 * 1024 * 1024 * 1024,
-            cpu_temperature_c: Some(90.0),
-            ..safe
-        };
-        assert_eq!(launch_block_reason(&too_hot), None);
-
-        let missing_temperature = HostStats {
-            memory_available_bytes: 12 * 1024 * 1024 * 1024,
-            cpu_temperature_c: None,
-            ..HostStats::default()
-        };
-        assert_eq!(launch_block_reason(&missing_temperature), None);
-
-        let invalid_temperature = HostStats {
-            cpu_temperature_c: Some(f32::NAN),
-            ..missing_temperature
-        };
-        assert_eq!(launch_block_reason(&invalid_temperature), None);
-    }
-
-    #[test]
-    fn launch_entry_samples_and_enforces_admission() {
-        let root =
-            std::env::temp_dir().join(format!("emumi-admission-test-{}", std::process::id()));
-        let proc_root = root.join("proc");
-        let sys_root = root.join("sys");
-        fs::create_dir_all(&proc_root).unwrap();
-        fs::create_dir_all(&sys_root).unwrap();
-        fs::write(proc_root.join("stat"), "cpu 100 0 100 800 0 0 0 0\n").unwrap();
-        fs::write(
-            proc_root.join("meminfo"),
-            "MemTotal: 16777216 kB\nMemAvailable: 0 kB\n",
-        )
-        .unwrap();
-        let mut monitor = HostMonitor::for_roots(proc_root, sys_root);
-
-        let result = enforce_launch_admission(&mut monitor);
-
-        assert!(result.unwrap_err().contains("8 GB"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn staged_start_waits_twenty_seconds_after_boot() {
-        let observed = std::cell::Cell::new(std::time::Duration::ZERO);
-        settle_after_boot_with(|duration| {
-            observed.set(duration);
-            async {}
-        })
-        .await;
-        assert_eq!(
-            observed.get(),
-            std::time::Duration::from_secs(STARTUP_SETTLE_SECONDS)
-        );
-        assert_eq!(STARTUP_SETTLE_SECONDS, 20);
-    }
-
-    #[test]
-    fn adaptive_cpu_control_starts_conservatively_and_reacts_quickly() {
-        assert_eq!(STARTUP_CPU_QUOTA_PERCENT, 120);
-        assert_eq!(CPU_CONTROL_SAMPLE_SECONDS, 1);
-    }
-
-    #[test]
-    fn startup_thermal_sampling_never_waits_for_adb_discovery() {
-        for phase in [
-            crate::supervisor::DevicePhase::Admitting,
-            crate::supervisor::DevicePhase::Launching,
-            crate::supervisor::DevicePhase::Booting,
-            crate::supervisor::DevicePhase::Settling,
-        ] {
-            assert!(!cpu_control_requires_device_discovery(phase));
-        }
-        assert!(cpu_control_requires_device_discovery(
-            crate::supervisor::DevicePhase::Ready
-        ));
-    }
-
-    #[test]
-    fn thermal_emergency_requires_three_consecutive_hot_samples() {
-        let mut hot_samples = 0;
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(99.0)));
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(97.0)));
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(98.0)));
-        assert!(!thermal_emergency_confirmed(&mut hot_samples, Some(99.0)));
-        assert!(thermal_emergency_confirmed(&mut hot_samples, Some(100.0)));
-    }
-
-    #[test]
-    fn startup_throttling_requires_three_consecutive_hot_samples() {
-        let mut hot_samples = 0;
-        assert!(!startup_heat_confirmed(&mut hot_samples, Some(95.0)));
-        assert!(!startup_heat_confirmed(&mut hot_samples, Some(70.0)));
-        assert!(!startup_heat_confirmed(&mut hot_samples, Some(86.0)));
-        assert!(!startup_heat_confirmed(&mut hot_samples, Some(87.0)));
-        assert!(startup_heat_confirmed(&mut hot_samples, Some(88.0)));
+        let starting_duplicate = BTreeSet::from(["Device_3".to_owned()]);
+        assert!(has_device_slot(&three, &starting_duplicate));
     }
 
     #[test]
@@ -2158,25 +1563,13 @@ mod tests {
     }
 
     #[test]
-    fn persisted_queue_is_rebuilt_after_manager_restart() {
-        let mut supervisor = crate::supervisor::DeviceSupervisor::new(BTreeSet::new());
-        supervisor.request_start("Device_1", 0);
-        supervisor.mark_queued("Device_1");
-
-        assert_eq!(
-            restored_queued_profiles(&supervisor),
-            VecDeque::from(["Device_1".to_owned()])
-        );
-    }
-
-    #[test]
     fn readiness_uses_cached_supervision_without_waiting_for_adb() {
         let running = crate::supervisor::DeviceStatus {
             phase: crate::supervisor::DevicePhase::Ready,
             desired_running: true,
             ..Default::default()
         };
-        let ready = port_readiness_from_state("Device_3", false, false, Some(running));
+        let ready = port_readiness_from_state("Device_3", false, Some(running));
         assert!(ready.ready);
         assert_eq!(ready.phase, "ready");
 
@@ -2186,39 +1579,9 @@ mod tests {
             last_failure: Some("health probe timed out".into()),
             ..Default::default()
         };
-        let not_ready = port_readiness_from_state("Device_3", false, false, Some(recovering));
+        let not_ready = port_readiness_from_state("Device_3", false, Some(recovering));
         assert!(!not_ready.ready);
         assert_eq!(not_ready.phase, "recovering");
-    }
-
-    #[test]
-    fn running_scopes_are_adopted_once_after_manager_restart() {
-        let samples = vec![
-            crate::model::DeviceHostStats {
-                profile_name: "Device_1".into(),
-                scope_name: Some("emumi-Device_1-100.scope".into()),
-                ..Default::default()
-            },
-            crate::model::DeviceHostStats {
-                profile_name: "Device_3".into(),
-                scope_name: Some("emumi-Device_3-300.scope".into()),
-                ..Default::default()
-            },
-        ];
-        let starting = BTreeSet::from(["Device_3".to_owned()]);
-        let mut registered = BTreeSet::new();
-
-        assert_eq!(
-            new_cpu_controller_candidates(&samples, &starting, &mut registered),
-            vec![("Device_1".to_owned(), "emumi-Device_1-100.scope".to_owned())]
-        );
-        assert!(new_cpu_controller_candidates(&samples, &starting, &mut registered).is_empty());
-
-        let no_starting = BTreeSet::new();
-        assert_eq!(
-            new_cpu_controller_candidates(&samples, &no_starting, &mut registered),
-            vec![("Device_3".to_owned(), "emumi-Device_3-300.scope".to_owned())]
-        );
     }
 
     #[test]
@@ -2264,11 +1627,8 @@ mod tests {
         assert_eq!(options.memory_mb, 4096);
         assert_eq!(options.gpu_mode, "host-intel");
         assert!(options.disable_vulkan);
-        assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
-        assert_eq!(options.memory_high_mb, 5632);
-        assert_eq!(options.memory_max_mb, 6656);
         assert!(args.windows(2).any(|pair| pair == ["-gpu", "host"]));
         assert!(args.windows(2).any(|pair| pair == ["-feature", "-Vulkan"]));
         assert!(args.windows(2).any(|pair| pair == ["-vsync-rate", "30"]));
@@ -2378,25 +1738,5 @@ mod tests {
             ..ProfileOptions::default()
         };
         assert!(!launch_args(&options).contains(&"-Vulkan".to_owned()));
-    }
-
-    #[test]
-    fn validates_conservative_per_emulator_memory_limits() {
-        let safe = ProfileOptions {
-            host_memory_policy: true,
-            ..ProfileOptions::default()
-        };
-        assert!(validate_profile_options(&safe).is_ok());
-        let unsafe_high = ProfileOptions {
-            memory_high_mb: 3840,
-            ..safe.clone()
-        };
-        assert!(validate_profile_options(&unsafe_high).is_err());
-        let inverted = ProfileOptions {
-            memory_high_mb: 6144,
-            memory_max_mb: 5120,
-            ..safe
-        };
-        assert!(validate_profile_options(&inverted).is_err());
     }
 }

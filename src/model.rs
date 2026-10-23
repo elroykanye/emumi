@@ -1,16 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LaunchAdmission {
-    _private: (),
-}
-
-impl LaunchAdmission {
-    pub(crate) fn granted() -> Self {
-        Self { _private: () }
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AndroidProfile {
     pub name: String,
@@ -72,10 +61,6 @@ pub struct ProfileOptions {
     pub disable_vulkan: bool,
     pub refresh_rate_hz: u16,
     pub suspend_store_during_automation: bool,
-    pub host_memory_policy: bool,
-    pub memory_high_mb: u32,
-    pub memory_max_mb: u32,
-    pub memory_swap_max_mb: u32,
 }
 
 impl Default for ProfileOptions {
@@ -99,10 +84,6 @@ impl Default for ProfileOptions {
             disable_vulkan: true,
             refresh_rate_hz: 30,
             suspend_store_during_automation: true,
-            host_memory_policy: true,
-            memory_high_mb: 5632,
-            memory_max_mb: 6656,
-            memory_swap_max_mb: 1024,
         }
     }
 }
@@ -140,18 +121,14 @@ mod tests {
     use super::ProfileOptions;
 
     #[test]
-    fn older_profiles_inherit_the_lean_host_policy() {
+    fn older_profiles_inherit_the_fixed_lean_device_defaults() {
         let options: ProfileOptions =
             serde_json::from_str(r#"{"speed":"LeanGaming","cores":2,"memory_mb":4096}"#).unwrap();
 
-        assert!(options.host_memory_policy);
         assert_eq!(options.refresh_rate_hz, 30);
         assert!(options.suspend_store_during_automation);
         assert_eq!(options.gpu_mode, "host-intel");
         assert!(options.disable_vulkan);
         assert_eq!(options.memory_mb, 4096);
-        assert_eq!(options.memory_high_mb, 5632);
-        assert_eq!(options.memory_max_mb, 6656);
-        assert_eq!(options.memory_swap_max_mb, 1024);
     }
 }

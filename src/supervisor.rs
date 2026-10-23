@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 const FAILURE_DELAYS_SECONDS: [u64; 3] = [30, 120, 600];
 const CIRCUIT_OPEN_SECONDS: u64 = 1800;
 const UNHEALTHY_SAMPLE_LIMIT: u8 = 3;
-const COOL_SAMPLE_LIMIT: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,8 +36,6 @@ pub struct DeviceStatus {
     pub last_failure: Option<String>,
     pub scope: Option<String>,
     pub pid: Option<u32>,
-    pub cpu_quota_percent: Option<u16>,
-    pub cpu_temperature_c: Option<f32>,
     pub snapshot_state: Option<String>,
 }
 
@@ -64,8 +61,6 @@ pub struct PersistedDeviceState {
     status: DeviceStatus,
     #[serde(default)]
     unhealthy_samples: u8,
-    #[serde(default)]
-    cool_samples: u8,
     #[serde(default)]
     recovery_scope: Option<String>,
     #[serde(default)]
@@ -137,7 +132,20 @@ impl DeviceSupervisor {
         self.entries.clone()
     }
 
-    pub fn restore(states: BTreeMap<String, PersistedDeviceState>) -> Self {
+    pub fn restore(mut states: BTreeMap<String, PersistedDeviceState>) -> Self {
+        for entry in states.values_mut() {
+            if entry.status.desired_running
+                && matches!(
+                    entry.status.phase,
+                    DevicePhase::Queued | DevicePhase::ThermalHold
+                )
+            {
+                entry.status.phase = DevicePhase::Backoff;
+                entry.status.next_retry_at = Some(0);
+                entry.status.last_failure =
+                    Some("Resuming with the simplified device manager".into());
+            }
+        }
         Self { entries: states }
     }
 
@@ -157,9 +165,6 @@ impl DeviceSupervisor {
         manual: bool,
     ) -> Result<u64, String> {
         let entry = self.entries.entry(profile.to_owned()).or_default();
-        if entry.status.phase == DevicePhase::ThermalHold {
-            return Err("Android is in Thermal Hold until three readings are below 75 C".into());
-        }
         if entry.status.desired_running
             && matches!(
                 entry.status.phase,
@@ -179,7 +184,6 @@ impl DeviceSupervisor {
         entry.status.next_retry_at = None;
         entry.manual_admission = manual;
         entry.unhealthy_samples = 0;
-        entry.cool_samples = 0;
         entry.boot_started_at = None;
         Ok(entry.status.generation)
     }
@@ -202,27 +206,9 @@ impl DeviceSupervisor {
         true
     }
 
-    pub fn reject_admission(&mut self, profile: &str, reason: impl Into<String>, now: u64) {
-        let entry = self.entries.entry(profile.to_owned()).or_default();
-        entry.status.phase = DevicePhase::Backoff;
-        entry.status.last_failure = Some(reason.into());
-        entry.status.next_retry_at = Some(now.saturating_add(FAILURE_DELAYS_SECONDS[0]));
-        entry.manual_admission = false;
-    }
-
     #[cfg(test)]
     pub fn request_start(&mut self, profile: &str, now: u64) {
         let _ = self.begin_admission(profile, now, true);
-    }
-
-    pub fn mark_queued(&mut self, profile: &str) {
-        let entry = self.entries.entry(profile.to_owned()).or_default();
-        entry.status.desired_running = true;
-        entry.status.phase = DevicePhase::Queued;
-        entry.status.stop_requested = false;
-        entry.status.next_retry_at = None;
-        entry.unhealthy_samples = 0;
-        entry.boot_started_at = None;
     }
 
     pub fn request_stop(&mut self, profile: &str) {
@@ -393,7 +379,6 @@ impl DeviceSupervisor {
         entry.status.last_failure = None;
         entry.status.snapshot_state = None;
         entry.unhealthy_samples = 0;
-        entry.cool_samples = 0;
         entry.boot_started_at = None;
         true
     }
@@ -406,27 +391,6 @@ impl DeviceSupervisor {
             .status
             .generation;
         let _ = self.complete_ready(profile, generation);
-    }
-
-    pub fn enter_thermal_hold(
-        &mut self,
-        profile: &str,
-        generation: u64,
-        temperature: f32,
-        now: u64,
-    ) -> bool {
-        let Some(entry) = self.entries.get_mut(profile) else {
-            return false;
-        };
-        if entry.status.generation != generation || !entry.status.desired_running {
-            return false;
-        }
-        entry.status.phase = DevicePhase::ThermalHold;
-        entry.status.cpu_temperature_c = Some(temperature);
-        entry.status.last_failure = Some(format!("Thermal stop at {temperature:.1} C"));
-        entry.status.next_retry_at = Some(now.saturating_add(30));
-        entry.cool_samples = 0;
-        true
     }
 
     pub fn schedule_snapshot_recovery(&mut self, profile: &str, generation: u64, now: u64) -> bool {
@@ -444,46 +408,6 @@ impl DeviceSupervisor {
         entry.status.last_failure = Some("Failed default_boot snapshot quarantined".into());
         entry.status.next_retry_at = Some(now);
         entry.recovery_scope = entry.status.scope.clone();
-        true
-    }
-
-    pub fn observe_cool_sample(&mut self, profile: &str, temperature: f32, now: u64) -> bool {
-        let Some(entry) = self.entries.get_mut(profile) else {
-            return false;
-        };
-        entry.status.cpu_temperature_c = Some(temperature);
-        if entry.status.phase != DevicePhase::ThermalHold {
-            return false;
-        }
-        if temperature < 75.0 {
-            entry.cool_samples = entry.cool_samples.saturating_add(1);
-        } else {
-            entry.cool_samples = 0;
-        }
-        if entry.cool_samples < COOL_SAMPLE_LIMIT {
-            return false;
-        }
-        entry.status.phase = DevicePhase::Backoff;
-        entry.status.next_retry_at = Some(now);
-        entry.cool_samples = 0;
-        true
-    }
-
-    pub fn update_telemetry(
-        &mut self,
-        profile: &str,
-        generation: u64,
-        quota_percent: u16,
-        temperature_c: Option<f32>,
-    ) -> bool {
-        let Some(entry) = self.entries.get_mut(profile) else {
-            return false;
-        };
-        if entry.status.generation != generation || !entry.status.desired_running {
-            return false;
-        }
-        entry.status.cpu_quota_percent = Some(quota_percent);
-        entry.status.cpu_temperature_c = temperature_c;
         true
     }
 
@@ -771,17 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn queued_state_is_visible_without_consuming_a_failure() {
-        let mut supervisor = DeviceSupervisor::default();
-        supervisor.request_start("Device_4", 0);
-        supervisor.mark_queued("Device_4");
-        let status = supervisor.status("Device_4");
-        assert_eq!(status.phase, DevicePhase::Queued);
-        assert_eq!(status.consecutive_failures, 0);
-        assert!(status.next_retry_at.is_none());
-    }
-
-    #[test]
     fn the_same_unresolved_failure_is_not_counted_twice() {
         let mut supervisor = DeviceSupervisor::default();
         supervisor.request_start("Device_1", 0);
@@ -861,7 +774,6 @@ mod tests {
         supervisor.record_failure("Device_3", "crash", None, 0);
         assert_eq!(supervisor.status("Device_3").consecutive_failures, 1);
 
-        supervisor.reject_admission("Device_3", "host too hot", 5);
         assert_eq!(supervisor.status("Device_3").consecutive_failures, 1);
         let generation = supervisor.begin_admission("Device_3", 6, true).unwrap();
         supervisor.admission_succeeded("Device_3", generation);
@@ -869,22 +781,16 @@ mod tests {
     }
 
     #[test]
-    fn thermal_hold_is_persistable_and_requires_three_cool_samples() {
-        let mut supervisor = DeviceSupervisor::default();
-        let generation = supervisor.begin_admission("Device_3", 0, true).unwrap();
-        supervisor.enter_thermal_hold("Device_3", generation, 96.0, 10);
-        assert_eq!(
-            supervisor.status("Device_3").phase,
-            DevicePhase::ThermalHold
-        );
+    fn legacy_resource_holds_resume_immediately() {
+        for phase in [DevicePhase::Queued, DevicePhase::ThermalHold] {
+            let mut supervisor = DeviceSupervisor::default();
+            supervisor.request_start("Device_3", 0);
+            supervisor.entries.get_mut("Device_3").unwrap().status.phase = phase;
 
-        let persisted = supervisor.persisted_states();
-        let mut restored = DeviceSupervisor::restore(persisted);
-        assert_eq!(restored.status("Device_3").phase, DevicePhase::ThermalHold);
-        assert!(!restored.observe_cool_sample("Device_3", 74.0, 20));
-        assert!(!restored.observe_cool_sample("Device_3", 74.0, 21));
-        assert!(restored.observe_cool_sample("Device_3", 74.0, 22));
-        assert_eq!(restored.status("Device_3").phase, DevicePhase::Backoff);
+            let restored = DeviceSupervisor::restore(supervisor.persisted_states());
+            assert_eq!(restored.status("Device_3").phase, DevicePhase::Backoff);
+            assert_eq!(restored.status("Device_3").next_retry_at, Some(0));
+        }
     }
 
     #[test]
@@ -933,41 +839,6 @@ mod tests {
         supervisor.mark_settling("Device_4", generation);
         supervisor.observe("Device_4", Observation::Healthy, 2);
         assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Settling);
-    }
-
-    #[test]
-    fn thermal_hold_rejects_health_and_manual_start_until_cooldown() {
-        let mut supervisor = DeviceSupervisor::default();
-        let generation = supervisor.begin_admission("Device_4", 0, true).unwrap();
-        supervisor.mark_launching(
-            "Device_4",
-            generation,
-            "emumi-Device_4-123.scope".into(),
-            12345,
-        );
-        supervisor.enter_thermal_hold("Device_4", generation, 95.0, 1);
-
-        supervisor.observe("Device_4", Observation::Healthy, 2);
-        assert_eq!(
-            supervisor.status("Device_4").phase,
-            DevicePhase::ThermalHold
-        );
-        assert!(supervisor.begin_admission("Device_4", 2, true).is_err());
-        supervisor.observe(
-            "Device_4",
-            Observation::Booting {
-                scope: Some("emumi-Device_4-stale.scope".into()),
-            },
-            3,
-        );
-        assert_eq!(
-            supervisor.status("Device_4").phase,
-            DevicePhase::ThermalHold
-        );
-        assert!(!supervisor.observe_cool_sample("Device_4", 74.0, 3));
-        assert!(!supervisor.observe_cool_sample("Device_4", 74.0, 4));
-        assert!(supervisor.observe_cool_sample("Device_4", 74.0, 5));
-        assert_eq!(supervisor.status("Device_4").phase, DevicePhase::Backoff);
     }
 
     #[test]

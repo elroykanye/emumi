@@ -5,6 +5,17 @@ All notable changes to EmuMi are documented here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Simplify EmuMi into a lifecycle manager: up to four devices may start concurrently, while Linux,
+  KVM and firmware manage host CPU, memory and temperature.
+- Keep per-launch systemd scopes only for exact process ownership and cleanup.
+
+### Removed
+
+- Remove adaptive CPU quotas, CPU and I/O weights, host-memory ceilings, thermal holds,
+  resource-based start refusal and calm-host startup sequencing.
+
 ### Added
 
 - Persist the set of devices the user asked to keep running and supervise each launch through

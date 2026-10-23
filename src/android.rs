@@ -1,7 +1,4 @@
-use crate::{
-    cpu_policy::CpuStat,
-    model::{AndroidProfile, LaunchAdmission, ProfileOptions},
-};
+use crate::model::{AndroidProfile, ProfileOptions};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -13,8 +10,6 @@ use std::{
     thread,
     time::Duration,
 };
-
-pub(crate) const STARTUP_CPU_QUOTA_PERCENT: u16 = 120;
 
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -401,7 +396,6 @@ impl AndroidTools {
         profile: &AndroidProfile,
         args: &[String],
         options: &ProfileOptions,
-        _admission: LaunchAdmission,
     ) -> Result<LaunchHandle, String> {
         let emulator = self
             .emulator
@@ -412,7 +406,6 @@ impl AndroidTools {
         if let Some(image) = runtime_image.as_deref() {
             prepare_profile_runtime_overlay(&profile.name, image)?;
         }
-        validate_memory_policy(options)?;
         let log_path =
             state_path(&format!("emulators/{}.log", profile.name)).ok_or("HOME is not set")?;
         if let Some(parent) = log_path.parent() {
@@ -420,7 +413,7 @@ impl AndroidTools {
         }
         let log = fs::File::create(log_path).map_err(|err| err.to_string())?;
         let emulator_args = emulator_launch_args(&profile.name, args, runtime_image);
-        let launch = launch_spec(emulator, &emulator_args, &profile.name, options)?;
+        let launch = launch_spec(emulator, &emulator_args, &profile.name)?;
         let scope_unit = launch.scope_unit.clone();
         let mut command = Command::new(&launch.program);
         command
@@ -458,62 +451,6 @@ impl AndroidTools {
             scope_unit,
             launcher_pid,
         })
-    }
-
-    pub fn set_scope_cpu_policy(
-        &self,
-        scope_unit: &str,
-        percent: u16,
-        weight: u16,
-    ) -> Result<(), String> {
-        if !valid_scope_unit(scope_unit) {
-            return Err("Refusing to modify an invalid EmuMi scope name".into());
-        }
-        if !(1..=400).contains(&percent) {
-            return Err("CPU quota must be between 1% and 400%".into());
-        }
-        if !(1..=10_000).contains(&weight) {
-            return Err("CPU weight must be between 1 and 10000".into());
-        }
-        let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
-        let status = Command::new(systemctl)
-            .args(scope_cpu_policy_args(scope_unit, percent, weight))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| format!("Could not update {scope_unit}: {error}"))?;
-        status
-            .success()
-            .then_some(())
-            .ok_or_else(|| format!("systemd rejected the CPU quota for {scope_unit}: {status}"))
-    }
-
-    pub fn scope_cpu_stat(&self, scope_unit: &str) -> Result<CpuStat, String> {
-        if !valid_scope_unit(scope_unit) {
-            return Err("Refusing to inspect an invalid EmuMi scope name".into());
-        }
-        let systemctl = path_command("systemctl").ok_or("systemctl was not found in PATH")?;
-        let output = Command::new(systemctl)
-            .args(scope_control_group_args(scope_unit))
-            .output()
-            .map_err(|error| format!("Could not inspect {scope_unit}: {error}"))?;
-        if !output.status.success() {
-            return Err(format!("systemd could not inspect {scope_unit}"));
-        }
-        let relative = String::from_utf8_lossy(&output.stdout);
-        let relative = relative.trim().trim_start_matches('/');
-        if relative.is_empty() {
-            return Err(format!("{scope_unit} has no control group"));
-        }
-        let cgroup = Path::new("/sys/fs/cgroup").join(relative);
-        let text = fs::read_to_string(cgroup.join("cpu.stat"))
-            .map_err(|error| format!("Could not read CPU counters for {scope_unit}: {error}"))?;
-        let cpu_max = fs::read_to_string(cgroup.join("cpu.max"))
-            .map_err(|error| format!("Could not read CPU quota for {scope_unit}: {error}"))?;
-        let quota_percent = parse_cpu_max(&cpu_max)
-            .ok_or_else(|| format!("{scope_unit} returned an invalid CPU quota"))?;
-        parse_cpu_stat(&text, quota_percent)
-            .ok_or_else(|| format!("{scope_unit} returned incomplete CPU counters"))
     }
 
     /// Android's Pixel hardware profiles can re-apply their device-shape overlay
@@ -1010,7 +947,6 @@ fn launch_spec(
     emulator: &Path,
     emulator_args: &[OsString],
     profile_name: &str,
-    options: &ProfileOptions,
 ) -> Result<LaunchSpec, String> {
     let prlimit = path_command("prlimit")
         .ok_or("Safe emulator launch needs prlimit, but it was not found in PATH")?;
@@ -1034,7 +970,6 @@ fn launch_spec(
         emulator_args,
         profile_name,
         now_millis(),
-        options,
     ))
 }
 
@@ -1045,12 +980,12 @@ fn systemd_scope_launch_spec(
     emulator_args: &[OsString],
     profile_name: &str,
     launch_id: u128,
-    options: &ProfileOptions,
 ) -> LaunchSpec {
     // netsimd is shared by emulator processes and can legitimately outlive the
     // AVD that first spawned it. A fixed scope name then makes systemd reject a
     // later restart even though the emulator itself is gone. Per-launch scope
-    // identities preserve accounting without coupling restarts to helper life.
+    // identities preserve exact lifecycle ownership without coupling restarts
+    // to helper life. The scope intentionally carries no resource policy.
     let unit = format!("emumi-{profile_name}-{launch_id}");
     let mut args = vec![
         OsString::from("--user"),
@@ -1059,21 +994,6 @@ fn systemd_scope_launch_spec(
         OsString::from("--collect"),
         OsString::from(format!("--unit={unit}")),
     ];
-    args.extend([
-        OsString::from(format!("--property=CPUQuota={STARTUP_CPU_QUOTA_PERCENT}%")),
-        OsString::from("--property=CPUWeight=25"),
-    ]);
-    if options.host_memory_policy {
-        args.extend([
-            OsString::from(format!("--property=MemoryHigh={}M", options.memory_high_mb)),
-            OsString::from(format!("--property=MemoryMax={}M", options.memory_max_mb)),
-            OsString::from(format!(
-                "--property=MemorySwapMax={}M",
-                options.memory_swap_max_mb
-            )),
-            OsString::from("--property=IOWeight=25"),
-        ]);
-    }
     args.extend([
         OsString::from("--"),
         // Scope units have no ExecContext, so systemd rejects LimitCORE here.
@@ -1102,73 +1022,12 @@ pub(crate) fn scope_belongs_to_profile(scope: &str, profile: &str) -> bool {
     scope_profile(scope).as_deref() == Some(profile)
 }
 
-fn scope_cpu_policy_args(scope_unit: &str, percent: u16, weight: u16) -> Vec<OsString> {
-    vec![
-        OsString::from("--user"),
-        OsString::from("set-property"),
-        OsString::from("--runtime"),
-        OsString::from(scope_unit),
-        OsString::from(format!("CPUQuota={percent}%")),
-        OsString::from(format!("CPUWeight={weight}")),
-    ]
-}
-
-fn scope_control_group_args(scope_unit: &str) -> Vec<OsString> {
-    vec![
-        OsString::from("--user"),
-        OsString::from("show"),
-        OsString::from(scope_unit),
-        OsString::from("--property=ControlGroup"),
-        OsString::from("--value"),
-    ]
-}
-
 fn valid_scope_unit(scope_unit: &str) -> bool {
     scope_unit.starts_with("emumi-")
         && scope_unit.ends_with(".scope")
         && scope_unit
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-}
-
-fn parse_cpu_max(text: &str) -> Option<u16> {
-    let mut values = text.split_whitespace();
-    let quota = values.next()?.parse::<u64>().ok()?;
-    let period = values.next()?.parse::<u64>().ok()?;
-    if period == 0 {
-        return None;
-    }
-    u16::try_from(quota.saturating_mul(100).div_ceil(period)).ok()
-}
-
-fn parse_cpu_stat(text: &str, quota_percent: u16) -> Option<CpuStat> {
-    let values = text
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter_map(|(key, value)| Some((key, value.parse::<u64>().ok()?)))
-        .collect::<HashMap<_, _>>();
-    Some(CpuStat {
-        periods: *values.get("nr_periods")?,
-        throttled_periods: *values.get("nr_throttled")?,
-        throttled_usec: *values.get("throttled_usec")?,
-        quota_percent,
-    })
-}
-
-fn validate_memory_policy(options: &ProfileOptions) -> Result<(), String> {
-    if !options.host_memory_policy {
-        return Ok(());
-    }
-    if options.memory_high_mb < 4096 {
-        return Err("MemoryHigh must be at least 4096 MB for the first safe trials".into());
-    }
-    if options.memory_max_mb < options.memory_high_mb {
-        return Err("MemoryMax must be greater than or equal to MemoryHigh".into());
-    }
-    if options.memory_max_mb < options.memory_mb {
-        return Err("MemoryMax cannot be lower than Android guest memory".into());
-    }
-    Ok(())
 }
 
 pub fn validate_profile_name(name: &str) -> Result<(), String> {
@@ -1656,11 +1515,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mandatory_startup_quota_is_independent_of_optional_memory_policy() {
-        let options = ProfileOptions {
-            host_memory_policy: false,
-            ..Default::default()
-        };
+    fn lifecycle_scope_does_not_throttle_emulator_resources() {
         let spec = systemd_scope_launch_spec(
             "/fake/systemd-run".into(),
             "/fake/prlimit".into(),
@@ -1668,22 +1523,22 @@ mod tests {
             &[],
             "Device_4",
             123,
-            &options,
         );
-        assert!(
-            spec.args
-                .contains(&OsString::from("--property=CPUQuota=120%"))
-        );
-        assert!(
-            spec.args
-                .contains(&OsString::from("--property=CPUWeight=25"))
-        );
-        assert!(
-            !spec
-                .args
-                .iter()
-                .any(|arg| arg.to_string_lossy().contains("MemoryMax"))
-        );
+        for forbidden in [
+            "CPUQuota",
+            "CPUWeight",
+            "IOWeight",
+            "MemoryHigh",
+            "MemoryMax",
+            "MemorySwapMax",
+        ] {
+            assert!(
+                !spec
+                    .args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains(forbidden))
+            );
+        }
     }
 
     #[test]
@@ -1841,10 +1696,6 @@ mod tests {
             &emulator_args,
             "Device_3",
             12344,
-            &ProfileOptions {
-                host_memory_policy: false,
-                ..ProfileOptions::default()
-            },
         );
         let scoped = systemd_scope_launch_spec(
             PathBuf::from("/usr/bin/systemd-run"),
@@ -1853,7 +1704,6 @@ mod tests {
             &emulator_args,
             "Device_3",
             12345,
-            &ProfileOptions::default(),
         );
 
         assert_eq!(
@@ -1906,11 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn wraps_only_one_emulator_in_its_own_memory_scope() {
-        let options = ProfileOptions {
-            host_memory_policy: true,
-            ..ProfileOptions::default()
-        };
+    fn wraps_only_one_emulator_in_its_own_lifecycle_scope() {
         let spec = systemd_scope_launch_spec(
             PathBuf::from("/usr/bin/systemd-run"),
             PathBuf::from("/usr/bin/prlimit"),
@@ -1918,7 +1764,6 @@ mod tests {
             &[OsString::from("-avd"), OsString::from("Device_2")],
             "Device_2",
             12345,
-            &options,
         );
         let args = spec
             .args
@@ -1932,33 +1777,13 @@ mod tests {
             Some("emumi-Device_2-12345.scope")
         );
         assert!(args.contains(&std::borrow::Cow::Borrowed("--unit=emumi-Device_2-12345")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryHigh=5632M")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=MemoryMax=6656M")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed(
-            "--property=MemorySwapMax=1024M"
-        )));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUQuota=120%")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=CPUWeight=25")));
-        assert!(args.contains(&std::borrow::Cow::Borrowed("--property=IOWeight=25")));
+        assert!(!args.iter().any(|arg| arg.contains("--property=CPU")));
+        assert!(!args.iter().any(|arg| arg.contains("--property=Memory")));
+        assert!(!args.iter().any(|arg| arg.contains("--property=IO")));
         assert!(!args.contains(&std::borrow::Cow::Borrowed("--property=LimitCORE=0")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/usr/bin/prlimit")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("--core=0")));
         assert!(args.contains(&std::borrow::Cow::Borrowed("/sdk/emulator")));
-    }
-
-    #[test]
-    fn adaptive_cpu_policy_targets_only_the_launched_scope() {
-        assert_eq!(
-            scope_cpu_policy_args("emumi-Device_2-12345.scope", 240, 100),
-            vec![
-                OsString::from("--user"),
-                OsString::from("set-property"),
-                OsString::from("--runtime"),
-                OsString::from("emumi-Device_2-12345.scope"),
-                OsString::from("CPUQuota=240%"),
-                OsString::from("CPUWeight=100"),
-            ]
-        );
     }
 
     #[test]
@@ -1974,37 +1799,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("launcher child {pid} was left as a zombie");
-    }
-
-    #[test]
-    fn reads_cpu_counters_from_only_the_launched_scope() {
-        assert_eq!(
-            scope_control_group_args("emumi-Device_2-12345.scope"),
-            vec![
-                OsString::from("--user"),
-                OsString::from("show"),
-                OsString::from("emumi-Device_2-12345.scope"),
-                OsString::from("--property=ControlGroup"),
-                OsString::from("--value"),
-            ]
-        );
-        assert_eq!(
-            parse_cpu_stat(
-                "usage_usec 800000\nnr_periods 120\nnr_throttled 90\nthrottled_usec 450000\n",
-                240,
-            ),
-            Some(CpuStat {
-                periods: 120,
-                throttled_periods: 90,
-                throttled_usec: 450_000,
-                quota_percent: 240,
-            })
-        );
-        assert_eq!(parse_cpu_max("300000 100000\n"), Some(300));
-        assert_eq!(parse_cpu_max("180000 100000\n"), Some(180));
-        assert!(parse_cpu_max("max 100000\n").is_none());
-        assert!(parse_cpu_stat("nr_periods 120\n", 180).is_none());
-        assert!(!valid_scope_unit("other.service"));
     }
 
     #[test]

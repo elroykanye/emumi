@@ -146,15 +146,10 @@ fn memory_warning(sample: &DeviceHostStats) -> Option<String> {
         || events.get("oom").copied().unwrap_or(0) > 0
         || events.get("max").copied().unwrap_or(0) > 0
     {
-        return Some(
-            "The host memory ceiling was reached; this emulator may have stalled or been killed"
-                .into(),
-        );
+        return Some("Linux reported an out-of-memory event for this emulator".into());
     }
     if events.get("high").copied().unwrap_or(0) > 0 {
-        return Some(
-            "The host is reclaiming this emulator above MemoryHigh; watch for game stutter".into(),
-        );
+        return Some("Linux reported sustained memory reclaim for this emulator".into());
     }
     if sample.pressure_some_avg10.unwrap_or(0.0) >= 10.0
         || sample.pressure_full_avg10.unwrap_or(0.0) >= 2.0
@@ -313,12 +308,12 @@ mod tests {
     }
 
     #[test]
-    fn warns_for_high_and_hard_limit_events() {
+    fn reports_linux_memory_pressure_events_without_claiming_emumi_limits() {
         let mut sample = DeviceHostStats::default();
         sample.memory_events.insert("high".into(), 2);
-        assert!(memory_warning(&sample).unwrap().contains("MemoryHigh"));
+        assert!(memory_warning(&sample).unwrap().contains("memory reclaim"));
         sample.memory_events.insert("oom_kill".into(), 1);
-        assert!(memory_warning(&sample).unwrap().contains("ceiling"));
+        assert!(memory_warning(&sample).unwrap().contains("out-of-memory"));
     }
 
     #[test]
