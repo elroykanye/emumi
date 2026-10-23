@@ -3,7 +3,7 @@ use crate::{
     config::AppConfig,
     manager_guard::ManagerGuard,
     model::{PicturePreset, ProfileOptions, SpeedPreset},
-    monitor::{HostMonitor, sample_devices},
+    monitor::{HostMonitor, host_resource_warnings, sample_devices},
     netsimd_log::{self, GuardOutcome},
     snapshot_recovery::{self, RecoveryOutcome},
     supervisor::{DevicePhase, DeviceStatus, DeviceSupervisor, Observation, SupervisorAction},
@@ -25,7 +25,6 @@ use tokio::net::TcpListener;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
-const MAX_RUNNING_PROFILES: usize = 4;
 const NETSIMD_LOG_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 const NETSIMD_LOG_CHECK_SECONDS: u64 = 5;
 
@@ -47,6 +46,7 @@ struct Runtime {
     cached_profiles: Vec<crate::model::AndroidProfile>,
     cached_system_images: Vec<ImageDto>,
     cached_device_stats: Vec<crate::model::DeviceHostStats>,
+    host_monitor: HostMonitor,
     discovery_in_flight: bool,
     supervisor: DeviceSupervisor,
 }
@@ -69,6 +69,7 @@ struct AppState {
     config: SettingsDto,
     health: HealthDto,
     stats: crate::model::HostStats,
+    resource_warnings: Vec<String>,
     device_stats: Vec<crate::model::DeviceHostStats>,
     logs: Vec<ApiLog>,
 }
@@ -142,6 +143,7 @@ impl EmuMiApp {
             cached_profiles: Vec::new(),
             cached_system_images: Vec::new(),
             cached_device_stats: Vec::new(),
+            host_monitor: HostMonitor::default(),
             discovery_in_flight: false,
             supervisor,
         }));
@@ -602,8 +604,9 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             }
         });
     }
-    let host_stats = HostMonitor::default().sample();
     let mut runtime = lock(&shared)?;
+    let host_stats = runtime.host_monitor.sample();
+    let resource_warnings = host_resource_warnings(&host_stats);
     let profiles = runtime.cached_profiles.clone();
     let system_images = runtime.cached_system_images.clone();
     let device_stats = runtime.cached_device_stats.clone();
@@ -679,6 +682,7 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             systemd_run: tools.systemd_run_available,
         },
         stats: host_stats,
+        resource_warnings,
         device_stats,
         logs: runtime.logs.clone(),
     };
@@ -773,7 +777,7 @@ fn start_named_profile_internal(
         .map(|candidate| candidate.name)
         .collect::<BTreeSet<_>>();
 
-    let (options, startup_generation, config_to_save) = {
+    let (options, startup_generation, config_to_save, launch_warnings) = {
         let mut runtime = lock(shared)?;
         if !user_requested && !runtime.supervisor.is_desired(name) {
             return Ok(message("Recovery was cancelled by an intentional stop"));
@@ -800,11 +804,13 @@ fn start_named_profile_internal(
             }
             return Ok(message("Android is already running"));
         }
-        if !has_device_slot(&running_profiles, &runtime.starting_profiles) {
-            return api_error(
-                StatusCode::CONFLICT,
-                "This computer is limited to four running Androids. Stop an idle one first.",
-            );
+        let mut launch_warnings = host_resource_warnings(&runtime.host_monitor.sample());
+        launch_warnings.extend(device_count_warnings(
+            &running_profiles,
+            &runtime.starting_profiles,
+        ));
+        for warning in &launch_warnings {
+            runtime.log("warning", format!("Starting {name}: {warning}"));
         }
         let generation = if user_requested {
             runtime
@@ -828,7 +834,7 @@ fn start_named_profile_internal(
             .startup_generations
             .insert(name.to_owned(), generation);
         let config = runtime.lifecycle_config_snapshot();
-        (options, generation, config)
+        (options, generation, config, launch_warnings)
     };
     config_to_save.save().map_err(|error| {
         error_tuple(
@@ -928,11 +934,21 @@ fn start_named_profile_internal(
         startup_generation,
         scope_unit,
     );
-    Ok(message("Android is starting"))
+    if launch_warnings.is_empty() {
+        Ok(message("Android is starting"))
+    } else {
+        Ok(message(format!(
+            "Android is starting. Warning: {}",
+            launch_warnings.join(" ")
+        )))
+    }
 }
 
-fn has_device_slot(running: &BTreeSet<String>, starting: &BTreeSet<String>) -> bool {
-    running.union(starting).count() < MAX_RUNNING_PROFILES
+fn device_count_warnings(running: &BTreeSet<String>, starting: &BTreeSet<String>) -> Vec<String> {
+    // EmuMi deliberately imposes no device-count ceiling. Android's available
+    // emulator ports and the host operating system remain the real boundaries.
+    let _active_device_count = running.union(starting).count();
+    Vec::new()
 }
 
 fn watch_profile_start(
@@ -1487,8 +1503,8 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_RUNNING_PROFILES, classify_supervisor_observation, graceful_stop_allowed,
-        has_device_slot, launch_args, port_readiness_from_state,
+        classify_supervisor_observation, device_count_warnings, graceful_stop_allowed, launch_args,
+        port_readiness_from_state,
     };
     use crate::model::{PicturePreset, ProfileOptions, SpeedPreset};
     use crate::supervisor::DevicePhase;
@@ -1510,25 +1526,19 @@ mod tests {
     }
 
     #[test]
-    fn manager_allows_four_concurrent_androids() {
-        assert_eq!(MAX_RUNNING_PROFILES, 4);
-        let three = BTreeSet::from([
-            "Device_1".to_owned(),
-            "Device_2".to_owned(),
-            "Device_3".to_owned(),
-        ]);
-        assert!(has_device_slot(&three, &BTreeSet::new()));
-
-        let four = BTreeSet::from([
+    fn manager_does_not_impose_a_device_count_limit() {
+        let running = BTreeSet::from([
             "Device_1".to_owned(),
             "Device_2".to_owned(),
             "Device_3".to_owned(),
             "Device_4".to_owned(),
+            "Device_5".to_owned(),
+            "Device_6".to_owned(),
+            "Device_7".to_owned(),
+            "Device_8".to_owned(),
         ]);
-        assert!(!has_device_slot(&four, &BTreeSet::new()));
-
-        let starting_duplicate = BTreeSet::from(["Device_3".to_owned()]);
-        assert!(has_device_slot(&three, &starting_duplicate));
+        let starting = BTreeSet::from(["Device_9".to_owned(), "Device_10".to_owned()]);
+        assert!(device_count_warnings(&running, &starting).is_empty());
     }
 
     #[test]

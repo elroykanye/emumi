@@ -141,6 +141,7 @@ type AppState = {
   config: { android_sdk_path: string; jdk_path: string };
   health: { emulator: boolean; adb: boolean; avd_manager: boolean; kvm: boolean; java: boolean; systemd_run: boolean };
   stats: { cpu_percent: number; memory_used_bytes: number; memory_total_bytes: number; memory_available_bytes: number; cpu_temperature_c: number | null };
+  resource_warnings: string[];
   device_stats: DeviceHostStats[];
   logs: { at: number; level: string; message: string }[];
 };
@@ -414,6 +415,7 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
     <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(260px, 340px) minmax(0, 1fr)" }, gridTemplateRows: { xs: "minmax(180px, auto) minmax(0, 1fr)", lg: "minmax(0, 1fr)" }, gap: 3, height: "100%", minHeight: 0 }}>
       <Stack spacing={1.5} sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}>
         <Typography variant="overline" color="text.secondary">Your devices · {state.profiles.length}</Typography>
+        {state.resource_warnings.map((warning) => <Alert key={warning} severity="warning">{warning}</Alert>)}
         {state.profiles.length === 0 ? (
           <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="No Androids yet" detail="Use New Android to create your first profile." />
         ) : state.profiles.map((profile) => {
@@ -656,6 +658,7 @@ function MonitorPage({ state }: { state: AppState }) {
   const available = state.stats.memory_available_bytes;
   const running = state.profiles.filter((profile) => profile.running_serial);
   return <Stack spacing={3}>
+    {state.resource_warnings.map((warning) => <Alert key={warning} severity="warning">{warning}</Alert>)}
     <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(3, 1fr)", xl: "repeat(5, 1fr)" }, gap: 2 }}>
       <Metric title="Host CPU" value={`${Math.round(state.stats.cpu_percent)}%`} progress={state.stats.cpu_percent} icon={<MemoryRounded />} />
       <Metric title="Host memory" value={`${gib(used)} / ${gib(total)} GB`} progress={total ? used / total * 100 : 0} icon={<MonitorHeartRounded />} />

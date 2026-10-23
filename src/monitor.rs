@@ -31,6 +31,35 @@ pub fn sample_devices(profiles: &[AndroidProfile]) -> Vec<DeviceHostStats> {
         .collect()
 }
 
+pub fn host_resource_warnings(stats: &HostStats) -> Vec<String> {
+    const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
+    let mut warnings = Vec::new();
+    if stats.memory_total_bytes > 0 {
+        let low_memory_threshold = (stats.memory_total_bytes / 10).min(TWO_GIB);
+        if stats.memory_available_bytes <= low_memory_threshold {
+            warnings.push(format!(
+                "Host memory is running low: {:.1} GiB available",
+                stats.memory_available_bytes as f64 / 1024_f64.powi(3)
+            ));
+        }
+    }
+    if stats.cpu_percent >= 90.0 {
+        warnings.push(format!(
+            "Host CPU is {:.0}% busy; additional devices may respond slowly",
+            stats.cpu_percent
+        ));
+    }
+    if let Some(temperature) = stats.cpu_temperature_c
+        && temperature >= 90.0
+    {
+        warnings.push(format!(
+            "CPU temperature is {:.0} C; additional load may trigger firmware throttling",
+            temperature
+        ));
+    }
+    warnings
+}
+
 fn sample_device(profile_name: &str, serial: &str) -> DeviceHostStats {
     let pid = find_emulator_pid(Path::new("/proc"), profile_name);
     let mut sample = DeviceHostStats {
@@ -314,6 +343,40 @@ mod tests {
         assert!(memory_warning(&sample).unwrap().contains("memory reclaim"));
         sample.memory_events.insert("oom_kill".into(), 1);
         assert!(memory_warning(&sample).unwrap().contains("out-of-memory"));
+    }
+
+    #[test]
+    fn warns_about_host_pressure_without_refusing_work() {
+        let warnings = host_resource_warnings(&HostStats {
+            cpu_percent: 96.0,
+            memory_used_bytes: 31 * 1024 * 1024 * 1024,
+            memory_total_bytes: 32 * 1024 * 1024 * 1024,
+            memory_available_bytes: 1024 * 1024 * 1024,
+            cpu_temperature_c: Some(92.0),
+        });
+
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.iter().any(|warning| warning.contains("memory")));
+        assert!(warnings.iter().any(|warning| warning.contains("CPU")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("temperature"))
+        );
+    }
+
+    #[test]
+    fn healthy_host_has_no_resource_warning() {
+        assert!(
+            host_resource_warnings(&HostStats {
+                cpu_percent: 55.0,
+                memory_used_bytes: 16 * 1024 * 1024 * 1024,
+                memory_total_bytes: 32 * 1024 * 1024 * 1024,
+                memory_available_bytes: 16 * 1024 * 1024 * 1024,
+                cpu_temperature_c: Some(70.0),
+            })
+            .is_empty()
+        );
     }
 
     #[test]

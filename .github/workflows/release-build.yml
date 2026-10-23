@@ -35,6 +35,10 @@ jobs:
           npm run build
       - name: Ensure bundled frontend is current
         run: git diff --exit-code -- web
+      - name: Verify manager HTTP wire
+        run: |
+          cargo build
+          ./tests/manager_wire.sh
       - name: Build Debian package
         run: ./scripts/package-deb.sh
       - uses: actions/upload-artifact@v4

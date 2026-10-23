@@ -9,7 +9,8 @@ The first supported EmuMi release establishes a simple, stable Android device ma
 
 ### Added
 
-- Create, clone, configure, start and stop up to four Android emulator profiles.
+- Create, clone, configure, start and stop as many Android emulator profiles as the host can sustain,
+  within Android's supported emulator-port range.
 - Use fixed ADB ports, a 720 x 1280 automation canvas, hardware graphics, muted audio and optional
   headless operation for reliable automation.
 - Persist the devices the user asked to keep running and supervise native crashes, boot timeouts and
@@ -22,8 +23,8 @@ The first supported EmuMi release establishes a simple, stable Android device ma
 
 - Let Linux, KVM and firmware manage CPU, memory and temperature instead of implementing a second
   resource scheduler inside EmuMi.
-- Allow up to four devices to start concurrently without resource-based admission blocks or staged
-  startup delays.
+- Do not impose an EmuMi device-count ceiling or resource-based admission blocks; report host
+  pressure as warnings and let the user decide whether to start another device.
 
 ### Fixed
 

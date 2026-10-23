@@ -17,7 +17,7 @@ stopping Android profiles without requiring Android Studio.
 - Stable sequential ADB ports (`5554`, `5556`, `5558`, ...)
 - Simple performance, window-size and audio controls
 - Lean Gaming defaults: 2 CPU cores, 4 GB RAM, 720 × 1280 at 240 dpi, 30 Hz and host GPU
-- Independent starts for as many as four devices at once
+- Independent starts with no EmuMi device-count cap
 - Stable Intel/Mesa rendering on hybrid-GPU Linux systems, with explicit experimental NVIDIA
   offload available per profile
 - Quick Boot with exact-profile snapshot quarantine, one cold retry and stale-lock cleanup
@@ -27,7 +27,7 @@ stopping Android profiles without requiring Android Studio.
 - Per-emulator Linux lifecycle scopes used only for exact process ownership and cleanup
 - A single kernel-locked manager, atomic API endpoint publication and a non-blocking stop path
 - Windowless automation by default while preserving ADB screenshots and input
-- Up to four concurrently running Android devices
+- As many concurrently running Android devices as the host can sustain
 - Live device state plus host CPU and memory monitoring
 - Automatic protection against runaway Android `netsimd` temp logs filling the host disk
 - Automatic Android SDK, Java, ADB, emulator and KVM discovery
@@ -111,8 +111,10 @@ The default Lean Gaming profile gives Android two virtual CPU cores and 4 GB of 
 can change those fixed launch settings when needed.
 
 Every managed emulator still launches in an individual systemd user scope so EmuMi can terminate
-only the process tree it owns. Up to four devices can start and run concurrently. The Monitor page
-reports usage without changing it. Headless automation is the default because Frostguard operates
+only the process tree it owns. EmuMi does not impose a device-count ceiling; Android's supported
+emulator-port range provides up to 64 stable slots. The Monitor page warns about low available
+memory, high CPU use and high CPU temperature without blocking a launch. Headless automation is
+the default because Frostguard operates
 through ADB; users can still enable a visible window for interactive play.
 
 Native emulator processes inherit a zero-byte core-dump limit through `prlimit`; a crash therefore
