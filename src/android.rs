@@ -12,6 +12,19 @@ use std::{
 };
 
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const PLAY_STORE_PACKAGE: &str = "com.android.vending";
+const GOOGLE_RESTORE_PACKAGE: &str = "com.google.android.apps.restore";
+
+fn automation_store_actions(suspend_restore: bool) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut enable = vec![PLAY_STORE_PACKAGE];
+    let disable = if suspend_restore {
+        vec![GOOGLE_RESTORE_PACKAGE]
+    } else {
+        enable.push(GOOGLE_RESTORE_PACKAGE);
+        Vec::new()
+    };
+    (enable, disable)
+}
 
 fn command_output_with_timeout(
     command: &mut Command,
@@ -583,9 +596,10 @@ impl AndroidTools {
         Ok(())
     }
 
-    pub fn watch_lean_profile_after_start(
+    pub fn watch_profile_after_start(
         &self,
         profile_name: &str,
+        lean_gaming: bool,
         suspend_store_during_automation: bool,
     ) {
         let Some(adb) = self.adb.clone() else {
@@ -596,6 +610,20 @@ impl AndroidTools {
             let Some(serial) = wait_for_booted_profile(&adb, &profile_name) else {
                 return;
             };
+            let (enable_packages, disable_store_packages) =
+                automation_store_actions(lean_gaming && suspend_store_during_automation);
+            for package in enable_packages {
+                let _ = Command::new(&adb)
+                    .args([
+                        "-s", &serial, "shell", "pm", "enable", "--user", "0", package,
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            if !lean_gaming {
+                return;
+            }
             for setting in [
                 "window_animation_scale",
                 "transition_animation_scale",
@@ -665,19 +693,7 @@ impl AndroidTools {
                 "com.android.chrome",
                 "com.android.camera2",
             ];
-            if suspend_store_during_automation {
-                packages.extend(["com.android.vending", "com.google.android.apps.restore"]);
-            } else {
-                for package in ["com.android.vending", "com.google.android.apps.restore"] {
-                    let _ = Command::new(&adb)
-                        .args([
-                            "-s", &serial, "shell", "pm", "enable", "--user", "0", package,
-                        ])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-            }
+            packages.extend(disable_store_packages);
             for package in packages {
                 let _ = Command::new(&adb)
                     .args([
@@ -1513,6 +1529,20 @@ fn remove_ini_value(text: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automation_store_actions_never_disable_play_store() {
+        let (enable, disable) = automation_store_actions(true);
+        assert_eq!(enable, vec!["com.android.vending"]);
+        assert_eq!(disable, vec!["com.google.android.apps.restore"]);
+
+        let (enable, disable) = automation_store_actions(false);
+        assert_eq!(
+            enable,
+            vec!["com.android.vending", "com.google.android.apps.restore"]
+        );
+        assert!(disable.is_empty());
+    }
 
     #[test]
     fn lifecycle_scope_does_not_throttle_emulator_resources() {

@@ -581,7 +581,7 @@ function ProfileDetail({ profile, options, pending, lifecycle, setPending, perfo
           </ToggleButtonGroup>
         </SettingRow>
         <Divider />
-        <SettingRow icon={<RefreshRounded />} title="Pause app updates during automation" description="Keeps Play Store installed but prevents restores and updates from consuming CPU while bots run">
+        <SettingRow icon={<RefreshRounded />} title="Pause device restore during automation" description="Keeps Play Store available while preventing Google Restore from consuming CPU and network in Lean Gaming mode">
           <Switch checked={draft.suspend_store_during_automation} onChange={(event) => setDraft({ ...draft, suspend_store_during_automation: event.target.checked })} />
         </SettingRow>
         {draft.speed === "LeanGaming" && <Alert severity="info" sx={{ mt: 1 }}>Lean Gaming always starts Android from a clean boot so native games do not inherit a broken saved-memory state. Installed apps, game data and accounts are preserved.</Alert>}

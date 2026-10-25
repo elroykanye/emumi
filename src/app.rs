@@ -925,9 +925,11 @@ fn start_named_profile_internal(
     if options.rectangular_display {
         tools.watch_rectangular_display_after_start(name);
     }
-    if options.speed == SpeedPreset::LeanGaming {
-        tools.watch_lean_profile_after_start(name, options.suspend_store_during_automation);
-    }
+    tools.watch_profile_after_start(
+        name,
+        options.speed == SpeedPreset::LeanGaming,
+        options.suspend_store_during_automation,
+    );
     watch_profile_start(
         Arc::clone(shared),
         name.to_owned(),
