@@ -88,34 +88,6 @@ impl Default for ProfileOptions {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct HostStats {
-    pub cpu_percent: f32,
-    pub memory_used_bytes: u64,
-    pub memory_total_bytes: u64,
-    pub memory_available_bytes: u64,
-    pub cpu_temperature_c: Option<f32>,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct DeviceHostStats {
-    pub profile_name: String,
-    pub serial: String,
-    pub pid: Option<u32>,
-    pub rss_bytes: u64,
-    pub pss_bytes: u64,
-    pub vm_swap_bytes: u64,
-    pub scope_name: Option<String>,
-    pub memory_current_bytes: Option<u64>,
-    pub memory_high_bytes: Option<u64>,
-    pub memory_max_bytes: Option<u64>,
-    pub memory_swap_current_bytes: Option<u64>,
-    pub memory_events: std::collections::BTreeMap<String, u64>,
-    pub pressure_some_avg10: Option<f32>,
-    pub pressure_full_avg10: Option<f32>,
-    pub warning: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::ProfileOptions;

@@ -28,7 +28,7 @@ stopping Android profiles without requiring Android Studio.
 - A single kernel-locked manager, atomic API endpoint publication and a non-blocking stop path
 - Windowless automation by default while preserving ADB screenshots and input
 - As many concurrently running Android devices as the host can sustain
-- Live device state plus host CPU and memory monitoring
+- Live Android lifecycle and ADB state without host-hardware telemetry
 - Automatic protection against runaway Android `netsimd` temp logs filling the host disk
 - Automatic Android SDK, Java, ADB, emulator and KVM discovery
 - Local lifecycle API for tools such as Frostguard
@@ -56,7 +56,7 @@ sudo apt install libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0 libgtk-3-0t64
 Download the `.deb` from the latest GitHub release and install it with:
 
 ```bash
-sudo apt install ./emumi_1.0.0_amd64.deb
+sudo apt install ./emumi_1.0.1_amd64.deb
 ```
 
 EmuMi then appears in the desktop application menu.
@@ -93,7 +93,6 @@ Create the Debian package with:
 - `src/config.rs` — XDG user configuration persistence
 - `src/supervisor.rs` — persisted lifecycle generations, backoff and recovery circuits
 - `src/snapshot_recovery.rs` — exact-profile failed-snapshot quarantine
-- `src/monitor.rs` — Linux host monitoring
 - `src/model.rs` — shared application models
 - `frontend/` — React, TypeScript and Material UI source
 - `web/` — compiled interface bundled into the native binary
@@ -104,18 +103,23 @@ EmuMi's local-only lifecycle API and stable ADB port assignments.
 
 ## Resource policy
 
-EmuMi configures the virtual hardware selected in each device profile and then leaves host CPU,
-memory and temperature management to Linux, KVM and the computer firmware. It does not apply CPU
-quotas, scheduling weights, host-memory ceilings, thermal holds or resource-based launch blocks.
+EmuMi configures Android virtual hardware and leaves host CPU, memory and temperature management to
+Linux, KVM and the computer firmware. It does not sample or report host hardware, and it does not
+apply CPU quotas, scheduling weights, host-memory ceilings, thermal holds or resource-based launch
+blocks.
 The default Lean Gaming profile gives Android two virtual CPU cores and 4 GB of guest RAM, and users
 can change those fixed launch settings when needed.
 
 Every managed emulator still launches in an individual systemd user scope so EmuMi can terminate
 only the process tree it owns. EmuMi does not impose a device-count ceiling; Android's supported
-emulator-port range provides up to 64 stable slots. The Monitor page warns about low available
-memory, high CPU use and high CPU temperature without blocking a launch. Headless automation is
-the default because Frostguard operates
+emulator-port range provides up to 64 stable slots. The Running page reports only Android lifecycle
+and ADB state. Headless automation is the default because Frostguard operates
 through ADB; users can still enable a visible window for interactive play.
+
+Chrome and Google Play Store are protected packages. EmuMi enables and unsuspends both after every
+managed boot, including Lean Gaming boots, and never adds either package to its optional Android
+background-app cleanup. The separate Google Restore service may still be paused when the user keeps
+the "Pause device restore during automation" option enabled.
 
 Native emulator processes inherit a zero-byte core-dump limit through `prlimit`; a crash therefore
 cannot create another multi-gigabyte systemd coredump. EmuMi retains the bounded per-device log,

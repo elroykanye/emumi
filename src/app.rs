@@ -3,7 +3,6 @@ use crate::{
     config::AppConfig,
     manager_guard::ManagerGuard,
     model::{PicturePreset, ProfileOptions, SpeedPreset},
-    monitor::{HostMonitor, host_resource_warnings, sample_devices},
     netsimd_log::{self, GuardOutcome},
     snapshot_recovery::{self, RecoveryOutcome},
     supervisor::{DevicePhase, DeviceStatus, DeviceSupervisor, Observation, SupervisorAction},
@@ -41,12 +40,9 @@ struct Runtime {
     rectangular_watchers: BTreeSet<String>,
     starting_profiles: BTreeSet<String>,
     startup_generations: BTreeMap<String, u64>,
-    memory_warnings: BTreeMap<String, String>,
     profile_scopes: BTreeMap<String, String>,
     cached_profiles: Vec<crate::model::AndroidProfile>,
     cached_system_images: Vec<ImageDto>,
-    cached_device_stats: Vec<crate::model::DeviceHostStats>,
-    host_monitor: HostMonitor,
     discovery_in_flight: bool,
     supervisor: DeviceSupervisor,
 }
@@ -68,9 +64,6 @@ struct AppState {
     system_images: Vec<ImageDto>,
     config: SettingsDto,
     health: HealthDto,
-    stats: crate::model::HostStats,
-    resource_warnings: Vec<String>,
-    device_stats: Vec<crate::model::DeviceHostStats>,
     logs: Vec<ApiLog>,
 }
 
@@ -138,12 +131,9 @@ impl EmuMiApp {
             rectangular_watchers: BTreeSet::new(),
             starting_profiles: BTreeSet::new(),
             startup_generations: BTreeMap::new(),
-            memory_warnings: BTreeMap::new(),
             profile_scopes: BTreeMap::new(),
             cached_profiles: Vec::new(),
             cached_system_images: Vec::new(),
-            cached_device_stats: Vec::new(),
-            host_monitor: HostMonitor::default(),
             discovery_in_flight: false,
             supervisor,
         }));
@@ -315,7 +305,23 @@ fn spawn_device_supervisor(runtime: Shared) {
                                 runtime.supervisor.adopt_scope(&name, owned_scope);
                             }
                         }
+                        let was_ready =
+                            runtime
+                                .supervisor
+                                .status_snapshot(&name)
+                                .is_some_and(|status| {
+                                    status.desired_running && status.phase == DevicePhase::Ready
+                                });
                         runtime.supervisor.observe(&name, observation, now);
+                        if was_ready && !runtime.supervisor.is_desired(&name) {
+                            runtime.profile_scopes.remove(&name);
+                            runtime.log(
+                                "info",
+                                format!(
+                                    "{name} was closed outside EmuMi; keeping it stopped until the next Start request"
+                                ),
+                            );
+                        }
                     }
                     let mut resumed = Vec::new();
                     for (name, generation, scope, boot_completed) in restored_startups {
@@ -574,14 +580,13 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
                         package_id: image.package_id,
                     })
                     .collect();
-                let device_stats = sample_devices(&profiles);
-                (profiles, system_images, device_stats)
+                (profiles, system_images)
             })
             .await;
             if let Ok(mut runtime) = refresh_shared.lock() {
                 runtime.discovery_in_flight = false;
                 match result {
-                    Ok((profiles, system_images, device_stats)) => {
+                    Ok((profiles, system_images)) => {
                         let names = profiles
                             .iter()
                             .map(|profile| profile.name.clone())
@@ -589,7 +594,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
                         let changed = runtime.ensure_profile_ports(&names);
                         runtime.cached_profiles = profiles;
                         runtime.cached_system_images = system_images;
-                        runtime.cached_device_stats = device_stats;
                         if changed {
                             let config = runtime.config.clone();
                             drop(runtime);
@@ -605,11 +609,8 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
         });
     }
     let mut runtime = lock(&shared)?;
-    let host_stats = runtime.host_monitor.sample();
-    let resource_warnings = host_resource_warnings(&host_stats);
     let profiles = runtime.cached_profiles.clone();
     let system_images = runtime.cached_system_images.clone();
-    let device_stats = runtime.cached_device_stats.clone();
     let running_names = profiles
         .iter()
         .filter(|profile| profile.is_running())
@@ -634,34 +635,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             rectangular_starts.push(profile.name.clone());
         }
     }
-    for sample in &device_stats {
-        if let Some(scope) = &sample.scope_name {
-            runtime
-                .profile_scopes
-                .insert(sample.profile_name.clone(), scope.clone());
-        }
-    }
-    let running_profile_names = device_stats
-        .iter()
-        .map(|sample| sample.profile_name.clone())
-        .collect::<BTreeSet<_>>();
-    runtime
-        .memory_warnings
-        .retain(|name, _| running_profile_names.contains(name));
-    for sample in &device_stats {
-        match &sample.warning {
-            Some(warning) if runtime.memory_warnings.get(&sample.profile_name) != Some(warning) => {
-                runtime
-                    .memory_warnings
-                    .insert(sample.profile_name.clone(), warning.clone());
-                runtime.log("warning", format!("{}: {warning}", sample.profile_name));
-            }
-            None => {
-                runtime.memory_warnings.remove(&sample.profile_name);
-            }
-            _ => {}
-        }
-    }
     let state = AppState {
         manager_id: runtime._manager_guard.manager_id().to_owned(),
         profiles,
@@ -681,9 +654,6 @@ async fn read_state(State(shared): State<Shared>) -> ApiResult<AppState> {
             java: tools.java_home.is_some(),
             systemd_run: tools.systemd_run_available,
         },
-        stats: host_stats,
-        resource_warnings,
-        device_stats,
         logs: runtime.logs.clone(),
     };
     drop(runtime);
@@ -770,14 +740,7 @@ fn start_named_profile_internal(
         .into_iter()
         .find(|profile| profile.name == name)
         .ok_or_else(|| error_tuple(StatusCode::NOT_FOUND, "Profile not found"))?;
-    let running_profiles = tools
-        .discover_profiles()
-        .into_iter()
-        .filter(|candidate| candidate.is_running())
-        .map(|candidate| candidate.name)
-        .collect::<BTreeSet<_>>();
-
-    let (options, startup_generation, config_to_save, launch_warnings) = {
+    let (options, startup_generation, config_to_save) = {
         let mut runtime = lock(shared)?;
         if !user_requested && !runtime.supervisor.is_desired(name) {
             return Ok(message("Recovery was cancelled by an intentional stop"));
@@ -804,14 +767,6 @@ fn start_named_profile_internal(
             }
             return Ok(message("Android is already running"));
         }
-        let mut launch_warnings = host_resource_warnings(&runtime.host_monitor.sample());
-        launch_warnings.extend(device_count_warnings(
-            &running_profiles,
-            &runtime.starting_profiles,
-        ));
-        for warning in &launch_warnings {
-            runtime.log("warning", format!("Starting {name}: {warning}"));
-        }
         let generation = if user_requested {
             runtime
                 .supervisor
@@ -834,7 +789,7 @@ fn start_named_profile_internal(
             .startup_generations
             .insert(name.to_owned(), generation);
         let config = runtime.lifecycle_config_snapshot();
-        (options, generation, config, launch_warnings)
+        (options, generation, config)
     };
     config_to_save.save().map_err(|error| {
         error_tuple(
@@ -844,11 +799,16 @@ fn start_named_profile_internal(
     })?;
 
     let (display_width, display_height) = display_dimensions(options.picture);
+    let mut launch_options = options.clone();
+    if needs_rectangular_hardware_migration(&profile.device_name, options.rectangular_display) {
+        launch_options.cold_boot = true;
+    }
     let start_result = tools
         .configure_input_and_window(
             name,
             options.host_keyboard,
             options.device_frame,
+            options.rectangular_display,
             display_width,
             display_height,
             options.dpi,
@@ -861,7 +821,7 @@ fn start_named_profile_internal(
                 Ok(())
             }
         })
-        .and_then(|_| tools.start(&profile, &launch_args(&options), &options));
+        .and_then(|_| tools.start(&profile, &launch_args(&launch_options), &options));
     let launch_handle = match start_result {
         Ok(launch_handle) => launch_handle,
         Err(message) => {
@@ -936,21 +896,7 @@ fn start_named_profile_internal(
         startup_generation,
         scope_unit,
     );
-    if launch_warnings.is_empty() {
-        Ok(message("Android is starting"))
-    } else {
-        Ok(message(format!(
-            "Android is starting. Warning: {}",
-            launch_warnings.join(" ")
-        )))
-    }
-}
-
-fn device_count_warnings(running: &BTreeSet<String>, starting: &BTreeSet<String>) -> Vec<String> {
-    // EmuMi deliberately imposes no device-count ceiling. Android's available
-    // emulator ports and the host operating system remain the real boundaries.
-    let _active_device_count = running.union(starting).count();
-    Vec::new()
+    Ok(message("Android is starting"))
 }
 
 fn watch_profile_start(
@@ -1477,6 +1423,10 @@ fn display_dimensions(_picture: PicturePreset) -> (u16, u16) {
     (720, 1280)
 }
 
+fn needs_rectangular_hardware_migration(device_name: &str, rectangular_display: bool) -> bool {
+    rectangular_display && !device_name.eq_ignore_ascii_case("pixel 2")
+}
+
 fn lock(
     shared: &Shared,
 ) -> Result<std::sync::MutexGuard<'_, Runtime>, (StatusCode, Json<ApiMessage>)> {
@@ -1505,12 +1455,11 @@ fn error_tuple(status: StatusCode, text: impl Into<String>) -> (StatusCode, Json
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_supervisor_observation, device_count_warnings, graceful_stop_allowed, launch_args,
-        port_readiness_from_state,
+        classify_supervisor_observation, graceful_stop_allowed, launch_args,
+        needs_rectangular_hardware_migration, port_readiness_from_state,
     };
     use crate::model::{PicturePreset, ProfileOptions, SpeedPreset};
     use crate::supervisor::DevicePhase;
-    use std::collections::BTreeSet;
 
     #[test]
     fn snapshot_saving_stop_is_allowed_only_after_ready() {
@@ -1525,22 +1474,6 @@ mod tests {
         ] {
             assert!(!graceful_stop_allowed(phase), "{phase:?}");
         }
-    }
-
-    #[test]
-    fn manager_does_not_impose_a_device_count_limit() {
-        let running = BTreeSet::from([
-            "Device_1".to_owned(),
-            "Device_2".to_owned(),
-            "Device_3".to_owned(),
-            "Device_4".to_owned(),
-            "Device_5".to_owned(),
-            "Device_6".to_owned(),
-            "Device_7".to_owned(),
-            "Device_8".to_owned(),
-        ]);
-        let starting = BTreeSet::from(["Device_9".to_owned(), "Device_10".to_owned()]);
-        assert!(device_count_warnings(&running, &starting).is_empty());
     }
 
     #[test]
@@ -1670,6 +1603,13 @@ mod tests {
         let skin = args.iter().position(|arg| arg == "-skin").unwrap();
 
         assert_eq!(args.get(skin + 1).map(String::as_str), Some("720x1280"));
+    }
+
+    #[test]
+    fn rectangular_hardware_migration_gets_one_clean_boot() {
+        assert!(needs_rectangular_hardware_migration("pixel 7", true));
+        assert!(!needs_rectangular_hardware_migration("pixel 2", true));
+        assert!(!needs_rectangular_hardware_migration("pixel 7", false));
     }
 
     #[test]

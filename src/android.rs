@@ -13,10 +13,12 @@ use std::{
 
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const PLAY_STORE_PACKAGE: &str = "com.android.vending";
+const CHROME_PACKAGE: &str = "com.android.chrome";
 const GOOGLE_RESTORE_PACKAGE: &str = "com.google.android.apps.restore";
+const PACKAGE_REPAIR_ACTIONS: [&str; 2] = ["enable", "unsuspend"];
 
 fn automation_store_actions(suspend_restore: bool) -> (Vec<&'static str>, Vec<&'static str>) {
-    let mut enable = vec![PLAY_STORE_PACKAGE];
+    let mut enable = vec![PLAY_STORE_PACKAGE, CHROME_PACKAGE];
     let disable = if suspend_restore {
         vec![GOOGLE_RESTORE_PACKAGE]
     } else {
@@ -548,6 +550,7 @@ impl AndroidTools {
         profile_name: &str,
         host_keyboard: bool,
         device_frame: bool,
+        rectangular_display: bool,
         display_width: u16,
         display_height: u16,
         display_dpi: u16,
@@ -570,7 +573,8 @@ impl AndroidTools {
         );
         let text = set_ini_value(&text, "hw.lcd.width", &display_width.to_string());
         let text = set_ini_value(&text, "hw.lcd.height", &display_height.to_string());
-        let mut text = set_ini_value(&text, "hw.lcd.density", &display_dpi.to_string());
+        let text = set_ini_value(&text, "hw.lcd.density", &display_dpi.to_string());
+        let mut text = configure_rectangular_hardware(&text, rectangular_display);
         // Whiteout's ARM translation path expects a normal phone hardware surface.
         // Removing sensors/cameras saves almost nothing and caused repeatable native startup aborts.
         let phone_hardware = [
@@ -613,13 +617,13 @@ impl AndroidTools {
             let (enable_packages, disable_store_packages) =
                 automation_store_actions(lean_gaming && suspend_store_during_automation);
             for package in enable_packages {
-                let _ = Command::new(&adb)
-                    .args([
-                        "-s", &serial, "shell", "pm", "enable", "--user", "0", package,
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                for action in PACKAGE_REPAIR_ACTIONS {
+                    let _ = Command::new(&adb)
+                        .args(["-s", &serial, "shell", "pm", action, "--user", "0", package])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
             }
             if !lean_gaming {
                 return;
@@ -690,7 +694,6 @@ impl AndroidTools {
                 "com.google.android.healthconnect.controller",
                 "com.google.android.ondevicepersonalization.services",
                 "com.google.android.deskclock",
-                "com.android.chrome",
                 "com.android.camera2",
             ];
             packages.extend(disable_store_packages);
@@ -1510,6 +1513,18 @@ fn set_ini_value(text: &str, key: &str, value: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+fn configure_rectangular_hardware(text: &str, rectangular_display: bool) -> String {
+    if !rectangular_display {
+        return text.to_owned();
+    }
+    let text = set_ini_value(text, "hw.device.name", "pixel_2");
+    set_ini_value(
+        &text,
+        "hw.device.hash2",
+        "MD5:914a6a50cd5dbc5e6c0c5ec988ac20fa",
+    )
+}
+
 fn remove_ini_value(text: &str, key: &str) -> String {
     let lines = text
         .lines()
@@ -1529,19 +1544,76 @@ fn remove_ini_value(text: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn automation_store_actions_never_disable_play_store() {
+    fn automation_store_actions_restore_chrome_and_play_store() {
+        assert_eq!(PACKAGE_REPAIR_ACTIONS, ["enable", "unsuspend"]);
         let (enable, disable) = automation_store_actions(true);
-        assert_eq!(enable, vec!["com.android.vending"]);
+        assert_eq!(enable, vec!["com.android.vending", "com.android.chrome"]);
         assert_eq!(disable, vec!["com.google.android.apps.restore"]);
 
         let (enable, disable) = automation_store_actions(false);
         assert_eq!(
             enable,
-            vec!["com.android.vending", "com.google.android.apps.restore"]
+            vec![
+                "com.android.vending",
+                "com.android.chrome",
+                "com.google.android.apps.restore"
+            ]
         );
         assert!(disable.is_empty());
+    }
+
+    #[test]
+    fn boot_watcher_repairs_protected_packages_through_adb() {
+        let rig = std::env::temp_dir().join(format!(
+            "emumi-protected-packages-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&rig).unwrap();
+        let adb = rig.join("adb");
+        let log = rig.join("adb.log");
+        fs::write(
+            &adb,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  devices) printf 'List of devices attached\nemulator-5554\tdevice\n' ;;
+  '-s emulator-5554 emu avd name') printf 'Protected_Device\nOK\n' ;;
+  '-s emulator-5554 shell getprop sys.boot_completed') printf '1\n' ;;
+esac
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&adb, fs::Permissions::from_mode(0o700)).unwrap();
+
+        AndroidTools {
+            adb: Some(adb),
+            ..AndroidTools::default()
+        }
+        .watch_profile_after_start("Protected_Device", true, true);
+
+        let output = (0..100)
+            .find_map(|_| {
+                let output = fs::read_to_string(&log).unwrap_or_default();
+                let complete = output.contains("shell pm unsuspend --user 0 com.android.chrome");
+                complete.then_some(output).or_else(|| {
+                    thread::sleep(Duration::from_millis(20));
+                    None
+                })
+            })
+            .expect("package repair commands were not issued");
+        for package in [PLAY_STORE_PACKAGE, CHROME_PACKAGE] {
+            assert!(output.contains(&format!("shell pm enable --user 0 {package}")));
+            assert!(output.contains(&format!("shell pm unsuspend --user 0 {package}")));
+            assert!(!output.contains(&format!("shell pm disable-user --user 0 {package}")));
+        }
+        let _ = fs::remove_dir_all(rig);
     }
 
     #[test]
@@ -1686,6 +1758,18 @@ mod tests {
                 "0"
             ]
         );
+    }
+
+    #[test]
+    fn rectangular_display_uses_a_notchless_hardware_profile() {
+        let original = "hw.device.name=pixel_7\nhw.device.hash2=MD5:2016577e1656e8e7c2adb0fac972beea\nhw.lcd.width=720\nhw.lcd.height=1280\n";
+
+        let configured = configure_rectangular_hardware(original, true);
+
+        assert!(configured.contains("hw.device.name=pixel_2\n"));
+        assert!(configured.contains("hw.device.hash2=MD5:914a6a50cd5dbc5e6c0c5ec988ac20fa\n"));
+        assert!(configured.contains("hw.lcd.width=720\n"));
+        assert!(configured.contains("hw.lcd.height=1280\n"));
     }
 
     #[test]

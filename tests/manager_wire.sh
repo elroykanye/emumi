@@ -62,7 +62,12 @@ first_time=$(tail -n 1 "$rig/state-response")
 head -n -1 "$rig/state-response" >"$rig/state.json"
 grep -q '"manager_id"' "$rig/state.json"
 grep -q '"device_supervision"' "$rig/state.json"
-grep -q '"resource_warnings"' "$rig/state.json"
+for forbidden_field in '"stats"' '"resource_warnings"' '"device_stats"'; do
+  if grep -q "$forbidden_field" "$rig/state.json"; then
+    echo "host telemetry leaked into /api/state: $forbidden_field" >&2
+    exit 1
+  fi
+done
 awk -v elapsed="$first_time" 'BEGIN { if (elapsed >= 0.5) exit 1 }'
 
 curl --silent --show-error --max-time 1 --request POST --write-out '\n%{time_total}' \

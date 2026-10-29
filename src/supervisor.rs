@@ -514,15 +514,18 @@ impl DeviceSupervisor {
                     );
                 }
             }
-            Observation::Absent { scope } => {
-                let entry = self.entries.entry(profile.to_owned()).or_default();
-                if !entry.status.desired_running {
-                    entry.status.phase = DevicePhase::Stopped;
-                    entry.status.next_retry_at = None;
-                } else if entry.status.phase == DevicePhase::Ready {
-                    entry.unhealthy_samples = entry.unhealthy_samples.saturating_add(1);
-                    if entry.unhealthy_samples >= UNHEALTHY_SAMPLE_LIMIT {
-                        self.record_failure(profile, "Emulator disappeared from ADB", scope, now);
+            Observation::Absent { .. } => {
+                let externally_closed = self.entries.get(profile).is_some_and(|entry| {
+                    entry.status.desired_running && entry.status.phase == DevicePhase::Ready
+                });
+                if externally_closed {
+                    self.request_stop(profile);
+                    self.mark_cleaned(profile);
+                } else {
+                    let entry = self.entries.entry(profile.to_owned()).or_default();
+                    if !entry.status.desired_running {
+                        entry.status.phase = DevicePhase::Stopped;
+                        entry.status.next_retry_at = None;
                     }
                 }
             }
@@ -595,6 +598,30 @@ mod tests {
         assert_eq!(supervisor.status("Device_1").phase, DevicePhase::Stopped);
         assert!(!supervisor.status("Device_1").desired_running);
         assert!(supervisor.due_actions(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn closing_a_ready_emulator_outside_emumi_is_an_explicit_stop() {
+        let mut supervisor = DeviceSupervisor::default();
+        let generation = supervisor.begin_admission("Device_1", 0, true).unwrap();
+        assert!(supervisor.complete_ready("Device_1", generation));
+
+        supervisor.observe("Device_1", Observation::Absent { scope: None }, 1);
+
+        let status = supervisor.status("Device_1");
+        assert_eq!(status.phase, DevicePhase::Stopped);
+        assert!(!status.desired_running);
+        assert!(status.stop_requested);
+        assert!(supervisor.due_actions(u64::MAX).is_empty());
+
+        let mut restored = DeviceSupervisor::restore(supervisor.persisted_states());
+        assert!(!restored.is_desired("Device_1"));
+
+        let next_generation = restored.begin_admission("Device_1", 2, true).unwrap();
+        assert!(next_generation > generation);
+        assert!(restored.is_desired("Device_1"));
+        assert_eq!(restored.status("Device_1").phase, DevicePhase::Admitting);
+        assert!(!restored.status("Device_1").stop_requested);
     }
 
     #[test]

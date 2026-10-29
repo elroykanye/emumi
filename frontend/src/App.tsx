@@ -21,7 +21,6 @@ import {
   FormControl,
   FormControlLabel,
   InputLabel,
-  LinearProgress,
   List,
   ListItem,
   ListItemButton,
@@ -65,7 +64,7 @@ import {
   WarningAmberRounded,
 } from "@mui/icons-material";
 
-type Page = "androids" | "monitor" | "logs" | "settings";
+type Page = "androids" | "running" | "logs" | "settings";
 type PendingAction = "starting" | "stopping";
 type Speed = "Efficient" | "LeanGaming" | "Balanced" | "Fast";
 type Picture = "Compact" | "Phone" | "Sharp";
@@ -113,24 +112,6 @@ type ProfileOptions = {
   suspend_store_during_automation: boolean;
 };
 
-type DeviceHostStats = {
-  profile_name: string;
-  serial: string;
-  pid: number | null;
-  rss_bytes: number;
-  pss_bytes: number;
-  vm_swap_bytes: number;
-  scope_name: string | null;
-  memory_current_bytes: number | null;
-  memory_high_bytes: number | null;
-  memory_max_bytes: number | null;
-  memory_swap_current_bytes: number | null;
-  memory_events: Record<string, number>;
-  pressure_some_avg10: number | null;
-  pressure_full_avg10: number | null;
-  warning: string | null;
-};
-
 type AppState = {
   manager_id: string;
   profiles: AndroidProfile[];
@@ -140,9 +121,6 @@ type AppState = {
   system_images: { package_id: string; label: string }[];
   config: { android_sdk_path: string; jdk_path: string };
   health: { emulator: boolean; adb: boolean; avd_manager: boolean; kvm: boolean; java: boolean; systemd_run: boolean };
-  stats: { cpu_percent: number; memory_used_bytes: number; memory_total_bytes: number; memory_available_bytes: number; cpu_temperature_c: number | null };
-  resource_warnings: string[];
-  device_stats: DeviceHostStats[];
   logs: { at: number; level: string; message: string }[];
 };
 
@@ -221,14 +199,6 @@ function internalProfileName(name: string) {
   return name.trim().replace(/\s+/g, "_");
 }
 
-function gib(bytes: number) {
-  return (bytes / 1024 / 1024 / 1024).toFixed(1);
-}
-
-function mib(bytes: number | null) {
-  return bytes === null ? "Unavailable" : `${Math.round(bytes / 1024 / 1024)} MB`;
-}
-
 function relativeTime(seconds: number) {
   const ago = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
   if (ago < 5) return "now";
@@ -299,7 +269,7 @@ export default function App() {
 
   const nav: { id: Page; label: string; icon: React.ReactNode }[] = [
     { id: "androids", label: "My Androids", icon: <PhoneAndroidRounded /> },
-    { id: "monitor", label: "Monitor", icon: <MonitorHeartRounded /> },
+    { id: "running", label: "Running", icon: <PlayArrowRounded /> },
     { id: "logs", label: "Activity", icon: <TerminalRounded /> },
     { id: "settings", label: "Settings", icon: <SettingsRounded /> },
   ];
@@ -342,7 +312,7 @@ export default function App() {
               <Typography variant="h6">{nav.find((item) => item.id === page)?.label}</Typography>
               <Typography variant="body2" color="text.secondary">
                 {page === "androids" && "Create, tune and launch virtual Android devices"}
-                {page === "monitor" && "A clear view of what is running"}
+                {page === "running" && "Android lifecycle and ADB status"}
                 {page === "logs" && "Recent emulator manager activity"}
                 {page === "settings" && "Tools, paths and system readiness"}
               </Typography>
@@ -369,8 +339,8 @@ export default function App() {
               setCloneSource={setCloneSource}
               busy={busy}
             />
-          ) : page === "monitor" ? (
-            <MonitorPage state={state} />
+          ) : page === "running" ? (
+            <RunningPage state={state} />
           ) : page === "logs" ? (
             <LogsPage state={state} />
           ) : (
@@ -415,7 +385,6 @@ function AndroidsPage({ state, selected, selectedName, setSelectedName, pending,
     <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(260px, 340px) minmax(0, 1fr)" }, gridTemplateRows: { xs: "minmax(180px, auto) minmax(0, 1fr)", lg: "minmax(0, 1fr)" }, gap: 3, height: "100%", minHeight: 0 }}>
       <Stack spacing={1.5} sx={{ minHeight: 0, overflowY: "auto", pr: 0.75 }}>
         <Typography variant="overline" color="text.secondary">Your devices · {state.profiles.length}</Typography>
-        {state.resource_warnings.map((warning) => <Alert key={warning} severity="warning">{warning}</Alert>)}
         {state.profiles.length === 0 ? (
           <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="No Androids yet" detail="Use New Android to create your first profile." />
         ) : state.profiles.map((profile) => {
@@ -581,7 +550,7 @@ function ProfileDetail({ profile, options, pending, lifecycle, setPending, perfo
           </ToggleButtonGroup>
         </SettingRow>
         <Divider />
-        <SettingRow icon={<RefreshRounded />} title="Pause device restore during automation" description="Keeps Play Store available while preventing Google Restore from consuming CPU and network in Lean Gaming mode">
+        <SettingRow icon={<RefreshRounded />} title="Pause device restore during automation" description="Chrome and Play Store always stay enabled; this pauses only Google Restore in Lean Gaming mode">
           <Switch checked={draft.suspend_store_during_automation} onChange={(event) => setDraft({ ...draft, suspend_store_during_automation: event.target.checked })} />
         </SettingRow>
         {draft.speed === "LeanGaming" && <Alert severity="info" sx={{ mt: 1 }}>Lean Gaming always starts Android from a clean boot so native games do not inherit a broken saved-memory state. Installed apps, game data and accounts are preserved.</Alert>}
@@ -652,31 +621,12 @@ function CloneDialog({ source, profiles, onClose, busy, perform, onCreated }: { 
   </Dialog>;
 }
 
-function MonitorPage({ state }: { state: AppState }) {
-  const total = state.stats.memory_total_bytes;
-  const used = state.stats.memory_used_bytes;
-  const available = state.stats.memory_available_bytes;
+function RunningPage({ state }: { state: AppState }) {
   const running = state.profiles.filter((profile) => profile.running_serial);
-  return <Stack spacing={3}>
-    {state.resource_warnings.map((warning) => <Alert key={warning} severity="warning">{warning}</Alert>)}
-    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(3, 1fr)", xl: "repeat(5, 1fr)" }, gap: 2 }}>
-      <Metric title="Host CPU" value={`${Math.round(state.stats.cpu_percent)}%`} progress={state.stats.cpu_percent} icon={<MemoryRounded />} />
-      <Metric title="Host memory" value={`${gib(used)} / ${gib(total)} GB`} progress={total ? used / total * 100 : 0} icon={<MonitorHeartRounded />} />
-      <Metric title="Available memory" value={`${gib(available)} GB`} progress={total ? available / total * 100 : 0} icon={<MemoryRounded />} />
-      <Metric title="CPU temperature" value={state.stats.cpu_temperature_c === null ? "Unavailable" : `${Math.round(state.stats.cpu_temperature_c)} °C`} progress={state.stats.cpu_temperature_c ?? 0} icon={<MonitorHeartRounded />} />
-      <Metric title="Running now" value={`${running.length} Android${running.length === 1 ? "" : "s"}`} progress={state.profiles.length ? running.length / state.profiles.length * 100 : 0} icon={<PhoneAndroidRounded />} />
-    </Box>
-    <Card><CardContent><Typography variant="h6" mb={2}>Live Androids</Typography>{running.length ? <Stack spacing={2}>{running.map((profile) => {
-      const sample = state.device_stats.find((item) => item.profile_name === profile.name);
-      return <Box key={profile.name}><Stack direction={{ xs: "column", md: "row" }} gap={2} alignItems={{ md: "center" }}><ListItemIcon><CheckCircleRounded color="success" /></ListItemIcon><Box sx={{ flexGrow: 1 }}><Typography fontWeight={700}>{displayProfileName(profile.name)}</Typography><Typography variant="body2" color="text.secondary">{profile.running_serial}{sample?.pid ? ` · PID ${sample.pid}` : ""}{sample?.scope_name ? ` · ${sample.scope_name}` : " · unconstrained"}</Typography></Box><Stack direction="row" gap={1} flexWrap="wrap"><Chip size="small" variant="outlined" label={`RSS ${mib(sample?.rss_bytes ?? null)}`} /><Chip size="small" variant="outlined" label={`PSS ${mib(sample?.pss_bytes ?? null)}`} /><Chip size="small" variant="outlined" label={`Swap ${mib(sample?.vm_swap_bytes ?? null)}`} /></Stack></Stack>
-        {sample?.scope_name && <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", md: "repeat(4, 1fr)" }, gap: 1, mt: 1.5 }}><Typography variant="caption">Current: {mib(sample.memory_current_bytes)}</Typography><Typography variant="caption">High: {mib(sample.memory_high_bytes)}</Typography><Typography variant="caption">Max: {mib(sample.memory_max_bytes)}</Typography><Typography variant="caption">Scope swap: {mib(sample.memory_swap_current_bytes)}</Typography><Typography variant="caption">High events: {sample.memory_events.high ?? 0}</Typography><Typography variant="caption">Max events: {sample.memory_events.max ?? 0}</Typography><Typography variant="caption">Pressure some: {(sample.pressure_some_avg10 ?? 0).toFixed(2)}%</Typography><Typography variant="caption">Pressure full: {(sample.pressure_full_avg10 ?? 0).toFixed(2)}%</Typography></Box>}
-        {sample?.warning && <Alert severity="warning" sx={{ mt: 1.5 }}>{sample.warning}</Alert>}<Divider sx={{ mt: 2 }} /></Box>;
-    })}</Stack> : <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="Nothing is running" detail="Start an Android to see it here." />}</CardContent></Card>
-  </Stack>;
-}
-
-function Metric({ title, value, progress, icon }: { title: string; value: string; progress: number; icon: React.ReactNode }) {
-  return <Card><CardContent><Stack direction="row" gap={1} color="text.secondary" alignItems="center">{icon}<Typography variant="body2" fontWeight={700}>{title}</Typography></Stack><Typography variant="h5" my={2}>{value}</Typography><LinearProgress variant="determinate" value={Math.max(0, Math.min(100, progress))} /></CardContent></Card>;
+  return <Card><CardContent><Typography variant="h6" mb={2}>Running Androids</Typography>{running.length ? <Stack spacing={2}>{running.map((profile) => {
+    const lifecycle = state.device_supervision[profile.name];
+    return <Box key={profile.name}><Stack direction={{ xs: "column", md: "row" }} gap={2} alignItems={{ md: "center" }}><ListItemIcon><CheckCircleRounded color="success" /></ListItemIcon><Box sx={{ flexGrow: 1 }}><Typography fontWeight={700}>{displayProfileName(profile.name)}</Typography><Typography variant="body2" color="text.secondary">{profile.running_serial} · {statusLabel(profile, undefined, lifecycle)}</Typography></Box></Stack><Divider sx={{ mt: 2 }} /></Box>;
+  })}</Stack> : <EmptyState icon={<PhoneAndroidRounded fontSize="large" />} title="Nothing is running" detail="Start an Android to see it here." />}</CardContent></Card>;
 }
 
 function LogsPage({ state }: { state: AppState }) {
