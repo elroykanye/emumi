@@ -41,7 +41,7 @@ jobs:
           bash ./tests/manager_wire.sh
       - name: Build Debian package
         run: ./scripts/package-deb.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: emumi-${{ github.sha }}
           path: |
